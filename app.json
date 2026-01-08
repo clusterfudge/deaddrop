@@ -1,0 +1,24 @@
+{
+  "name": "deadrop",
+  "description": "Minimal inbox-only messaging for agents",
+  "keywords": ["agents", "messaging", "inbox"],
+  "env": {
+    "DEADROP_ADMIN_TOKEN": {
+      "description": "Admin token for namespace management",
+      "required": true
+    },
+    "TURSO_URL": {
+      "description": "Turso database URL (libsql://...)",
+      "required": false
+    },
+    "TURSO_AUTH_TOKEN": {
+      "description": "Turso authentication token",
+      "required": false
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1
+    }
+  }
+}

@@ -1,0 +1,270 @@
+# deadrop
+
+Minimal inbox-only messaging for agents.
+
+## Concepts
+
+- **Namespace**: An isolated group of mailboxes. ID is derived from a secret (`ns_id = hash(ns_secret)[:16]`).
+- **Identity/Mailbox**: An agent's inbox within a namespace. ID is derived from a secret (`id = hash(secret)[:16]`).
+- **Message**: A blob sent from one identity to another within a namespace. Uses UUIDv7 (timestamp-sortable).
+
+## Auth Model
+
+Three tiers of authentication, with clear separation of concerns:
+
+| Role | Namespaces | Mailboxes | Messages |
+|------|------------|-----------|----------|
+| **Admin** | CRUD | CRUD (metadata only) | ❌ None |
+| **Namespace Owner** | Archive own | CRUD (metadata only) | ❌ None |
+| **Mailbox Owner** | ❌ | List peers | Own inbox only |
+
+**Key principle**: Neither admin nor namespace owner can read message contents. Only the mailbox owner can access their inbox.
+
+## Message Lifecycle
+
+```
+UNREAD (∞) → READ (TTL starts) → EXPIRED → DELETED
+```
+
+- **Unread**: Message lives indefinitely until read
+- **Read**: TTL countdown starts (default: 24 hours, configurable per-namespace)
+- **Expired**: Automatically deleted by TTL job
+
+**Sender can also set TTL** for ephemeral messages that expire from creation time (instead of read time).
+
+## CLI Configuration
+
+The CLI manages configuration in `~/.config/deadrop/`:
+
+```
+~/.config/deadrop/
+├── config.yaml              # Global config (URL, bearer token)
+└── namespaces/
+    ├── {ns_hash}.yaml       # Namespace config (secret + mailboxes)
+    └── ...
+```
+
+### First-Time Setup
+
+```bash
+# Interactive wizard
+deadrop init
+
+# Or show current config
+deadrop config
+```
+
+### Admin Workflow
+
+```bash
+# 1. Create a namespace (saved to local config)
+deadrop ns create --display-name "My Project"
+deadrop ns create --display-name "Short TTL" --ttl-hours 1
+
+# 2. Create mailboxes (saved to namespace config)
+deadrop identity create abc123 --display-name "Agent 1"
+deadrop identity create abc123 --display-name "Agent 2"
+
+# 3. Export credentials for mailbox owners
+deadrop identity export abc123 f9e8d7c6b5a4
+deadrop identity export abc123 f9e8d7c6b5a4 --format json
+deadrop identity export abc123 f9e8d7c6b5a4 --format env
+
+# 4. List/manage
+deadrop ns list
+deadrop ns list --remote  # From server
+deadrop identity list abc123
+```
+
+### Testing with CLI
+
+```bash
+# Send a message (uses first mailbox in namespace config)
+deadrop message send abc123 {recipient_id} "Hello!"
+
+# Read inbox (marks messages as read, starts TTL)
+deadrop message inbox abc123
+deadrop message inbox abc123 --unread       # Only unread
+deadrop message inbox abc123 --after {mid}  # Cursor pagination
+
+# Delete message immediately (instead of waiting for TTL)
+deadrop message delete abc123 {mid}
+```
+
+## API
+
+### Admin Endpoints
+
+Requires bearer token (heare-auth) or `--no-auth` mode.
+
+```bash
+POST /admin/namespaces              # Create namespace
+GET /admin/namespaces               # List namespaces
+DELETE /admin/namespaces/{ns}       # Delete namespace
+```
+
+### Namespace Owner Endpoints
+
+Requires `X-Namespace-Secret` header.
+
+```bash
+POST /{ns}/archive                  # Archive namespace
+POST /{ns}/identities               # Create identity
+GET /{ns}/identities                # List identities
+DELETE /{ns}/identities/{id}        # Delete identity
+```
+
+### Mailbox Owner Endpoints
+
+Requires `X-Inbox-Secret` header.
+
+```bash
+# List peers
+GET /{ns}/identities
+
+# Send message
+POST /{ns}/send
+{"to": "recipient_id", "body": "Hello!"}
+{"to": "recipient_id", "body": "Ephemeral!", "ttl_hours": 1}  # Expires from creation
+
+# Read inbox (marks as read, starts TTL)
+GET /{ns}/inbox/{id}
+GET /{ns}/inbox/{id}?unread=true        # Only unread
+GET /{ns}/inbox/{id}?after={mid}        # Cursor pagination
+
+# Delete message immediately
+DELETE /{ns}/inbox/{id}/{mid}
+```
+
+## Running the Server
+
+### Development Mode
+
+```bash
+# No authentication required for admin endpoints
+deadrop serve --no-auth
+
+# With auto-reload
+deadrop serve --no-auth --reload
+```
+
+### Production Mode
+
+```bash
+# Option 1: heare-auth (recommended)
+export HEARE_AUTH_URL=https://your-heare-auth.com
+deadrop serve
+
+# Option 2: Legacy static token
+export DEADROP_ADMIN_TOKEN=your-secret-token
+deadrop serve
+```
+
+## Deployment (Dokku)
+
+```bash
+# Create app
+dokku apps:create deadrop
+
+# Set environment
+dokku config:set deadrop HEARE_AUTH_URL=https://your-heare-auth.com
+dokku config:set deadrop TURSO_URL=libsql://your-db.turso.io
+dokku config:set deadrop TURSO_AUTH_TOKEN=your-turso-token
+
+# Deploy
+git push dokku main
+```
+
+## Storage
+
+**Local (default)**: SQLite file
+```bash
+export DEADROP_DB=deadrop.db
+```
+
+**Production**: Turso (SQLite at the edge)
+```bash
+export TURSO_URL=libsql://your-db.turso.io
+export TURSO_AUTH_TOKEN=your-token
+pip install deadrop[turso]
+```
+
+## Environment Variables
+
+### Server
+
+| Variable | Description |
+|----------|-------------|
+| `DEADROP_NO_AUTH` | Set to `1` for development (no admin auth) |
+| `HEARE_AUTH_URL` | URL of heare-auth service |
+| `DEADROP_ADMIN_TOKEN` | Legacy static admin token |
+| `DEADROP_DB` | SQLite database path |
+| `TURSO_URL` | Turso database URL |
+| `TURSO_AUTH_TOKEN` | Turso authentication token |
+
+### CLI
+
+The CLI uses `~/.config/deadrop/config.yaml` for configuration.
+Run `deadrop init` to set up interactively.
+
+## Security Notes
+
+- **Secret-derived IDs**: Can't claim an identity without the secret
+- **No plaintext secrets stored**: Server only stores hashes
+- **Namespace isolation**: Agents only interact within their namespace
+- **Content privacy**: Admin/namespace owners cannot read messages
+- **Config file security**: Namespace YAML files contain secrets - protect them!
+
+### Known Limitations
+
+- No end-to-end encryption (encrypt your own payloads)
+- No message signing (recipient trusts `from` field)
+- No rate limiting (yet)
+- Replay attacks possible (use TTLs and nonces)
+
+## CLI Reference
+
+```bash
+# Configuration
+deadrop init                    # Setup wizard
+deadrop config                  # Show current config
+
+# Namespaces
+deadrop ns create               # Create namespace
+deadrop ns create --ttl-hours 1 # Custom TTL (hours after read)
+deadrop ns list                 # List local namespaces
+deadrop ns list --remote        # List from server
+deadrop ns show {ns}            # Show details
+deadrop ns secret {ns}          # Show namespace secret
+deadrop ns archive {ns}         # Archive namespace
+deadrop ns delete {ns}          # Delete local config
+deadrop ns delete {ns} --remote # Delete from server
+
+# Identities
+deadrop identity create {ns}    # Create identity
+deadrop identity list {ns}      # List local identities
+deadrop identity show {ns} {id} # Show details
+deadrop identity export {ns} {id}           # Export for handoff
+deadrop identity export {ns} {id} --format json
+deadrop identity export {ns} {id} --format env
+deadrop identity delete {ns} {id}
+deadrop identity delete {ns} {id} --remote
+
+# Messages (for testing)
+deadrop message send {ns} {to} "Hello!"
+deadrop message send {ns} {to} "Hi" --identity-id {from}
+deadrop message inbox {ns}                  # Read all
+deadrop message inbox {ns} --unread         # Only unread
+deadrop message inbox {ns} --after {mid}    # After cursor
+deadrop message delete {ns} {mid}           # Delete immediately
+
+# Server
+deadrop serve                   # Run server
+deadrop serve --no-auth         # Development mode
+deadrop serve --reload          # With auto-reload
+
+# Jobs (requires DB access)
+deadrop jobs ttl                # Process expired messages
+deadrop jobs ttl --dry-run      # Show what would be processed
+deadrop jobs ttl --archive-path /path/to/archives
+```
