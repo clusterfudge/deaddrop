@@ -15,11 +15,12 @@ DEFAULT_TTL_HOURS = 24
 
 # Connection singleton
 _conn: sqlite3.Connection | None = None
+_is_libsql: bool = False
 
 
 def get_connection() -> sqlite3.Connection:
     """Get or create database connection."""
-    global _conn
+    global _conn, _is_libsql
     if _conn is None:
         db_url = os.environ.get("TURSO_URL", "")
 
@@ -28,22 +29,46 @@ def get_connection() -> sqlite3.Connection:
             import libsql_experimental as libsql  # type: ignore[import-not-found]
 
             _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
+            _is_libsql = True
         else:
             # Local SQLite
             db_path = os.environ.get("DEADROP_DB", "deadrop.db")
             _conn = sqlite3.connect(db_path, check_same_thread=False)
-
-        _conn.row_factory = sqlite3.Row
+            _conn.row_factory = sqlite3.Row
+            _is_libsql = False
 
     return _conn
 
 
+def _row_to_dict(cursor_description: Any, row: tuple | sqlite3.Row | None) -> dict | None:
+    """Convert a database row to a dictionary."""
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    # For libsql, manually create dict from cursor description
+    columns = [col[0] for col in cursor_description]
+    return dict(zip(columns, row))
+
+
+def _rows_to_dicts(cursor_description: Any, rows: list) -> list[dict]:
+    """Convert database rows to a list of dictionaries."""
+    if not rows:
+        return []
+    if rows and isinstance(rows[0], sqlite3.Row):
+        return [dict(row) for row in rows]
+    # For libsql, manually create dicts from cursor description
+    columns = [col[0] for col in cursor_description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
 def close_db():
     """Close database connection."""
-    global _conn
+    global _conn, _is_libsql
     if _conn:
         _conn.close()
         _conn = None
+        _is_libsql = False
 
 
 def init_db():
@@ -136,10 +161,11 @@ def create_namespace(
 def get_namespace(ns: str) -> dict | None:
     """Get namespace by ID."""
     conn = get_connection()
-    row = conn.execute(
+    cursor = conn.execute(
         "SELECT ns, metadata, ttl_hours, created_at, archived_at FROM namespaces WHERE ns = ?",
         (ns,),
-    ).fetchone()
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if row:
         return {
@@ -155,7 +181,8 @@ def get_namespace(ns: str) -> dict | None:
 def is_namespace_archived(ns: str) -> bool:
     """Check if namespace is archived (read-only)."""
     conn = get_connection()
-    row = conn.execute("SELECT archived_at FROM namespaces WHERE ns = ?", (ns,)).fetchone()
+    cursor = conn.execute("SELECT archived_at FROM namespaces WHERE ns = ?", (ns,))
+    row = _row_to_dict(cursor.description, cursor.fetchone())
     return row is not None and row["archived_at"] is not None
 
 
@@ -173,16 +200,18 @@ def archive_namespace(ns: str) -> bool:
 def get_namespace_ttl_hours(ns: str) -> int:
     """Get the TTL hours for a namespace."""
     conn = get_connection()
-    row = conn.execute("SELECT ttl_hours FROM namespaces WHERE ns = ?", (ns,)).fetchone()
+    cursor = conn.execute("SELECT ttl_hours FROM namespaces WHERE ns = ?", (ns,))
+    row = _row_to_dict(cursor.description, cursor.fetchone())
     return row["ttl_hours"] if row else DEFAULT_TTL_HOURS
 
 
 def list_namespaces() -> list[dict]:
     """List all namespaces."""
     conn = get_connection()
-    rows = conn.execute(
+    cursor = conn.execute(
         "SELECT ns, metadata, ttl_hours, created_at, archived_at FROM namespaces ORDER BY created_at"
-    ).fetchall()
+    )
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
     return [
         {
@@ -204,7 +233,8 @@ def verify_namespace_secret(ns: str, secret: str) -> bool:
 
     # Second check: does the hash match what's stored?
     conn = get_connection()
-    row = conn.execute("SELECT secret_hash FROM namespaces WHERE ns = ?", (ns,)).fetchone()
+    cursor = conn.execute("SELECT secret_hash FROM namespaces WHERE ns = ?", (ns,))
+    row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if not row:
         return False
@@ -255,9 +285,10 @@ def create_identity(ns: str, metadata: dict[str, Any] | None = None) -> dict[str
 def get_identity(ns: str, identity_id: str) -> dict | None:
     """Get identity by ID."""
     conn = get_connection()
-    row = conn.execute(
+    cursor = conn.execute(
         "SELECT id, metadata, created_at FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
-    ).fetchone()
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if row:
         return {
@@ -271,9 +302,10 @@ def get_identity(ns: str, identity_id: str) -> dict | None:
 def list_identities(ns: str) -> list[dict]:
     """List all identities in a namespace."""
     conn = get_connection()
-    rows = conn.execute(
+    cursor = conn.execute(
         "SELECT id, metadata, created_at FROM identities WHERE ns = ? ORDER BY created_at", (ns,)
-    ).fetchall()
+    )
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
     return [
         {
@@ -293,9 +325,10 @@ def verify_identity_secret(ns: str, identity_id: str, secret: str) -> bool:
 
     # Second check: does the hash match what's stored?
     conn = get_connection()
-    row = conn.execute(
+    cursor = conn.execute(
         "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
-    ).fetchone()
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if not row:
         return False
@@ -310,9 +343,10 @@ def verify_identity_in_namespace(ns: str, secret: str) -> str | None:
     identity_id = derive_id(secret)
 
     conn = get_connection()
-    row = conn.execute(
+    cursor = conn.execute(
         "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
-    ).fetchone()
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if not row:
         return None
@@ -364,7 +398,10 @@ def send_message(
     """
     # Verify recipient exists
     conn = get_connection()
-    row = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id)).fetchone()
+    cursor = conn.execute(
+        "SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id)
+    )
+    row = cursor.fetchone()
 
     if not row:
         raise ValueError(f"Recipient {to_id} not found in namespace {ns}")
@@ -431,7 +468,8 @@ def get_messages(
 
     query += " ORDER BY mid"  # UUIDv7 ordering = chronological
 
-    rows = conn.execute(query, params).fetchall()
+    cursor = conn.execute(query, params)
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
     messages = [
         {
@@ -471,13 +509,14 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
     """Get a single message."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    row = conn.execute(
+    cursor = conn.execute(
         """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at
            FROM messages 
            WHERE ns = ? AND to_id = ? AND mid = ?
            AND (expires_at IS NULL OR expires_at > ?)""",
         (ns, identity_id, mid, now),
-    ).fetchone()
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if row:
         return {
@@ -509,16 +548,15 @@ def get_expired_messages(limit: int = 1000) -> list[dict]:
     """Get messages past their expiration time."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    rows = conn.execute(
+    cursor = conn.execute(
         """SELECT mid, ns, to_id, from_id, body, created_at, read_at, expires_at
            FROM messages 
            WHERE expires_at IS NOT NULL AND expires_at <= ?
            ORDER BY expires_at
            LIMIT ?""",
         (now, limit),
-    ).fetchall()
-
-    return [dict(row) for row in rows]
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
 
 
 def delete_expired_messages() -> int:
@@ -567,10 +605,10 @@ def get_archive_batches(ns: str | None = None) -> list[dict]:
     conn = get_connection()
 
     if ns:
-        rows = conn.execute(
+        cursor = conn.execute(
             "SELECT * FROM archive_batches WHERE ns = ? ORDER BY created_at", (ns,)
-        ).fetchall()
+        )
     else:
-        rows = conn.execute("SELECT * FROM archive_batches ORDER BY created_at").fetchall()
+        cursor = conn.execute("SELECT * FROM archive_batches ORDER BY created_at")
 
-    return [dict(row) for row in rows]
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
