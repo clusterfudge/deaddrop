@@ -107,47 +107,49 @@ def get_legacy_admin_token() -> str | None:
 def require_admin(authorization: str | None, x_admin_token: str | None) -> dict:
     """
     Verify admin authentication.
-    
+
     Supports three modes:
     1. No-auth: DEADROP_NO_AUTH=1 (for development, no auth required)
     2. heare-auth: Authorization: Bearer <token> (if HEARE_AUTH_URL is set)
     3. Legacy: X-Admin-Token header (fallback)
-    
+
     Returns:
         dict with auth info: {"method": "no-auth"|"heare-auth"|"legacy", "key_id": ..., "metadata": ...}
     """
     # Development mode - no auth required
     if is_no_auth_mode():
         return {"method": "no-auth", "key_id": None, "metadata": {}}
-    
+
     # Try heare-auth first if configured
     if is_heare_auth_enabled():
         token = extract_bearer_token(authorization)
         if not token:
             raise HTTPException(401, "Authorization: Bearer <token> header required")
-        
+
         result = verify_bearer_token(token)
         if not result.valid:
             raise HTTPException(403, result.error or "Invalid token")
-        
+
         return {
             "method": "heare-auth",
             "key_id": result.key_id,
             "name": result.name,
             "metadata": result.metadata,
         }
-    
+
     # Fallback to legacy admin token
     legacy_token = get_legacy_admin_token()
     if not legacy_token:
-        raise HTTPException(500, "No auth method configured (set HEARE_AUTH_URL or DEADROP_ADMIN_TOKEN)")
-    
+        raise HTTPException(
+            500, "No auth method configured (set HEARE_AUTH_URL or DEADROP_ADMIN_TOKEN)"
+        )
+
     if not x_admin_token:
         raise HTTPException(401, "X-Admin-Token header required")
-    
+
     if x_admin_token != legacy_token:
         raise HTTPException(403, "Invalid admin token")
-    
+
     return {"method": "legacy", "key_id": None, "metadata": {}}
 
 
@@ -163,16 +165,16 @@ def require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str | None) 
     """Verify inbox secret matches identity. Returns the identity ID."""
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
-    
+
     # Derive ID from secret and verify it matches claimed identity
     derived_id = derive_id(x_inbox_secret)
     if derived_id != identity_id:
         raise HTTPException(403, "Secret does not match identity")
-    
+
     # Verify identity exists in namespace
     if not db.verify_identity_secret(ns, identity_id, x_inbox_secret):
         raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
-    
+
     return identity_id
 
 
@@ -180,11 +182,11 @@ def require_inbox_secret_any(ns: str, x_inbox_secret: str | None) -> str:
     """Verify inbox secret belongs to some identity in namespace. Returns identity ID."""
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
-    
+
     identity_id = db.verify_identity_in_namespace(ns, x_inbox_secret)
     if not identity_id:
         raise HTTPException(403, "Invalid inbox secret or not in namespace")
-    
+
     return identity_id
 
 
@@ -208,12 +210,12 @@ def create_namespace(
     auth_info = require_admin(authorization, x_admin_token)
     metadata = request.metadata if request else None
     ttl_hours = request.ttl_hours if request else 24
-    
+
     # Optionally include auth info in namespace metadata
     if auth_info.get("key_id"):
         metadata = metadata or {}
         metadata.setdefault("created_by", auth_info["key_id"])
-    
+
     result = db.create_namespace(metadata, ttl_hours=ttl_hours)
     return CreateNamespaceResponse(
         ns=result["ns"],
@@ -242,7 +244,7 @@ def get_namespace(
     """Get namespace details."""
     require_admin(authorization, x_admin_token)
     namespace = db.get_namespace(ns)
-    if not namespace:
+    if namespace is None:
         raise HTTPException(404, "Namespace not found")
     return NamespaceInfo(**namespace)
 
@@ -259,6 +261,8 @@ def update_namespace(
     if not db.update_namespace_metadata(ns, request.metadata):
         raise HTTPException(404, "Namespace not found")
     namespace = db.get_namespace(ns)
+    if namespace is None:
+        raise HTTPException(404, "Namespace not found")
     return NamespaceInfo(**namespace)
 
 
@@ -286,11 +290,11 @@ def admin_create_identity(
     """Create identity as admin."""
     require_admin(authorization, x_admin_token)
     require_active_namespace(ns)
-    
+
     # Verify namespace exists
     if not db.get_namespace(ns):
         raise HTTPException(404, "Namespace not found")
-    
+
     metadata = request.metadata if request else None
     result = db.create_identity(ns, metadata)
     return CreateIdentityResponse(
@@ -336,10 +340,10 @@ def archive_namespace(
 ):
     """Archive namespace (soft-delete, rejects future writes)."""
     require_namespace_secret(ns, x_namespace_secret)
-    
+
     if not db.archive_namespace(ns):
         raise HTTPException(400, "Namespace already archived or not found")
-    
+
     return {"ok": True, "archived": True}
 
 
@@ -352,7 +356,7 @@ def create_identity(
     """Create a new identity (mailbox) in a namespace."""
     require_namespace_secret(ns, x_namespace_secret)
     require_active_namespace(ns)
-    
+
     metadata = request.metadata if request else None
     result = db.create_identity(ns, metadata)
     return CreateIdentityResponse(
@@ -370,7 +374,7 @@ def list_identities(
 ):
     """
     List identities in namespace.
-    
+
     - Namespace owner (X-Namespace-Secret): Full access
     - Mailbox owner (X-Inbox-Secret): Can list peers
     """
@@ -383,7 +387,7 @@ def list_identities(
             raise HTTPException(403, "Invalid inbox secret or not in namespace")
     else:
         raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
-    
+
     return [IdentityInfo(**identity) for identity in db.list_identities(ns)]
 
 
@@ -408,9 +412,9 @@ def get_identity(
             raise HTTPException(403, "Invalid inbox secret")
     else:
         raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
-    
+
     identity = db.get_identity(ns, identity_id)
-    if not identity:
+    if identity is None:
         raise HTTPException(404, "Identity not found")
     return IdentityInfo(**identity)
 
@@ -425,11 +429,13 @@ def update_identity(
     """Update identity metadata. Requires namespace secret."""
     require_namespace_secret(ns, x_namespace_secret)
     require_active_namespace(ns)
-    
+
     if not db.update_identity_metadata(ns, identity_id, request.metadata):
         raise HTTPException(404, "Identity not found")
-    
+
     identity = db.get_identity(ns, identity_id)
+    if identity is None:
+        raise HTTPException(404, "Identity not found")
     return IdentityInfo(**identity)
 
 
@@ -441,7 +447,7 @@ def delete_identity(
 ):
     """Delete an identity and all its messages. Requires namespace secret."""
     require_namespace_secret(ns, x_namespace_secret)
-    
+
     if not db.delete_identity(ns, identity_id):
         raise HTTPException(404, "Identity not found")
     return {"ok": True}
@@ -458,19 +464,19 @@ def send_message(
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Send a message to another identity.
-    
+
     Messages are delivered instantly. Optionally set ttl_hours for ephemeral
     messages that expire from creation time (instead of read time).
     """
     require_active_namespace(ns)
-    
+
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
-    
+
     from_id = db.verify_identity_in_namespace(ns, x_inbox_secret)
     if not from_id:
         raise HTTPException(403, "Invalid inbox secret or not in namespace")
-    
+
     try:
         result = db.send_message(
             ns=ns,
@@ -481,7 +487,7 @@ def send_message(
         )
     except ValueError as e:
         raise HTTPException(404, str(e))
-    
+
     return result
 
 
@@ -494,23 +500,23 @@ def get_inbox(
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages for own inbox.
-    
+
     Reading messages marks them as read and starts the TTL countdown.
-    
+
     Query parameters:
     - unread: Only return unread messages
     - after: Only return messages after this message ID (cursor for pagination)
     """
     # Only mailbox owner can read their inbox
     require_inbox_secret(ns, identity_id, x_inbox_secret)
-    
+
     messages = db.get_messages(
         ns=ns,
         identity_id=identity_id,
         unread_only=unread,
         after_mid=after,
     )
-    
+
     return {
         "messages": [
             {
@@ -536,11 +542,11 @@ def get_message(
 ):
     """Get a single message from own inbox."""
     require_inbox_secret(ns, identity_id, x_inbox_secret)
-    
+
     message = db.get_message(ns, identity_id, mid)
     if not message:
         raise HTTPException(404, "Message not found")
-    
+
     return {
         "mid": message["mid"],
         "from": message["from"],
@@ -561,10 +567,10 @@ def delete_message_endpoint(
 ):
     """Delete a message from own inbox immediately."""
     require_inbox_secret(ns, identity_id, x_inbox_secret)
-    
+
     if not db.delete_message(ns, identity_id, mid):
         raise HTTPException(404, "Message not found")
-    
+
     return {"ok": True}
 
 

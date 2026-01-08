@@ -4,7 +4,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deadrop.api import app
-from deadrop import db
 
 
 @pytest.fixture
@@ -60,7 +59,7 @@ class TestNamespaces:
     def test_create_namespace_no_auth_mode(self, client):
         """In no-auth mode, admin endpoints don't require authentication."""
         import os
-        
+
         # Enable no-auth mode
         os.environ["DEADROP_NO_AUTH"] = "1"
         try:
@@ -78,9 +77,13 @@ class TestNamespaces:
 
     def test_list_namespaces(self, client, admin_headers):
         # Create two namespaces
-        client.post("/admin/namespaces", json={"metadata": {"display_name": "NS1"}}, headers=admin_headers)
-        client.post("/admin/namespaces", json={"metadata": {"display_name": "NS2"}}, headers=admin_headers)
-        
+        client.post(
+            "/admin/namespaces", json={"metadata": {"display_name": "NS1"}}, headers=admin_headers
+        )
+        client.post(
+            "/admin/namespaces", json={"metadata": {"display_name": "NS2"}}, headers=admin_headers
+        )
+
         response = client.get("/admin/namespaces", headers=admin_headers)
         assert response.status_code == 200
         namespaces = response.json()
@@ -92,11 +95,11 @@ class TestNamespaces:
         # Create namespace
         response = client.post("/admin/namespaces", json={}, headers=admin_headers)
         ns = response.json()["ns"]
-        
+
         # Delete it
         response = client.delete(f"/admin/namespaces/{ns}", headers=admin_headers)
         assert response.status_code == 200
-        
+
         # Verify gone
         response = client.get("/admin/namespaces", headers=admin_headers)
         assert len(response.json()) == 0
@@ -106,7 +109,7 @@ class TestNamespaces:
         response = client.post("/admin/namespaces", json={}, headers=admin_headers)
         ns = response.json()["ns"]
         ns_secret = response.json()["secret"]
-        
+
         # Create an identity first
         response = client.post(
             f"/{ns}/identities",
@@ -114,14 +117,14 @@ class TestNamespaces:
             headers={"X-Namespace-Secret": ns_secret},
         )
         assert response.status_code == 200
-        
+
         # Archive the namespace
         response = client.post(
             f"/{ns}/archive",
             headers={"X-Namespace-Secret": ns_secret},
         )
         assert response.status_code == 200
-        
+
         # Verify can't create new identities
         response = client.post(
             f"/{ns}/identities",
@@ -176,7 +179,7 @@ class TestIdentities:
             json={"metadata": {"display_name": "Agent 2"}},
             headers={"X-Namespace-Secret": namespace["secret"]},
         )
-        
+
         # List as namespace owner
         response = client.get(
             f"/{namespace['ns']}/identities",
@@ -194,13 +197,13 @@ class TestIdentities:
             headers={"X-Namespace-Secret": namespace["secret"]},
         )
         agent1_secret = r1.json()["secret"]
-        
+
         client.post(
             f"/{namespace['ns']}/identities",
             json={"metadata": {"display_name": "Agent 2"}},
             headers={"X-Namespace-Secret": namespace["secret"]},
         )
-        
+
         # List as mailbox owner (Agent 1 can see Agent 2)
         response = client.get(
             f"/{namespace['ns']}/identities",
@@ -218,14 +221,14 @@ class TestIdentities:
             headers={"X-Namespace-Secret": namespace["secret"]},
         )
         identity_id = response.json()["id"]
-        
+
         # Delete it
         response = client.delete(
             f"/{namespace['ns']}/identities/{identity_id}",
             headers={"X-Namespace-Secret": namespace["secret"]},
         )
         assert response.status_code == 200
-        
+
         # Verify gone
         response = client.get(
             f"/{namespace['ns']}/identities",
@@ -245,7 +248,7 @@ class TestMessaging:
             headers=admin_headers,
         )
         ns_data = ns_response.json()
-        
+
         # Create two agents
         a1_response = client.post(
             f"/{ns_data['ns']}/identities",
@@ -253,14 +256,14 @@ class TestMessaging:
             headers={"X-Namespace-Secret": ns_data["secret"]},
         )
         a1_data = a1_response.json()
-        
+
         a2_response = client.post(
             f"/{ns_data['ns']}/identities",
             json={"metadata": {"display_name": "Agent 2"}},
             headers={"X-Namespace-Secret": ns_data["secret"]},
         )
         a2_data = a2_response.json()
-        
+
         return {
             "ns": ns_data["ns"],
             "ns_secret": ns_data["secret"],
@@ -272,7 +275,7 @@ class TestMessaging:
         ns = setup_agents["ns"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Agent 1 sends to Agent 2
         response = client.post(
             f"/{ns}/send",
@@ -282,11 +285,11 @@ class TestMessaging:
         assert response.status_code == 200
         assert response.json()["from"] == agent1["id"]
         assert response.json()["to"] == agent2["id"]
-        
+
         # Verify mid is UUIDv7 format (starts with timestamp-like chars)
         mid = response.json()["mid"]
         assert len(mid) == 36  # UUID format
-        
+
         # Agent 2 reads inbox
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}",
@@ -304,7 +307,7 @@ class TestMessaging:
         ns = setup_agents["ns"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Agent 1 tries to read Agent 2's inbox
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}",
@@ -318,14 +321,14 @@ class TestMessaging:
         ns_secret = setup_agents["ns_secret"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Agent 1 sends to Agent 2
         client.post(
             f"/{ns}/send",
             json={"to": agent2["id"], "body": "Secret message"},
             headers={"X-Inbox-Secret": agent1["secret"]},
         )
-        
+
         # Namespace owner tries to read Agent 2's inbox - should fail
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}",
@@ -338,17 +341,17 @@ class TestMessaging:
         ns = setup_agents["ns"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Send message
         client.post(
             f"/{ns}/send",
             json={"to": agent2["id"], "body": "Test"},
             headers={"X-Inbox-Secret": agent1["secret"]},
         )
-        
+
         # Message should have no read_at or expires_at yet
         # (We can't check this without peeking, but we trust the DB)
-        
+
         # Read inbox - this marks as read and starts TTL
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}",
@@ -363,7 +366,7 @@ class TestMessaging:
         ns = setup_agents["ns"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Send message
         send_response = client.post(
             f"/{ns}/send",
@@ -371,20 +374,20 @@ class TestMessaging:
             headers={"X-Inbox-Secret": agent1["secret"]},
         )
         mid = send_response.json()["mid"]
-        
+
         # Read it first
         client.get(
             f"/{ns}/inbox/{agent2['id']}",
             headers={"X-Inbox-Secret": agent2["secret"]},
         )
-        
+
         # Delete immediately
         response = client.delete(
             f"/{ns}/inbox/{agent2['id']}/{mid}",
             headers={"X-Inbox-Secret": agent2["secret"]},
         )
         assert response.status_code == 200
-        
+
         # Verify gone
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}/{mid}",
@@ -396,7 +399,7 @@ class TestMessaging:
         ns = setup_agents["ns"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Send two messages
         client.post(
             f"/{ns}/send",
@@ -408,21 +411,21 @@ class TestMessaging:
             json={"to": agent2["id"], "body": "Message 2"},
             headers={"X-Inbox-Secret": agent1["secret"]},
         )
-        
+
         # Read all (marks as read)
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}",
             headers={"X-Inbox-Secret": agent2["secret"]},
         )
         assert len(response.json()["messages"]) == 2
-        
+
         # Send another
         client.post(
             f"/{ns}/send",
             json={"to": agent2["id"], "body": "Message 3"},
             headers={"X-Inbox-Secret": agent1["secret"]},
         )
-        
+
         # Get only unread
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}?unread=true",
@@ -437,24 +440,24 @@ class TestMessaging:
         ns = setup_agents["ns"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Send three messages
         mids = []
         for i in range(3):
             response = client.post(
                 f"/{ns}/send",
-                json={"to": agent2["id"], "body": f"Message {i+1}"},
+                json={"to": agent2["id"], "body": f"Message {i + 1}"},
                 headers={"X-Inbox-Secret": agent1["secret"]},
             )
             mids.append(response.json()["mid"])
-        
+
         # Get all
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}",
             headers={"X-Inbox-Secret": agent2["secret"]},
         )
         assert len(response.json()["messages"]) == 3
-        
+
         # Get messages after the first one
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}?after={mids[0]}",
@@ -464,7 +467,7 @@ class TestMessaging:
         assert len(messages) == 2
         assert messages[0]["body"] == "Message 2"
         assert messages[1]["body"] == "Message 3"
-        
+
         # Get messages after the second one
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}?after={mids[1]}",
@@ -479,10 +482,10 @@ class TestMessaging:
         ns_secret = setup_agents["ns_secret"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Archive the namespace
         client.post(f"/{ns}/archive", headers={"X-Namespace-Secret": ns_secret})
-        
+
         # Try to send - should fail
         response = client.post(
             f"/{ns}/send",
@@ -496,7 +499,7 @@ class TestMessaging:
         ns = setup_agents["ns"]
         agent1 = setup_agents["agent1"]
         agent2 = setup_agents["agent2"]
-        
+
         # Send ephemeral message with 1 hour TTL
         response = client.post(
             f"/{ns}/send",
@@ -504,7 +507,7 @@ class TestMessaging:
             headers={"X-Inbox-Secret": agent1["secret"]},
         )
         assert response.status_code == 200
-        
+
         # Check it has expiration set from creation (not read time)
         response = client.get(
             f"/{ns}/inbox/{agent2['id']}",

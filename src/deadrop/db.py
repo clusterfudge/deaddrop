@@ -22,21 +22,19 @@ def get_connection() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         db_url = os.environ.get("TURSO_URL", "")
-        
+
         if db_url.startswith("libsql://"):
             # Turso connection
-            import libsql_experimental as libsql
-            _conn = libsql.connect(
-                db_url,
-                auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")
-            )
+            import libsql_experimental as libsql  # type: ignore[import-not-found]
+
+            _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
         else:
             # Local SQLite
             db_path = os.environ.get("DEADROP_DB", "deadrop.db")
             _conn = sqlite3.connect(db_path, check_same_thread=False)
-        
+
         _conn.row_factory = sqlite3.Row
-    
+
     return _conn
 
 
@@ -116,20 +114,22 @@ def reset_db():
 # --- Namespace Operations ---
 
 
-def create_namespace(metadata: dict[str, Any] | None = None, ttl_hours: int = DEFAULT_TTL_HOURS) -> dict[str, str]:
+def create_namespace(
+    metadata: dict[str, Any] | None = None, ttl_hours: int = DEFAULT_TTL_HOURS
+) -> dict[str, str]:
     """Create a new namespace. Returns {ns, secret}."""
     secret = generate_secret()
     ns = derive_id(secret)
     secret_hash = hash_secret(secret)
     metadata_json = json.dumps(metadata or {})
-    
+
     conn = get_connection()
     conn.execute(
         "INSERT INTO namespaces (ns, secret_hash, metadata, ttl_hours) VALUES (?, ?, ?, ?)",
-        (ns, secret_hash, metadata_json, ttl_hours)
+        (ns, secret_hash, metadata_json, ttl_hours),
     )
     conn.commit()
-    
+
     return {"ns": ns, "secret": secret}
 
 
@@ -138,9 +138,9 @@ def get_namespace(ns: str) -> dict | None:
     conn = get_connection()
     row = conn.execute(
         "SELECT ns, metadata, ttl_hours, created_at, archived_at FROM namespaces WHERE ns = ?",
-        (ns,)
+        (ns,),
     ).fetchone()
-    
+
     if row:
         return {
             "ns": row["ns"],
@@ -155,10 +155,7 @@ def get_namespace(ns: str) -> dict | None:
 def is_namespace_archived(ns: str) -> bool:
     """Check if namespace is archived (read-only)."""
     conn = get_connection()
-    row = conn.execute(
-        "SELECT archived_at FROM namespaces WHERE ns = ?",
-        (ns,)
-    ).fetchone()
+    row = conn.execute("SELECT archived_at FROM namespaces WHERE ns = ?", (ns,)).fetchone()
     return row is not None and row["archived_at"] is not None
 
 
@@ -167,8 +164,7 @@ def archive_namespace(ns: str) -> bool:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        "UPDATE namespaces SET archived_at = ? WHERE ns = ? AND archived_at IS NULL",
-        (now, ns)
+        "UPDATE namespaces SET archived_at = ? WHERE ns = ? AND archived_at IS NULL", (now, ns)
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -177,10 +173,7 @@ def archive_namespace(ns: str) -> bool:
 def get_namespace_ttl_hours(ns: str) -> int:
     """Get the TTL hours for a namespace."""
     conn = get_connection()
-    row = conn.execute(
-        "SELECT ttl_hours FROM namespaces WHERE ns = ?",
-        (ns,)
-    ).fetchone()
+    row = conn.execute("SELECT ttl_hours FROM namespaces WHERE ns = ?", (ns,)).fetchone()
     return row["ttl_hours"] if row else DEFAULT_TTL_HOURS
 
 
@@ -190,7 +183,7 @@ def list_namespaces() -> list[dict]:
     rows = conn.execute(
         "SELECT ns, metadata, ttl_hours, created_at, archived_at FROM namespaces ORDER BY created_at"
     ).fetchall()
-    
+
     return [
         {
             "ns": row["ns"],
@@ -208,18 +201,16 @@ def verify_namespace_secret(ns: str, secret: str) -> bool:
     # First check: does the secret derive to this ns ID?
     if derive_id(secret) != ns:
         return False
-    
+
     # Second check: does the hash match what's stored?
     conn = get_connection()
-    row = conn.execute(
-        "SELECT secret_hash FROM namespaces WHERE ns = ?",
-        (ns,)
-    ).fetchone()
-    
+    row = conn.execute("SELECT secret_hash FROM namespaces WHERE ns = ?", (ns,)).fetchone()
+
     if not row:
         return False
-    
+
     from .auth import verify_secret
+
     return verify_secret(secret, row["secret_hash"])
 
 
@@ -235,8 +226,7 @@ def update_namespace_metadata(ns: str, metadata: dict[str, Any]) -> bool:
     """Update namespace metadata."""
     conn = get_connection()
     cursor = conn.execute(
-        "UPDATE namespaces SET metadata = ? WHERE ns = ?",
-        (json.dumps(metadata), ns)
+        "UPDATE namespaces SET metadata = ? WHERE ns = ?", (json.dumps(metadata), ns)
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -251,14 +241,14 @@ def create_identity(ns: str, metadata: dict[str, Any] | None = None) -> dict[str
     identity_id = derive_id(secret)
     secret_hash = hash_secret(secret)
     metadata_json = json.dumps(metadata or {})
-    
+
     conn = get_connection()
     conn.execute(
         "INSERT INTO identities (id, ns, secret_hash, metadata) VALUES (?, ?, ?, ?)",
-        (identity_id, ns, secret_hash, metadata_json)
+        (identity_id, ns, secret_hash, metadata_json),
     )
     conn.commit()
-    
+
     return {"id": identity_id, "secret": secret}
 
 
@@ -266,10 +256,9 @@ def get_identity(ns: str, identity_id: str) -> dict | None:
     """Get identity by ID."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT id, metadata, created_at FROM identities WHERE ns = ? AND id = ?",
-        (ns, identity_id)
+        "SELECT id, metadata, created_at FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
     ).fetchone()
-    
+
     if row:
         return {
             "id": row["id"],
@@ -283,10 +272,9 @@ def list_identities(ns: str) -> list[dict]:
     """List all identities in a namespace."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, metadata, created_at FROM identities WHERE ns = ? ORDER BY created_at",
-        (ns,)
+        "SELECT id, metadata, created_at FROM identities WHERE ns = ? ORDER BY created_at", (ns,)
     ).fetchall()
-    
+
     return [
         {
             "id": row["id"],
@@ -302,35 +290,35 @@ def verify_identity_secret(ns: str, identity_id: str, secret: str) -> bool:
     # First check: does the secret derive to this identity ID?
     if derive_id(secret) != identity_id:
         return False
-    
+
     # Second check: does the hash match what's stored?
     conn = get_connection()
     row = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
-        (ns, identity_id)
+        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
     ).fetchone()
-    
+
     if not row:
         return False
-    
+
     from .auth import verify_secret
+
     return verify_secret(secret, row["secret_hash"])
 
 
 def verify_identity_in_namespace(ns: str, secret: str) -> str | None:
     """Verify a secret belongs to some identity in the namespace. Returns identity ID or None."""
     identity_id = derive_id(secret)
-    
+
     conn = get_connection()
     row = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
-        (ns, identity_id)
+        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
     ).fetchone()
-    
+
     if not row:
         return None
-    
+
     from .auth import verify_secret
+
     if verify_secret(secret, row["secret_hash"]):
         return identity_id
     return None
@@ -339,10 +327,7 @@ def verify_identity_in_namespace(ns: str, secret: str) -> str | None:
 def delete_identity(ns: str, identity_id: str) -> bool:
     """Delete an identity and all its messages."""
     conn = get_connection()
-    cursor = conn.execute(
-        "DELETE FROM identities WHERE ns = ? AND id = ?",
-        (ns, identity_id)
-    )
+    cursor = conn.execute("DELETE FROM identities WHERE ns = ? AND id = ?", (ns, identity_id))
     conn.commit()
     return cursor.rowcount > 0
 
@@ -352,7 +337,7 @@ def update_identity_metadata(ns: str, identity_id: str, metadata: dict[str, Any]
     conn = get_connection()
     cursor = conn.execute(
         "UPDATE identities SET metadata = ? WHERE ns = ? AND id = ?",
-        (json.dumps(metadata), ns, identity_id)
+        (json.dumps(metadata), ns, identity_id),
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -369,7 +354,7 @@ def send_message(
     ttl_hours: int | None = None,
 ) -> dict:
     """Send a message. Returns message info.
-    
+
     Args:
         ns: Namespace
         from_id: Sender identity
@@ -379,29 +364,26 @@ def send_message(
     """
     # Verify recipient exists
     conn = get_connection()
-    row = conn.execute(
-        "SELECT id FROM identities WHERE ns = ? AND id = ?",
-        (ns, to_id)
-    ).fetchone()
-    
+    row = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id)).fetchone()
+
     if not row:
         raise ValueError(f"Recipient {to_id} not found in namespace {ns}")
-    
+
     mid = str(make_uuid7())
     now = datetime.now(timezone.utc).isoformat()
-    
+
     # If sender specifies TTL, message expires from creation (ephemeral)
     expires_at = None
     if ttl_hours is not None:
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
-    
+
     conn.execute(
         """INSERT INTO messages (mid, ns, to_id, from_id, body, created_at, expires_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (mid, ns, to_id, from_id, body, now, expires_at)
+        (mid, ns, to_id, from_id, body, now, expires_at),
     )
     conn.commit()
-    
+
     return {"mid": mid, "from": from_id, "to": to_id, "created_at": now}
 
 
@@ -410,24 +392,26 @@ def get_messages(
     identity_id: str,
     unread_only: bool = False,
     after_mid: str | None = None,
+    mark_as_read: bool = True,
 ) -> list[dict]:
-    """Get messages for an identity, marking unread messages as read.
-    
+    """Get messages for an identity, optionally marking unread messages as read.
+
     Args:
         ns: Namespace
         identity_id: Identity to fetch messages for
         unread_only: Only return unread messages
         after_mid: Only return messages after this message ID (cursor)
-    
+        mark_as_read: If True (default), marks unread messages as read and starts TTL
+
     Returns:
         List of messages, sorted by created_at
     """
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    
+
     # Get namespace TTL for setting expiration on read
     ttl_hours = get_namespace_ttl_hours(ns)
-    
+
     # Build query
     query = """
         SELECT mid, from_id, to_id, body, created_at, read_at, expires_at
@@ -436,19 +420,19 @@ def get_messages(
         AND (expires_at IS NULL OR expires_at > ?)
     """
     params: list[Any] = [ns, identity_id, now]
-    
+
     if unread_only:
         query += " AND read_at IS NULL"
-    
+
     if after_mid:
         # UUIDv7 is timestamp-ordered, so we can use string comparison
         query += " AND mid > ?"
         params.append(after_mid)
-    
+
     query += " ORDER BY mid"  # UUIDv7 ordering = chronological
-    
+
     rows = conn.execute(query, params).fetchall()
-    
+
     messages = [
         {
             "mid": row["mid"],
@@ -461,24 +445,25 @@ def get_messages(
         }
         for row in rows
     ]
-    
-    # Mark unread messages as read and set expiration
-    unread_mids = [m["mid"] for m in messages if m["read_at"] is None]
-    if unread_mids:
-        expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
-        placeholders = ",".join("?" * len(unread_mids))
-        conn.execute(
-            f"UPDATE messages SET read_at = ?, expires_at = ? WHERE mid IN ({placeholders})",
-            [now, expires_at] + unread_mids
-        )
-        conn.commit()
-        
-        # Update return values
-        for m in messages:
-            if m["read_at"] is None:
-                m["read_at"] = now
-                m["expires_at"] = expires_at
-    
+
+    # Mark unread messages as read and set expiration (if requested)
+    if mark_as_read:
+        unread_mids = [m["mid"] for m in messages if m["read_at"] is None]
+        if unread_mids:
+            expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
+            placeholders = ",".join("?" * len(unread_mids))
+            conn.execute(
+                f"UPDATE messages SET read_at = ?, expires_at = ? WHERE mid IN ({placeholders})",
+                [now, expires_at] + unread_mids,
+            )
+            conn.commit()
+
+            # Update return values
+            for m in messages:
+                if m["read_at"] is None:
+                    m["read_at"] = now
+                    m["expires_at"] = expires_at
+
     return messages
 
 
@@ -491,9 +476,9 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
            FROM messages 
            WHERE ns = ? AND to_id = ? AND mid = ?
            AND (expires_at IS NULL OR expires_at > ?)""",
-        (ns, identity_id, mid, now)
+        (ns, identity_id, mid, now),
     ).fetchone()
-    
+
     if row:
         return {
             "mid": row["mid"],
@@ -511,8 +496,7 @@ def delete_message(ns: str, identity_id: str, mid: str) -> bool:
     """Immediately delete a message."""
     conn = get_connection()
     cursor = conn.execute(
-        "DELETE FROM messages WHERE ns = ? AND to_id = ? AND mid = ?",
-        (ns, identity_id, mid)
+        "DELETE FROM messages WHERE ns = ? AND to_id = ? AND mid = ?", (ns, identity_id, mid)
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -531,9 +515,9 @@ def get_expired_messages(limit: int = 1000) -> list[dict]:
            WHERE expires_at IS NOT NULL AND expires_at <= ?
            ORDER BY expires_at
            LIMIT ?""",
-        (now, limit)
+        (now, limit),
     ).fetchall()
-    
+
     return [dict(row) for row in rows]
 
 
@@ -542,8 +526,7 @@ def delete_expired_messages() -> int:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?",
-        (now,)
+        "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,)
     )
     conn.commit()
     return cursor.rowcount
@@ -553,7 +536,7 @@ def mark_messages_archived(mids: list[str], archive_key: str) -> int:
     """Mark messages as archived with a reference key."""
     if not mids:
         return 0
-    
+
     # For now, we just delete after archiving
     # In the future, could add an archive_key column
     return len(mids)
@@ -573,7 +556,7 @@ def create_archive_batch(
         """INSERT INTO archive_batches 
            (batch_id, ns, archive_path, message_count, min_created_at, max_created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (batch_id, ns, archive_path, message_count, min_created_at, max_created_at)
+        (batch_id, ns, archive_path, message_count, min_created_at, max_created_at),
     )
     conn.commit()
     return batch_id
@@ -582,15 +565,12 @@ def create_archive_batch(
 def get_archive_batches(ns: str | None = None) -> list[dict]:
     """Get archive batch records, optionally filtered by namespace."""
     conn = get_connection()
-    
+
     if ns:
         rows = conn.execute(
-            "SELECT * FROM archive_batches WHERE ns = ? ORDER BY created_at",
-            (ns,)
+            "SELECT * FROM archive_batches WHERE ns = ? ORDER BY created_at", (ns,)
         ).fetchall()
     else:
-        rows = conn.execute(
-            "SELECT * FROM archive_batches ORDER BY created_at"
-        ).fetchall()
-    
+        rows = conn.execute("SELECT * FROM archive_batches ORDER BY created_at").fetchall()
+
     return [dict(row) for row in rows]

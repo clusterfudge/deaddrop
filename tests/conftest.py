@@ -18,6 +18,6 @@ from deadrop import db
 def reset_database():
     """Reset database before each test function."""
     db.close_db()  # Close any existing connection
-    db.init_db()   # Initialize fresh
+    db.init_db()  # Initialize fresh
     yield
     db.close_db()  # Cleanup after test
