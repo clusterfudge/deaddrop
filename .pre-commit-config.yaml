@@ -14,3 +14,10 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
+
+      - id: check-requirements
+        name: check requirements.txt sync
+        entry: uv run python scripts/check_requirements.py
+        language: system
+        files: ^(pyproject\.toml|requirements\.txt)$
+        pass_filenames: false
