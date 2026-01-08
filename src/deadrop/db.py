@@ -468,7 +468,7 @@ def get_messages(
 
     query += " ORDER BY mid"  # UUIDv7 ordering = chronological
 
-    cursor = conn.execute(query, params)
+    cursor = conn.execute(query, tuple(params))
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
     messages = [
@@ -492,7 +492,7 @@ def get_messages(
             placeholders = ",".join("?" * len(unread_mids))
             conn.execute(
                 f"UPDATE messages SET read_at = ?, expires_at = ? WHERE mid IN ({placeholders})",
-                [now, expires_at] + unread_mids,
+                tuple([now, expires_at] + unread_mids),
             )
             conn.commit()
 
