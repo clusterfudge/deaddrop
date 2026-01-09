@@ -494,6 +494,33 @@ class TestMessaging:
         )
         assert response.status_code == 410  # Gone
 
+    def test_send_message_to_self(self, client, setup_agents):
+        """Inbox owner can send messages to themselves."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+
+        # Agent 1 sends to themselves
+        response = client.post(
+            f"/{ns}/send",
+            json={"to": agent1["id"], "body": "Note to self"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["from"] == agent1["id"]
+        assert response.json()["to"] == agent1["id"]
+
+        # Agent 1 reads their own inbox and sees the self-sent message
+        response = client.get(
+            f"/{ns}/inbox/{agent1['id']}",
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        messages = response.json()["messages"]
+        assert len(messages) == 1
+        assert messages[0]["from"] == agent1["id"]
+        assert messages[0]["to"] == agent1["id"]
+        assert messages[0]["body"] == "Note to self"
+
     def test_ephemeral_message_with_ttl(self, client, setup_agents):
         """Sender can set TTL for ephemeral messages."""
         ns = setup_agents["ns"]

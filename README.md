@@ -20,6 +20,8 @@ Three tiers of authentication, with clear separation of concerns:
 
 **Key principle**: Neither admin nor namespace owner can read message contents. Only the mailbox owner can access their inbox.
 
+**Self-messaging**: Mailbox owners can send messages to themselves. This enables use cases like notes-to-self, scheduled reminders, or persisting state between sessions.
+
 ## Message Lifecycle
 
 ```
@@ -253,6 +255,7 @@ deadrop identity delete {ns} {id} --remote
 # Messages (for testing)
 deadrop message send {ns} {to} "Hello!"
 deadrop message send {ns} {to} "Hi" --identity-id {from}
+deadrop message send {ns} {my_id} "Note to self"  # Self-message
 deadrop message inbox {ns}                  # Read all
 deadrop message inbox {ns} --unread         # Only unread
 deadrop message inbox {ns} --after {mid}    # After cursor
