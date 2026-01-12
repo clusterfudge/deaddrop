@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -78,11 +79,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS namespaces (
             ns TEXT PRIMARY KEY,
             secret_hash TEXT NOT NULL,
+            slug TEXT UNIQUE,
             metadata JSON DEFAULT '{}',
             ttl_hours INTEGER DEFAULT 24,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             archived_at TIMESTAMP
         );
+        
+        CREATE INDEX IF NOT EXISTS idx_namespaces_slug ON namespaces(slug);
         
         CREATE TABLE IF NOT EXISTS identities (
             id TEXT NOT NULL,
@@ -102,6 +106,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             read_at TIMESTAMP,
             expires_at TIMESTAMP,
+            archived_at TIMESTAMP,
             FOREIGN KEY (ns, to_id) REFERENCES identities(ns, id) ON DELETE CASCADE
         );
         
@@ -109,6 +114,24 @@ def init_db():
             ON messages(ns, to_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_messages_expires 
             ON messages(expires_at) WHERE expires_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_messages_archived
+            ON messages(ns, to_id, archived_at) WHERE archived_at IS NOT NULL;
+        
+        CREATE TABLE IF NOT EXISTS invites (
+            invite_id TEXT PRIMARY KEY,
+            ns TEXT NOT NULL REFERENCES namespaces(ns) ON DELETE CASCADE,
+            identity_id TEXT NOT NULL,
+            server_key TEXT NOT NULL,
+            encrypted_secret TEXT NOT NULL,
+            display_name TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP,
+            claimed_at TIMESTAMP,
+            claimed_by TEXT
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_invites_ns ON invites(ns);
         
         CREATE TABLE IF NOT EXISTS archive_batches (
             batch_id TEXT PRIMARY KEY,
@@ -128,6 +151,7 @@ def reset_db():
     conn = get_connection()
     conn.executescript("""
         DROP TABLE IF EXISTS archive_batches;
+        DROP TABLE IF EXISTS invites;
         DROP TABLE IF EXISTS messages;
         DROP TABLE IF EXISTS identities;
         DROP TABLE IF EXISTS namespaces;
@@ -136,33 +160,89 @@ def reset_db():
     init_db()
 
 
+# --- Slug Utilities ---
+
+
+def slugify(text: str) -> str:
+    """Convert text to a URL-safe slug."""
+    if not text:
+        return ""
+    # Lowercase, replace spaces/underscores with hyphens
+    slug = text.lower().strip()
+    slug = re.sub(r"[\s_]+", "-", slug)
+    # Remove non-alphanumeric chars (except hyphens)
+    slug = re.sub(r"[^a-z0-9-]", "", slug)
+    # Remove multiple consecutive hyphens
+    slug = re.sub(r"-+", "-", slug)
+    # Remove leading/trailing hyphens
+    slug = slug.strip("-")
+    return slug
+
+
+def make_unique_slug(base_slug: str, exclude_ns: str | None = None) -> str:
+    """Generate a unique slug, appending a number if necessary."""
+    conn = get_connection()
+    slug = base_slug or "namespace"
+
+    # Check if slug exists
+    query = "SELECT COUNT(*) FROM namespaces WHERE slug = ?"
+    params: list[Any] = [slug]
+    if exclude_ns:
+        query += " AND ns != ?"
+        params.append(exclude_ns)
+
+    cursor = conn.execute(query, tuple(params))
+    count = cursor.fetchone()[0]
+
+    if count == 0:
+        return slug
+
+    # Append numbers until unique
+    counter = 2
+    while True:
+        new_slug = f"{slug}-{counter}"
+        params[0] = new_slug
+        cursor = conn.execute(query, tuple(params))
+        if cursor.fetchone()[0] == 0:
+            return new_slug
+        counter += 1
+
+
 # --- Namespace Operations ---
 
 
 def create_namespace(
-    metadata: dict[str, Any] | None = None, ttl_hours: int = DEFAULT_TTL_HOURS
+    metadata: dict[str, Any] | None = None,
+    ttl_hours: int = DEFAULT_TTL_HOURS,
+    slug: str | None = None,
 ) -> dict[str, str]:
-    """Create a new namespace. Returns {ns, secret}."""
+    """Create a new namespace. Returns {ns, secret, slug}."""
     secret = generate_secret()
     ns = derive_id(secret)
     secret_hash = hash_secret(secret)
     metadata_json = json.dumps(metadata or {})
 
+    # Generate slug from display_name if not provided
+    if not slug and metadata and metadata.get("display_name"):
+        slug = slugify(metadata["display_name"])
+    if slug:
+        slug = make_unique_slug(slug)
+
     conn = get_connection()
     conn.execute(
-        "INSERT INTO namespaces (ns, secret_hash, metadata, ttl_hours) VALUES (?, ?, ?, ?)",
-        (ns, secret_hash, metadata_json, ttl_hours),
+        "INSERT INTO namespaces (ns, secret_hash, slug, metadata, ttl_hours) VALUES (?, ?, ?, ?, ?)",
+        (ns, secret_hash, slug, metadata_json, ttl_hours),
     )
     conn.commit()
 
-    return {"ns": ns, "secret": secret}
+    return {"ns": ns, "secret": secret, "slug": slug}
 
 
 def get_namespace(ns: str) -> dict | None:
     """Get namespace by ID."""
     conn = get_connection()
     cursor = conn.execute(
-        "SELECT ns, metadata, ttl_hours, created_at, archived_at FROM namespaces WHERE ns = ?",
+        "SELECT ns, slug, metadata, ttl_hours, created_at, archived_at FROM namespaces WHERE ns = ?",
         (ns,),
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
@@ -170,12 +250,77 @@ def get_namespace(ns: str) -> dict | None:
     if row:
         return {
             "ns": row["ns"],
+            "slug": row["slug"],
             "metadata": json.loads(row["metadata"] or "{}"),
             "ttl_hours": row["ttl_hours"],
             "created_at": row["created_at"],
             "archived_at": row["archived_at"],
         }
     return None
+
+
+def get_namespace_by_slug(slug: str) -> dict | None:
+    """Get namespace by slug."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "SELECT ns, slug, metadata, ttl_hours, created_at, archived_at FROM namespaces WHERE slug = ?",
+        (slug,),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if row:
+        return {
+            "ns": row["ns"],
+            "slug": row["slug"],
+            "metadata": json.loads(row["metadata"] or "{}"),
+            "ttl_hours": row["ttl_hours"],
+            "created_at": row["created_at"],
+            "archived_at": row["archived_at"],
+        }
+    return None
+
+
+def get_or_create_namespace_slug(ns: str, suggested_slug: str | None = None) -> str | None:
+    """Get existing slug or create one for namespace."""
+    conn = get_connection()
+
+    # Check if already has slug
+    cursor = conn.execute("SELECT slug, metadata FROM namespaces WHERE ns = ?", (ns,))
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if not row:
+        return None
+
+    if row["slug"]:
+        return row["slug"]
+
+    # Generate slug from display_name or use suggested
+    metadata = json.loads(row["metadata"] or "{}")
+    base_slug = suggested_slug or slugify(metadata.get("display_name", "")) or ns[:8]
+    slug = make_unique_slug(base_slug, exclude_ns=ns)
+
+    conn.execute("UPDATE namespaces SET slug = ? WHERE ns = ?", (slug, ns))
+    conn.commit()
+    return slug
+
+
+def set_namespace_slug(ns: str, slug: str) -> bool:
+    """Set a namespace's slug. Returns False if slug already taken or ns not found."""
+    conn = get_connection()
+
+    # Validate slug format
+    clean_slug = slugify(slug)
+    if not clean_slug:
+        return False
+
+    # Check if slug is already taken by another namespace
+    cursor = conn.execute("SELECT ns FROM namespaces WHERE slug = ? AND ns != ?", (clean_slug, ns))
+    if cursor.fetchone():
+        return False
+
+    cursor = conn.execute("UPDATE namespaces SET slug = ? WHERE ns = ?", (clean_slug, ns))
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 def is_namespace_archived(ns: str) -> bool:
@@ -198,7 +343,7 @@ def archive_namespace(ns: str) -> bool:
 
 
 def get_namespace_ttl_hours(ns: str) -> int:
-    """Get the TTL hours for a namespace."""
+    """Get the TTL hours for a namespace. Returns 0 for persistent namespaces."""
     conn = get_connection()
     cursor = conn.execute("SELECT ttl_hours FROM namespaces WHERE ns = ?", (ns,))
     row = _row_to_dict(cursor.description, cursor.fetchone())
@@ -209,13 +354,14 @@ def list_namespaces() -> list[dict]:
     """List all namespaces."""
     conn = get_connection()
     cursor = conn.execute(
-        "SELECT ns, metadata, ttl_hours, created_at, archived_at FROM namespaces ORDER BY created_at"
+        "SELECT ns, slug, metadata, ttl_hours, created_at, archived_at FROM namespaces ORDER BY created_at"
     )
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
     return [
         {
             "ns": row["ns"],
+            "slug": row["slug"],
             "metadata": json.loads(row["metadata"] or "{}"),
             "ttl_hours": row["ttl_hours"],
             "created_at": row["created_at"],
@@ -297,6 +443,16 @@ def get_identity(ns: str, identity_id: str) -> dict | None:
             "created_at": row["created_at"],
         }
     return None
+
+
+def get_identity_secret_hash(ns: str, identity_id: str) -> str | None:
+    """Get the secret hash for an identity (used for invite creation)."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+    return row["secret_hash"] if row else None
 
 
 def list_identities(ns: str) -> list[dict]:
@@ -398,9 +554,7 @@ def send_message(
     """
     # Verify recipient exists
     conn = get_connection()
-    cursor = conn.execute(
-        "SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id)
-    )
+    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id))
     row = cursor.fetchone()
 
     if not row:
@@ -411,7 +565,7 @@ def send_message(
 
     # If sender specifies TTL, message expires from creation (ephemeral)
     expires_at = None
-    if ttl_hours is not None:
+    if ttl_hours is not None and ttl_hours > 0:
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
 
     conn.execute(
@@ -430,6 +584,7 @@ def get_messages(
     unread_only: bool = False,
     after_mid: str | None = None,
     mark_as_read: bool = True,
+    include_archived: bool = False,
 ) -> list[dict]:
     """Get messages for an identity, optionally marking unread messages as read.
 
@@ -439,6 +594,7 @@ def get_messages(
         unread_only: Only return unread messages
         after_mid: Only return messages after this message ID (cursor)
         mark_as_read: If True (default), marks unread messages as read and starts TTL
+        include_archived: If True, include archived messages
 
     Returns:
         List of messages, sorted by created_at
@@ -451,12 +607,15 @@ def get_messages(
 
     # Build query
     query = """
-        SELECT mid, from_id, to_id, body, created_at, read_at, expires_at
+        SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
         FROM messages 
         WHERE ns = ? AND to_id = ?
         AND (expires_at IS NULL OR expires_at > ?)
     """
     params: list[Any] = [ns, identity_id, now]
+
+    if not include_archived:
+        query += " AND archived_at IS NULL"
 
     if unread_only:
         query += " AND read_at IS NULL"
@@ -480,15 +639,21 @@ def get_messages(
             "created_at": row["created_at"],
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
+            "archived_at": row.get("archived_at"),
         }
         for row in rows
     ]
 
-    # Mark unread messages as read and set expiration (if requested)
+    # Mark unread messages as read and set expiration (if requested and namespace has TTL)
     if mark_as_read:
         unread_mids = [m["mid"] for m in messages if m["read_at"] is None]
         if unread_mids:
-            expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
+            # Only set expires_at if namespace has TTL (ttl_hours > 0)
+            if ttl_hours > 0:
+                expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
+            else:
+                expires_at = None  # Persistent namespace - no expiration
+
             placeholders = ",".join("?" * len(unread_mids))
             conn.execute(
                 f"UPDATE messages SET read_at = ?, expires_at = ? WHERE mid IN ({placeholders})",
@@ -510,7 +675,7 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at
+        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
            FROM messages 
            WHERE ns = ? AND to_id = ? AND mid = ?
            AND (expires_at IS NULL OR expires_at > ?)""",
@@ -527,6 +692,7 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
             "created_at": row["created_at"],
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
+            "archived_at": row.get("archived_at"),
         }
     return None
 
@@ -541,6 +707,230 @@ def delete_message(ns: str, identity_id: str, mid: str) -> bool:
     return cursor.rowcount > 0
 
 
+def archive_message(ns: str, identity_id: str, mid: str) -> bool:
+    """Archive a message (hide from inbox but preserve)."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """UPDATE messages SET archived_at = ?, expires_at = NULL 
+           WHERE ns = ? AND to_id = ? AND mid = ? AND archived_at IS NULL""",
+        (now, ns, identity_id, mid),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def unarchive_message(ns: str, identity_id: str, mid: str) -> bool:
+    """Unarchive a message (restore to inbox)."""
+    conn = get_connection()
+    # Note: We don't restore the original expires_at - message becomes permanent
+    # unless namespace TTL kicks in on next read
+    cursor = conn.execute(
+        "UPDATE messages SET archived_at = NULL WHERE ns = ? AND to_id = ? AND mid = ?",
+        (ns, identity_id, mid),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_archived_messages(ns: str, identity_id: str) -> list[dict]:
+    """Get archived messages for an identity."""
+    conn = get_connection()
+    cursor = conn.execute(
+        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
+           FROM messages 
+           WHERE ns = ? AND to_id = ? AND archived_at IS NOT NULL
+           ORDER BY archived_at DESC""",
+        (ns, identity_id),
+    )
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
+
+    return [
+        {
+            "mid": row["mid"],
+            "from": row["from_id"],
+            "to": row["to_id"],
+            "body": row["body"],
+            "created_at": row["created_at"],
+            "read_at": row["read_at"],
+            "expires_at": row["expires_at"],
+            "archived_at": row["archived_at"],
+        }
+        for row in rows
+    ]
+
+
+# --- Invite Operations ---
+
+
+def create_invite(
+    invite_id: str,
+    ns: str,
+    identity_id: str,
+    server_key: str,
+    encrypted_secret: str,
+    display_name: str | None = None,
+    created_by: str | None = None,
+    expires_at: str | None = None,
+) -> dict:
+    """Create an invite record."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """INSERT INTO invites 
+           (invite_id, ns, identity_id, server_key, encrypted_secret, display_name, created_by, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            invite_id,
+            ns,
+            identity_id,
+            server_key,
+            encrypted_secret,
+            display_name,
+            created_by,
+            now,
+            expires_at,
+        ),
+    )
+    conn.commit()
+
+    return {
+        "invite_id": invite_id,
+        "ns": ns,
+        "identity_id": identity_id,
+        "display_name": display_name,
+        "created_at": now,
+        "expires_at": expires_at,
+    }
+
+
+def get_invite(invite_id: str) -> dict | None:
+    """Get an invite by ID."""
+    conn = get_connection()
+    cursor = conn.execute(
+        """SELECT invite_id, ns, identity_id, server_key, encrypted_secret, display_name,
+                  created_by, created_at, expires_at, claimed_at, claimed_by
+           FROM invites WHERE invite_id = ?""",
+        (invite_id,),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+    return row
+
+
+def get_invite_info(invite_id: str) -> dict | None:
+    """Get public invite info (without secrets)."""
+    conn = get_connection()
+    cursor = conn.execute(
+        """SELECT invite_id, ns, identity_id, display_name, created_at, expires_at, claimed_at
+           FROM invites WHERE invite_id = ?""",
+        (invite_id,),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if row:
+        # Add namespace info
+        ns_info = get_namespace(row["ns"])
+        if ns_info:
+            row["namespace_slug"] = ns_info.get("slug")
+            row["namespace_display_name"] = ns_info.get("metadata", {}).get("display_name")
+            row["namespace_ttl_hours"] = ns_info.get("ttl_hours")
+
+        # Add identity info
+        identity_info = get_identity(row["ns"], row["identity_id"])
+        if identity_info:
+            row["identity_display_name"] = identity_info.get("metadata", {}).get("display_name")
+
+    return row
+
+
+def claim_invite(invite_id: str, claimed_by: str | None = None) -> dict | None:
+    """
+    Claim an invite (mark as used and return secrets).
+
+    Returns the full invite record including server_key and encrypted_secret,
+    or None if invite doesn't exist, is already claimed, or is expired.
+    """
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Get invite and check validity
+    cursor = conn.execute(
+        """SELECT invite_id, ns, identity_id, server_key, encrypted_secret, display_name,
+                  created_by, created_at, expires_at, claimed_at
+           FROM invites 
+           WHERE invite_id = ? 
+           AND claimed_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?)""",
+        (invite_id, now),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if not row:
+        return None
+
+    # Mark as claimed
+    conn.execute(
+        "UPDATE invites SET claimed_at = ?, claimed_by = ? WHERE invite_id = ?",
+        (now, claimed_by, invite_id),
+    )
+    conn.commit()
+
+    # Add namespace info
+    ns_info = get_namespace(row["ns"])
+    if ns_info:
+        row["namespace_slug"] = ns_info.get("slug") or get_or_create_namespace_slug(row["ns"])
+        row["namespace_display_name"] = ns_info.get("metadata", {}).get("display_name")
+        row["namespace_ttl_hours"] = ns_info.get("ttl_hours")
+
+    # Add identity info
+    identity_info = get_identity(row["ns"], row["identity_id"])
+    if identity_info:
+        row["identity_display_name"] = identity_info.get("metadata", {}).get("display_name")
+
+    row["claimed_at"] = now
+    row["claimed_by"] = claimed_by
+
+    return row
+
+
+def list_invites(ns: str, include_claimed: bool = False) -> list[dict]:
+    """List invites for a namespace."""
+    conn = get_connection()
+
+    query = """SELECT invite_id, ns, identity_id, display_name, created_by, 
+                      created_at, expires_at, claimed_at, claimed_by
+               FROM invites WHERE ns = ?"""
+
+    if not include_claimed:
+        query += " AND claimed_at IS NULL"
+
+    query += " ORDER BY created_at DESC"
+
+    cursor = conn.execute(query, (ns,))
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def revoke_invite(invite_id: str) -> bool:
+    """Revoke (delete) an invite."""
+    conn = get_connection()
+    cursor = conn.execute("DELETE FROM invites WHERE invite_id = ?", (invite_id,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def cleanup_expired_invites() -> int:
+    """Delete expired unclaimed invites. Returns count deleted."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "DELETE FROM invites WHERE expires_at IS NOT NULL AND expires_at <= ? AND claimed_at IS NULL",
+        (now,),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 # --- TTL and Archive Operations ---
 
 
@@ -551,7 +941,7 @@ def get_expired_messages(limit: int = 1000) -> list[dict]:
     cursor = conn.execute(
         """SELECT mid, ns, to_id, from_id, body, created_at, read_at, expires_at
            FROM messages 
-           WHERE expires_at IS NOT NULL AND expires_at <= ?
+           WHERE expires_at IS NOT NULL AND expires_at <= ? AND archived_at IS NULL
            ORDER BY expires_at
            LIMIT ?""",
         (now, limit),
@@ -560,11 +950,12 @@ def get_expired_messages(limit: int = 1000) -> list[dict]:
 
 
 def delete_expired_messages() -> int:
-    """Delete all expired messages. Returns count deleted."""
+    """Delete all expired messages (excluding archived). Returns count deleted."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,)
+        "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ? AND archived_at IS NULL",
+        (now,),
     )
     conn.commit()
     return cursor.rowcount

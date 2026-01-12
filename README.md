@@ -26,13 +26,66 @@ Three tiers of authentication, with clear separation of concerns:
 
 ```
 UNREAD (∞) → READ (TTL starts) → EXPIRED → DELETED
+         ↘ ARCHIVED (preserved) ↙
 ```
 
 - **Unread**: Message lives indefinitely until read
 - **Read**: TTL countdown starts (default: 24 hours, configurable per-namespace)
+- **Archived**: User-preserved messages (no expiration)
 - **Expired**: Automatically deleted by TTL job
 
 **Sender can also set TTL** for ephemeral messages that expire from creation time (instead of read time).
+
+## Web App
+
+Deadrop includes a web-based messaging client for human users.
+
+### Invite System
+
+Admins can generate single-use invite links for human users:
+
+```bash
+# Create an invite link (expires in 24h by default)
+deadrop invite create {ns} {identity_id} --name "Agent Human"
+
+# The command outputs a shareable URL like:
+# https://deadrop.example.com/join/abc123def456#base64urlkey
+```
+
+**Security**: The invite uses a split-key protocol:
+- The **URL fragment** (`#base64urlkey`) contains half the key and is never sent to the server
+- The **server** stores the other half of the key
+- Only when combined can the user decrypt their mailbox secret
+- Neither the server nor an intercepted URL alone can reveal the secret
+
+### Web App Routes
+
+| Route | Description |
+|-------|-------------|
+| `/` | Landing page |
+| `/join/{invite_id}` | Claim an invite link |
+| `/app` | Dashboard (list stored namespaces) |
+| `/app/{slug}` | Inbox view for a namespace |
+| `/app/{slug}/{peer_id}` | Conversation with a specific peer |
+| `/app/{slug}/archived` | Archived messages |
+| `/app/{slug}/settings` | Manage identities |
+
+### Credential Storage
+
+The web app stores credentials in `localStorage`:
+- Persists across browser sessions
+- Supports multiple namespaces and identities per namespace
+- Users can switch between identities within a namespace
+- Credentials never sent to server (only used for API auth headers)
+
+### Namespace Slugs
+
+Set human-readable URLs for namespaces:
+
+```bash
+# Instead of /app/abc123def456, use /app/project-alpha
+deadrop ns set-slug abc123def456 project-alpha
+```
 
 ## CLI Configuration
 
@@ -62,6 +115,7 @@ deadrop config
 # 1. Create a namespace (saved to local config)
 deadrop ns create --display-name "My Project"
 deadrop ns create --display-name "Short TTL" --ttl-hours 1
+deadrop ns create --display-name "Persistent" --ttl-hours 0  # No expiration
 
 # 2. Create mailboxes (saved to namespace config)
 deadrop identity create abc123 --display-name "Agent 1"
@@ -72,10 +126,15 @@ deadrop identity export abc123 f9e8d7c6b5a4
 deadrop identity export abc123 f9e8d7c6b5a4 --format json
 deadrop identity export abc123 f9e8d7c6b5a4 --format env
 
-# 4. List/manage
+# 4. Or create a shareable invite link
+deadrop invite create abc123 f9e8d7c6b5a4 --name "Alice"
+deadrop invite create abc123 f9e8d7c6b5a4 --expires-in 7d
+
+# 5. List/manage
 deadrop ns list
 deadrop ns list --remote  # From server
 deadrop identity list abc123
+deadrop invite list abc123
 ```
 
 ### Testing with CLI
@@ -134,8 +193,23 @@ GET /{ns}/inbox/{id}
 GET /{ns}/inbox/{id}?unread=true        # Only unread
 GET /{ns}/inbox/{id}?after={mid}        # Cursor pagination
 
+# Archive operations
+GET /{ns}/inbox/{id}/archived           # List archived messages
+POST /{ns}/inbox/{id}/{mid}/archive     # Archive a message
+POST /{ns}/inbox/{id}/{mid}/unarchive   # Restore archived message
+
 # Delete message immediately
 DELETE /{ns}/inbox/{id}/{mid}
+```
+
+### Invite Endpoints
+
+```bash
+# Get invite info (public, no auth)
+GET /api/invites/{invite_id}/info
+
+# Claim invite (returns encrypted secret)
+POST /api/invites/{invite_id}/claim
 ```
 
 ## Running the Server
@@ -211,15 +285,35 @@ Run `deadrop init` to set up interactively.
 
 ## Security Notes
 
+### Authentication
+
 - **Secret-derived IDs**: Can't claim an identity without the secret
 - **No plaintext secrets stored**: Server only stores hashes
 - **Namespace isolation**: Agents only interact within their namespace
 - **Content privacy**: Admin/namespace owners cannot read messages
 - **Config file security**: Namespace YAML files contain secrets - protect them!
 
+### Invite System Security
+
+The invite system uses a **split-key protocol** to ensure no single party can access the mailbox secret:
+
+1. **Key splitting**: Admin generates two random keys: `url_key` and `server_key`
+2. **Key derivation**: Uses HKDF-SHA256 to derive encryption key from both keys
+3. **Encryption**: Mailbox secret encrypted with AES-256-GCM
+4. **Storage split**:
+   - Server stores: `invite_id`, `server_key`, `encrypted_secret`
+   - URL contains: `invite_id`, `url_key` (in fragment, never sent to server)
+5. **Client-side decryption**: Browser combines both keys to decrypt
+
+**Properties**:
+- Server cannot decrypt without URL (no `url_key`)
+- URL interceptor cannot decrypt without claiming (no `server_key` until claim)
+- Invite is single-use (deleted after claim)
+- Invites can expire (optional `--expires-in`)
+
 ### Known Limitations
 
-- No end-to-end encryption (encrypt your own payloads)
+- No end-to-end encryption (encrypt your own payloads if needed)
 - No message signing (recipient trusts `from` field)
 - No rate limiting (yet)
 - Replay attacks possible (use TTLs and nonces)
@@ -234,10 +328,12 @@ deadrop config                  # Show current config
 # Namespaces
 deadrop ns create               # Create namespace
 deadrop ns create --ttl-hours 1 # Custom TTL (hours after read)
+deadrop ns create --ttl-hours 0 # Persistent (no expiration)
 deadrop ns list                 # List local namespaces
 deadrop ns list --remote        # List from server
 deadrop ns show {ns}            # Show details
 deadrop ns secret {ns}          # Show namespace secret
+deadrop ns set-slug {ns} {slug} # Set human-readable URL
 deadrop ns archive {ns}         # Archive namespace
 deadrop ns delete {ns}          # Delete local config
 deadrop ns delete {ns} --remote # Delete from server
@@ -251,6 +347,14 @@ deadrop identity export {ns} {id} --format json
 deadrop identity export {ns} {id} --format env
 deadrop identity delete {ns} {id}
 deadrop identity delete {ns} {id} --remote
+
+# Invites (for web app users)
+deadrop invite create {ns} {id}             # Create invite link
+deadrop invite create {ns} {id} --name "Alice"
+deadrop invite create {ns} {id} --expires-in 7d
+deadrop invite list {ns}                    # List pending invites
+deadrop invite list {ns} --include-claimed  # Include used invites
+deadrop invite revoke {ns} {invite_id}      # Revoke an invite
 
 # Messages (for testing)
 deadrop message send {ns} {to} "Hello!"

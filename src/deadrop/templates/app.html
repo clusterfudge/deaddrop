@@ -1,0 +1,550 @@
+{% extends "base.html" %}
+
+{% block title %}Deadrop{% endblock %}
+
+{% block body %}
+<div id="app">
+    <!-- Namespace List View -->
+    <div id="view-namespaces" class="view">
+        <div class="header">
+            <h1>📬 Deadrop</h1>
+        </div>
+        
+        <div class="container">
+            <h2 style="margin-bottom: 16px;">Your Namespaces</h2>
+            
+            <div id="namespace-list"></div>
+            
+            <div id="no-namespaces" class="empty-state hidden">
+                <div class="empty-state-icon">📭</div>
+                <div class="empty-state-title">No namespaces yet</div>
+                <p>Get an invite link to join a namespace.</p>
+            </div>
+            
+            <div class="card" style="margin-top: 24px;">
+                <h3 style="margin-bottom: 12px;">Have an invite link?</h3>
+                <div style="display: flex; gap: 8px;">
+                    <input type="text" id="invite-url-input" class="form-input" 
+                           placeholder="Paste invite URL here...">
+                    <button id="invite-go-btn" class="btn btn-primary">Go</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Inbox View -->
+    <div id="view-inbox" class="view hidden">
+        <div class="header">
+            <a href="/app" class="back-link" id="inbox-back">←</a>
+            <div>
+                <h1 id="inbox-title">Namespace</h1>
+                <div class="subtitle" id="inbox-subtitle">as Identity</div>
+            </div>
+            <div style="margin-left: auto;">
+                <a href="#" id="inbox-settings" class="btn btn-icon">⚙️</a>
+            </div>
+        </div>
+        
+        <div style="padding: 16px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-weight: 600;">Inbox</span>
+            <div style="display: flex; gap: 8px;">
+                <a href="#" id="archived-link" class="btn btn-small btn-secondary">📦 Archived</a>
+                <button id="compose-btn" class="btn btn-small btn-primary">✏️ Compose</button>
+            </div>
+        </div>
+        
+        <div id="inbox-loading" class="loading">
+            <div class="spinner"></div>
+        </div>
+        
+        <div id="conversation-list"></div>
+        
+        <div id="inbox-empty" class="empty-state hidden">
+            <div class="empty-state-icon">📭</div>
+            <div class="empty-state-title">No messages yet</div>
+            <p>Start a conversation with a peer.</p>
+        </div>
+    </div>
+    
+    <!-- Conversation View -->
+    <div id="view-conversation" class="view hidden">
+        <div class="header">
+            <a href="#" class="back-link" id="conversation-back">←</a>
+            <h1 id="conversation-title">Peer</h1>
+        </div>
+        
+        <div id="message-list" class="message-list"></div>
+        
+        <div class="compose-area">
+            <textarea id="message-input" class="compose-input" 
+                      placeholder="Type a message..." rows="1"></textarea>
+            <button id="send-btn" class="btn btn-primary">Send ➤</button>
+        </div>
+    </div>
+    
+    <!-- Compose Modal -->
+    <div id="compose-modal" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
+        <div class="card" style="width: 100%; max-width: 480px; margin: 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h2>New Message</h2>
+                <button id="compose-cancel" class="btn btn-icon">✕</button>
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label">To</label>
+                <select id="compose-to" class="form-input"></select>
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label">Message</label>
+                <textarea id="compose-body" class="form-input" rows="4"></textarea>
+            </div>
+            
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+                <button id="compose-close" class="btn btn-secondary">Cancel</button>
+                <button id="compose-send" class="btn btn-primary">Send</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Archived View -->
+    <div id="view-archived" class="view hidden">
+        <div class="header">
+            <a href="#" class="back-link" id="archived-back">←</a>
+            <h1>Archived Messages</h1>
+        </div>
+        
+        <div class="container">
+            <div id="archived-list"></div>
+            
+            <div id="archived-empty" class="empty-state hidden">
+                <div class="empty-state-icon">📦</div>
+                <div class="empty-state-title">No archived messages</div>
+                <p>Archived messages appear here.</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // App state
+    let currentSlug = {{ slug | tojson if slug else 'null' }};
+    let currentPeerId = {{ peer_id | tojson if peer_id is defined and peer_id else 'null' }};
+    let currentView = {{ view | tojson if view is defined and view else 'null' }};
+    let credentials = null;
+    let peers = [];
+    let messages = [];
+    
+    // DOM elements
+    const views = {
+        namespaces: document.getElementById('view-namespaces'),
+        inbox: document.getElementById('view-inbox'),
+        conversation: document.getElementById('view-conversation'),
+        archived: document.getElementById('view-archived'),
+    };
+    
+    // Utility functions
+    function showView(name) {
+        Object.values(views).forEach(v => v.classList.add('hidden'));
+        views[name].classList.remove('hidden');
+    }
+    
+    function formatTime(isoString) {
+        const date = new Date(isoString);
+        const now = new Date();
+        const diffMs = now - date;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMs / 3600000);
+        const diffDays = Math.floor(diffMs / 86400000);
+        
+        if (diffMins < 1) return 'just now';
+        if (diffMins < 60) return `${diffMins}m ago`;
+        if (diffHours < 24) return `${diffHours}h ago`;
+        if (diffDays < 7) return `${diffDays}d ago`;
+        return date.toLocaleDateString();
+    }
+    
+    function formatExpiry(expiresAt, ttlHours) {
+        if (ttlHours === 0) return null; // Persistent
+        if (!expiresAt) return null; // Unread
+        
+        const remaining = new Date(expiresAt) - new Date();
+        if (remaining <= 0) return { text: 'expired', style: 'urgent' };
+        
+        const hours = Math.floor(remaining / 3600000);
+        const mins = Math.floor((remaining % 3600000) / 60000);
+        
+        if (hours > 3) return { text: `⏱ ${hours}h`, style: '' };
+        if (hours > 0) return { text: `⏱ ${hours}h`, style: 'warning' };
+        return { text: `⏱ ${mins}m`, style: 'urgent' };
+    }
+    
+    function getPeerName(id) {
+        const peer = peers.find(p => p.id === id);
+        return peer?.metadata?.display_name || id.substring(0, 8) + '...';
+    }
+    
+    // Namespace list
+    function renderNamespaceList() {
+        const list = document.getElementById('namespace-list');
+        const empty = document.getElementById('no-namespaces');
+        const namespaces = CredentialStore.listNamespaces();
+        
+        if (namespaces.length === 0) {
+            list.innerHTML = '';
+            empty.classList.remove('hidden');
+            return;
+        }
+        
+        empty.classList.add('hidden');
+        list.innerHTML = namespaces.map(ns => `
+            <div class="card card-clickable" onclick="openNamespace('${ns.slug || ns.ns}')">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <div class="card-title">${ns.displayName || ns.slug || ns.ns.substring(0, 8)}</div>
+                        <div class="card-subtitle">You are: ${ns.activeIdentity?.displayName || 'Unknown'}</div>
+                    </div>
+                    <span class="mode-badge ${ns.ttlHours === 0 ? 'persistent' : 'ephemeral'}">
+                        ${ns.ttlHours === 0 ? '📌 Persistent' : `⏱ ${ns.ttlHours}h TTL`}
+                    </span>
+                </div>
+            </div>
+        `).join('');
+    }
+    
+    // Open namespace
+    async function openNamespace(slug) {
+        currentSlug = slug;
+        credentials = CredentialStore.getCredentials(slug);
+        if (!credentials) {
+            alert('Credentials not found');
+            return;
+        }
+        
+        // Update URL
+        history.pushState({}, '', `/app/${slug}`);
+        
+        // Show inbox view
+        document.getElementById('inbox-title').textContent = 
+            CredentialStore.getNamespace(slug)?.displayName || slug;
+        document.getElementById('inbox-subtitle').textContent = 
+            `as ${credentials.displayName || credentials.id.substring(0, 8)}`;
+        
+        showView('inbox');
+        loadInbox();
+    }
+    
+    // Load inbox
+    async function loadInbox() {
+        const loading = document.getElementById('inbox-loading');
+        const list = document.getElementById('conversation-list');
+        const empty = document.getElementById('inbox-empty');
+        
+        loading.classList.remove('hidden');
+        list.innerHTML = '';
+        
+        try {
+            // Load peers and messages
+            const [peersResult, inboxResult] = await Promise.all([
+                DeadropAPI.listPeers(credentials),
+                DeadropAPI.getInbox(credentials),
+            ]);
+            
+            peers = peersResult;
+            messages = inboxResult.messages;
+            
+            loading.classList.add('hidden');
+            
+            // Group by peer
+            const conversations = {};
+            messages.forEach(msg => {
+                const peerId = msg.from === credentials.id ? msg.to : msg.from;
+                if (!conversations[peerId]) {
+                    conversations[peerId] = { peerId, messages: [], hasUnread: false };
+                }
+                conversations[peerId].messages.push(msg);
+                if (!msg.read_at && msg.from !== credentials.id) {
+                    conversations[peerId].hasUnread = true;
+                }
+            });
+            
+            // Sort by latest message
+            const sorted = Object.values(conversations).sort((a, b) => {
+                const aLatest = a.messages[a.messages.length - 1].created_at;
+                const bLatest = b.messages[b.messages.length - 1].created_at;
+                return new Date(bLatest) - new Date(aLatest);
+            });
+            
+            if (sorted.length === 0) {
+                empty.classList.remove('hidden');
+                return;
+            }
+            
+            empty.classList.add('hidden');
+            list.innerHTML = sorted.map(conv => {
+                const latest = conv.messages[conv.messages.length - 1];
+                const isSent = latest.from === credentials.id;
+                const preview = isSent ? `You: ${latest.body}` : latest.body;
+                const expiry = formatExpiry(latest.expires_at, credentials.ttlHours);
+                
+                return `
+                    <div class="conversation-item ${conv.hasUnread ? 'unread' : ''}" 
+                         onclick="openConversation('${conv.peerId}')">
+                        ${conv.hasUnread ? '<div class="unread-dot"></div>' : ''}
+                        <div class="conversation-avatar">${getPeerName(conv.peerId)[0].toUpperCase()}</div>
+                        <div class="conversation-content">
+                            <div class="conversation-header">
+                                <span class="conversation-name">${getPeerName(conv.peerId)}</span>
+                                <span class="conversation-time">${formatTime(latest.created_at)}</span>
+                            </div>
+                            <div class="conversation-preview">${preview.substring(0, 50)}${preview.length > 50 ? '...' : ''}</div>
+                            ${expiry ? `<span class="ttl-indicator ttl-${expiry.style}">${expiry.text}</span>` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            
+        } catch (e) {
+            loading.classList.add('hidden');
+            list.innerHTML = `<div class="error-message">${e.message}</div>`;
+        }
+    }
+    
+    // Open conversation
+    function openConversation(peerId) {
+        currentPeerId = peerId;
+        history.pushState({}, '', `/app/${currentSlug}/${peerId}`);
+        
+        document.getElementById('conversation-title').textContent = getPeerName(peerId);
+        showView('conversation');
+        renderConversation();
+    }
+    
+    // Render conversation
+    function renderConversation() {
+        const list = document.getElementById('message-list');
+        const peerMessages = messages.filter(m => 
+            m.from === currentPeerId || m.to === currentPeerId
+        );
+        
+        list.innerHTML = peerMessages.map(msg => {
+            const isSent = msg.from === credentials.id;
+            const expiry = formatExpiry(msg.expires_at, credentials.ttlHours);
+            
+            return `
+                <div class="message ${isSent ? 'message-sent' : 'message-received'}">
+                    <div class="message-body">${msg.body}</div>
+                    <div class="message-meta">
+                        <span>${formatTime(msg.created_at)}</span>
+                        ${expiry ? `<span class="ttl-indicator ttl-${expiry.style}">${expiry.text}</span>` : ''}
+                    </div>
+                    <div class="message-actions">
+                        <button class="btn btn-small btn-icon" onclick="archiveMessage('${msg.mid}')" title="Archive">📦</button>
+                        <button class="btn btn-small btn-icon" onclick="deleteMessage('${msg.mid}')" title="Delete">🗑</button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+        
+        // Scroll to bottom
+        list.scrollTop = list.scrollHeight;
+    }
+    
+    // Send message
+    async function sendMessage() {
+        const input = document.getElementById('message-input');
+        const body = input.value.trim();
+        if (!body) return;
+        
+        try {
+            await DeadropAPI.sendMessage(credentials, currentPeerId, body);
+            input.value = '';
+            
+            // Refresh inbox
+            const result = await DeadropAPI.getInbox(credentials);
+            messages = result.messages;
+            renderConversation();
+        } catch (e) {
+            alert('Failed to send: ' + e.message);
+        }
+    }
+    
+    // Archive message
+    async function archiveMessage(mid) {
+        if (!confirm('Archive this message?')) return;
+        try {
+            await DeadropAPI.archiveMessage(credentials, mid);
+            messages = messages.filter(m => m.mid !== mid);
+            renderConversation();
+        } catch (e) {
+            alert('Failed to archive: ' + e.message);
+        }
+    }
+    
+    // Delete message
+    async function deleteMessage(mid) {
+        if (!confirm('Delete this message permanently?')) return;
+        try {
+            await DeadropAPI.deleteMessage(credentials, mid);
+            messages = messages.filter(m => m.mid !== mid);
+            renderConversation();
+        } catch (e) {
+            alert('Failed to delete: ' + e.message);
+        }
+    }
+    
+    // Compose modal
+    function showCompose() {
+        const modal = document.getElementById('compose-modal');
+        const select = document.getElementById('compose-to');
+        
+        // Populate peer list
+        select.innerHTML = peers
+            .filter(p => p.id !== credentials.id)
+            .map(p => `<option value="${p.id}">${p.metadata?.display_name || p.id}</option>`)
+            .join('');
+        
+        // Add self option for notes
+        select.innerHTML += `<option value="${credentials.id}">Notes to Self</option>`;
+        
+        modal.classList.remove('hidden');
+    }
+    
+    function hideCompose() {
+        document.getElementById('compose-modal').classList.add('hidden');
+        document.getElementById('compose-body').value = '';
+    }
+    
+    async function sendCompose() {
+        const to = document.getElementById('compose-to').value;
+        const body = document.getElementById('compose-body').value.trim();
+        
+        if (!body) return;
+        
+        try {
+            await DeadropAPI.sendMessage(credentials, to, body);
+            hideCompose();
+            loadInbox();
+        } catch (e) {
+            alert('Failed to send: ' + e.message);
+        }
+    }
+    
+    // Event listeners
+    document.getElementById('invite-go-btn').addEventListener('click', () => {
+        const url = document.getElementById('invite-url-input').value.trim();
+        if (url) window.location.href = url;
+    });
+    
+    document.getElementById('inbox-back').addEventListener('click', (e) => {
+        e.preventDefault();
+        history.pushState({}, '', '/app');
+        currentSlug = null;
+        showView('namespaces');
+        renderNamespaceList();
+    });
+    
+    document.getElementById('conversation-back').addEventListener('click', (e) => {
+        e.preventDefault();
+        history.pushState({}, '', `/app/${currentSlug}`);
+        currentPeerId = null;
+        showView('inbox');
+    });
+    
+    document.getElementById('compose-btn').addEventListener('click', showCompose);
+    document.getElementById('compose-cancel').addEventListener('click', hideCompose);
+    document.getElementById('compose-close').addEventListener('click', hideCompose);
+    document.getElementById('compose-send').addEventListener('click', sendCompose);
+    
+    document.getElementById('send-btn').addEventListener('click', sendMessage);
+    document.getElementById('message-input').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+    
+    document.getElementById('archived-link').addEventListener('click', async (e) => {
+        e.preventDefault();
+        history.pushState({}, '', `/app/${currentSlug}/archived`);
+        showView('archived');
+        
+        const list = document.getElementById('archived-list');
+        const empty = document.getElementById('archived-empty');
+        
+        try {
+            const result = await DeadropAPI.getArchivedMessages(credentials);
+            
+            if (result.messages.length === 0) {
+                list.innerHTML = '';
+                empty.classList.remove('hidden');
+                return;
+            }
+            
+            empty.classList.add('hidden');
+            list.innerHTML = result.messages.map(msg => `
+                <div class="card">
+                    <div style="display: flex; justify-content: space-between; align-items: start;">
+                        <div>
+                            <div class="card-title">From: ${getPeerName(msg.from)}</div>
+                            <div style="margin: 8px 0;">${msg.body}</div>
+                            <div class="text-muted text-small">Archived ${formatTime(msg.archived_at)}</div>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="btn btn-small btn-secondary" onclick="unarchiveMessage('${msg.mid}')">Restore</button>
+                            <button class="btn btn-small btn-danger" onclick="deleteMessage('${msg.mid}')">Delete</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        } catch (e) {
+            list.innerHTML = `<div class="error-message">${e.message}</div>`;
+        }
+    });
+    
+    document.getElementById('archived-back').addEventListener('click', (e) => {
+        e.preventDefault();
+        history.pushState({}, '', `/app/${currentSlug}`);
+        showView('inbox');
+    });
+    
+    async function unarchiveMessage(mid) {
+        try {
+            await DeadropAPI.unarchiveMessage(credentials, mid);
+            // Refresh archived list
+            document.getElementById('archived-link').click();
+        } catch (e) {
+            alert('Failed to restore: ' + e.message);
+        }
+    }
+    
+    // Initialize
+    function init() {
+        if (currentSlug) {
+            credentials = CredentialStore.getCredentials(currentSlug);
+            if (credentials) {
+                if (currentView === 'archived') {
+                    document.getElementById('inbox-title').textContent = 
+                        CredentialStore.getNamespace(currentSlug)?.displayName || currentSlug;
+                    showView('archived');
+                    document.getElementById('archived-link').click();
+                } else if (currentPeerId) {
+                    openNamespace(currentSlug).then(() => openConversation(currentPeerId));
+                } else {
+                    openNamespace(currentSlug);
+                }
+            } else {
+                showView('namespaces');
+                renderNamespaceList();
+            }
+        } else {
+            showView('namespaces');
+            renderNamespaceList();
+        }
+    }
+    
+    init();
+</script>
+{% endblock %}

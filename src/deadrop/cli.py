@@ -34,11 +34,14 @@ message_app = cyclopts.App(name="message", help="Message operations (for testing
 jobs_app = cyclopts.App(name="jobs", help="Scheduled job operations")
 archive_app = cyclopts.App(name="archive", help="Archive and rehydration operations")
 
+invite_app = cyclopts.App(name="invite", help="Invite management for web users")
+
 app.command(ns_app)
 app.command(identity_app)
 app.command(message_app)
 app.command(jobs_app)
 app.command(archive_app)
+app.command(invite_app)
 
 
 def get_config() -> GlobalConfig:
@@ -298,6 +301,27 @@ def secret(ns: str):
     print(f"Secret: {ns_cfg.secret}")
     print("\nThis secret allows full control over mailboxes in this namespace.")
     print("Keep it secure!")
+
+
+@ns_app.command
+def set_slug(ns: str, slug: str):
+    """Set a human-readable slug for a namespace.
+
+    The slug is used in web app URLs: /app/{slug}
+    """
+    from . import db
+
+    db.init_db()
+
+    if db.set_namespace_slug(ns, slug):
+        print(f"Slug set: {slug}")
+        print(f"Web app URL: /app/{slug}")
+    else:
+        print(
+            "Error: Failed to set slug. It may already be taken or namespace not found.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 # --- Identity (Mailbox) Commands ---
@@ -804,6 +828,149 @@ def archive_export(
         with open(output, "w") as f:
             json.dump(messages, f, indent=2, default=str)
         print(f"Exported {len(messages)} messages to {output}", file=sys.stderr)
+
+
+# --- Invite Commands ---
+
+
+def parse_duration(duration: str) -> int:
+    """Parse a duration string like '24h', '1d', '30m' into hours."""
+    duration = duration.lower().strip()
+    if duration.endswith("h"):
+        return int(duration[:-1])
+    elif duration.endswith("d"):
+        return int(duration[:-1]) * 24
+    elif duration.endswith("m"):
+        return max(1, int(duration[:-1]) // 60)
+    else:
+        return int(duration)
+
+
+@invite_app.command
+def create(
+    ns: str,
+    identity_id: str,
+    *,
+    expires_in: str = "24h",
+    name: str | None = None,
+):
+    """Create a shareable invite link for a mailbox.
+
+    The invite allows someone to claim access to the specified identity
+    through the web interface. The link is single-use.
+
+    --expires-in: How long until the invite expires (e.g., '24h', '7d', '1h')
+    --name: Optional display name for the invite
+    """
+    from datetime import timedelta
+
+    from . import db
+    from .crypto import create_invite_secrets
+
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Verify identity exists locally
+    if identity_id not in ns_cfg.mailboxes:
+        print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+        sys.exit(1)
+
+    mb = ns_cfg.mailboxes[identity_id]
+
+    # Parse expiration
+    try:
+        hours = parse_duration(expires_in)
+    except ValueError:
+        print(f"Error: Invalid duration format: {expires_in}", file=sys.stderr)
+        sys.exit(1)
+
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+    # Create the cryptographic secrets
+    secrets = create_invite_secrets(mb.secret)
+
+    # Register invite on server
+    db.init_db()
+    db.create_invite(
+        invite_id=secrets.invite_id,
+        ns=ns,
+        identity_id=identity_id,
+        server_key=secrets.server_key_hex,
+        encrypted_secret=secrets.encrypted_secret_hex,
+        display_name=name or mb.display_name,
+        created_by=None,  # Could track who created it
+        expires_at=expires_at,
+    )
+
+    # Generate the invite URL
+    invite_url = f"{cfg.url}/join/{secrets.invite_id}#{secrets.url_key_base64}"
+
+    print("Invite created!")
+    print(f"  For: {mb.display_name or identity_id}")
+    print(f"  Expires: {expires_in}")
+    print()
+    print("Share this link (single-use):")
+    print(invite_url)
+
+
+@invite_app.command
+def list_invites(ns: str, *, include_claimed: bool = False):
+    """List pending invites for a namespace.
+
+    --include-claimed: Also show already-claimed invites
+    """
+    from . import db
+
+    db.init_db()
+    invites = db.list_invites(ns, include_claimed=include_claimed)
+
+    if not invites:
+        print("No invites found.")
+        return
+
+    print(f"Invites for namespace {ns}:")
+    for inv in invites:
+        status = ""
+        if inv.get("claimed_at"):
+            status = " [CLAIMED]"
+        elif inv.get("expires_at"):
+            expires = datetime.fromisoformat(inv["expires_at"].replace("Z", "+00:00"))
+            if expires < datetime.now(timezone.utc):
+                status = " [EXPIRED]"
+
+        name = inv.get("display_name") or inv["identity_id"][:8]
+        print(f"  {inv['invite_id'][:12]}...  {name}{status}")
+
+
+@invite_app.command
+def revoke(ns: str, invite_id: str):
+    """Revoke (delete) an invite.
+
+    The invite ID can be the full ID or a prefix.
+    """
+    from . import db
+
+    db.init_db()
+
+    # Try to find by prefix
+    invites = db.list_invites(ns, include_claimed=True)
+    matches = [i for i in invites if i["invite_id"].startswith(invite_id)]
+
+    if not matches:
+        print(f"Error: No invite found matching '{invite_id}'", file=sys.stderr)
+        sys.exit(1)
+
+    if len(matches) > 1:
+        print(f"Error: Multiple invites match '{invite_id}'. Be more specific.", file=sys.stderr)
+        sys.exit(1)
+
+    full_id = matches[0]["invite_id"]
+
+    if db.revoke_invite(full_id):
+        print(f"Invite {full_id[:12]}... revoked.")
+    else:
+        print("Error: Failed to revoke invite.", file=sys.stderr)
+        sys.exit(1)
 
 
 # --- Server Command ---
