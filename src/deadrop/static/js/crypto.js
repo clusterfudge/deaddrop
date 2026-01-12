@@ -1,9 +1,7 @@
 /**
  * Cryptographic utilities for the invite system.
- * Uses Web Crypto API for HKDF key derivation and AES-GCM decryption.
+ * Uses Web Crypto API for AES-GCM decryption.
  */
-
-const CRYPTO_INFO = new TextEncoder().encode('deadrop-invite-v1');
 
 /**
  * Decode base64url string to Uint8Array (handles missing padding).
@@ -37,70 +35,39 @@ function hexToBytes(hex) {
 }
 
 /**
- * Derive encryption key from url_key and server_key using HKDF-SHA256.
- */
-async function deriveEncryptionKey(urlKey, serverKey, salt) {
-    // Concatenate url_key and server_key
-    const ikm = new Uint8Array(urlKey.length + serverKey.length);
-    ikm.set(urlKey, 0);
-    ikm.set(serverKey, urlKey.length);
-    
-    // Import as raw key for HKDF
-    const baseKey = await crypto.subtle.importKey(
-        'raw',
-        ikm,
-        'HKDF',
-        false,
-        ['deriveBits', 'deriveKey']
-    );
-    
-    // Derive the encryption key
-    const encryptionKey = await crypto.subtle.deriveKey(
-        {
-            name: 'HKDF',
-            hash: 'SHA-256',
-            salt: salt,
-            info: CRYPTO_INFO,
-        },
-        baseKey,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['decrypt']
-    );
-    
-    return encryptionKey;
-}
-
-/**
  * Decrypt the encrypted secret using AES-256-GCM.
  * 
  * @param {string} encryptedSecretHex - Hex-encoded encrypted data (nonce + ciphertext + tag)
- * @param {string} urlKeyBase64 - Base64url-encoded key from URL fragment
- * @param {string} serverKeyHex - Hex-encoded key from server
- * @param {string} inviteId - The invite identifier (used as salt and AAD)
+ * @param {string} keyBase64 - Base64url-encoded key from URL fragment
+ * @param {string} inviteId - The invite identifier (used as AAD)
  * @returns {Promise<string>} The decrypted mailbox secret
  */
-async function decryptInviteSecret(encryptedSecretHex, urlKeyBase64, serverKeyHex, inviteId) {
+async function decryptInviteSecret(encryptedSecretHex, keyBase64, inviteId) {
     const encryptedData = hexToBytes(encryptedSecretHex);
-    const urlKey = base64urlToBytes(urlKeyBase64);
-    const serverKey = hexToBytes(serverKeyHex);
-    const salt = new TextEncoder().encode(inviteId);
+    const key = base64urlToBytes(keyBase64);
+    const aad = new TextEncoder().encode(inviteId);
     
     // Extract nonce (first 12 bytes) and ciphertext (rest)
     const nonce = encryptedData.slice(0, 12);
     const ciphertext = encryptedData.slice(12);
     
-    // Derive the encryption key
-    const encryptionKey = await deriveEncryptionKey(urlKey, serverKey, salt);
+    // Import the key for AES-GCM
+    const cryptoKey = await crypto.subtle.importKey(
+        'raw',
+        key,
+        { name: 'AES-GCM' },
+        false,
+        ['decrypt']
+    );
     
     // Decrypt using AES-GCM
     const decrypted = await crypto.subtle.decrypt(
         {
             name: 'AES-GCM',
             iv: nonce,
-            additionalData: salt,  // AAD = invite_id
+            additionalData: aad,
         },
-        encryptionKey,
+        cryptoKey,
         ciphertext
     );
     

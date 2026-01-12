@@ -9,7 +9,6 @@ from deadrop.crypto import (
     create_invite_secrets,
     decrypt_invite_secret,
     decrypt_secret,
-    derive_encryption_key,
     encrypt_secret,
     generate_invite_id,
     generate_key,
@@ -42,122 +41,60 @@ class TestKeyGeneration:
         assert len(set(ids)) == 10
 
 
-class TestKeyDerivation:
-    """Tests for key derivation."""
-
-    def test_derive_encryption_key_deterministic(self):
-        """Same inputs should produce same key."""
-        url_key = generate_key()
-        server_key = generate_key()
-        salt = b"test-salt"
-
-        key1 = derive_encryption_key(url_key, server_key, salt)
-        key2 = derive_encryption_key(url_key, server_key, salt)
-
-        assert key1 == key2
-
-    def test_derive_encryption_key_different_url_key(self):
-        """Different url_key should produce different encryption key."""
-        server_key = generate_key()
-        salt = b"test-salt"
-
-        key1 = derive_encryption_key(generate_key(), server_key, salt)
-        key2 = derive_encryption_key(generate_key(), server_key, salt)
-
-        assert key1 != key2
-
-    def test_derive_encryption_key_different_server_key(self):
-        """Different server_key should produce different encryption key."""
-        url_key = generate_key()
-        salt = b"test-salt"
-
-        key1 = derive_encryption_key(url_key, generate_key(), salt)
-        key2 = derive_encryption_key(url_key, generate_key(), salt)
-
-        assert key1 != key2
-
-    def test_derive_encryption_key_different_salt(self):
-        """Different salt should produce different encryption key."""
-        url_key = generate_key()
-        server_key = generate_key()
-
-        key1 = derive_encryption_key(url_key, server_key, b"salt1")
-        key2 = derive_encryption_key(url_key, server_key, b"salt2")
-
-        assert key1 != key2
-
-
 class TestEncryptionDecryption:
     """Tests for encryption and decryption."""
 
     def test_encrypt_decrypt_roundtrip(self):
         """Encrypted data should decrypt to original plaintext."""
         plaintext = "this is a secret message"
-        url_key = generate_key()
-        server_key = generate_key()
+        key = generate_key()
         invite_id = generate_invite_id()
 
-        encrypted = encrypt_secret(plaintext, url_key, server_key, invite_id)
-        decrypted = decrypt_secret(encrypted, url_key, server_key, invite_id)
+        encrypted = encrypt_secret(plaintext, key, invite_id)
+        decrypted = decrypt_secret(encrypted, key, invite_id)
 
         assert decrypted == plaintext
 
     def test_encrypt_decrypt_mailbox_secret(self):
         """Should handle 64-char hex mailbox secrets."""
         mailbox_secret = "a" * 64  # 64 hex chars
-        url_key = generate_key()
-        server_key = generate_key()
+        key = generate_key()
         invite_id = generate_invite_id()
 
-        encrypted = encrypt_secret(mailbox_secret, url_key, server_key, invite_id)
-        decrypted = decrypt_secret(encrypted, url_key, server_key, invite_id)
+        encrypted = encrypt_secret(mailbox_secret, key, invite_id)
+        decrypted = decrypt_secret(encrypted, key, invite_id)
 
         assert decrypted == mailbox_secret
 
-    def test_decrypt_wrong_url_key_fails(self):
-        """Decryption with wrong url_key should fail."""
+    def test_decrypt_wrong_key_fails(self):
+        """Decryption with wrong key should fail."""
         plaintext = "secret"
-        url_key = generate_key()
-        server_key = generate_key()
+        key = generate_key()
         invite_id = generate_invite_id()
 
-        encrypted = encrypt_secret(plaintext, url_key, server_key, invite_id)
+        encrypted = encrypt_secret(plaintext, key, invite_id)
 
         with pytest.raises(InvalidTag):
-            decrypt_secret(encrypted, generate_key(), server_key, invite_id)
-
-    def test_decrypt_wrong_server_key_fails(self):
-        """Decryption with wrong server_key should fail."""
-        plaintext = "secret"
-        url_key = generate_key()
-        server_key = generate_key()
-        invite_id = generate_invite_id()
-
-        encrypted = encrypt_secret(plaintext, url_key, server_key, invite_id)
-
-        with pytest.raises(InvalidTag):
-            decrypt_secret(encrypted, url_key, generate_key(), invite_id)
+            decrypt_secret(encrypted, generate_key(), invite_id)
 
     def test_decrypt_wrong_invite_id_fails(self):
         """Decryption with wrong invite_id should fail."""
         plaintext = "secret"
-        url_key = generate_key()
-        server_key = generate_key()
+        key = generate_key()
         invite_id = generate_invite_id()
 
-        encrypted = encrypt_secret(plaintext, url_key, server_key, invite_id)
+        encrypted = encrypt_secret(plaintext, key, invite_id)
 
         with pytest.raises(InvalidTag):
-            decrypt_secret(encrypted, url_key, server_key, generate_invite_id())
+            decrypt_secret(encrypted, key, generate_invite_id())
 
     def test_encrypted_data_includes_nonce(self):
         """Encrypted data should be longer than plaintext (includes nonce and tag)."""
         plaintext = "secret"
-        url_key = generate_key()
-        server_key = generate_key()
+        key = generate_key()
         invite_id = generate_invite_id()
 
-        encrypted = encrypt_secret(plaintext, url_key, server_key, invite_id)
+        encrypted = encrypt_secret(plaintext, key, invite_id)
 
         # Should include: 12-byte nonce + ciphertext (same length as plaintext) + 16-byte tag
         # So minimum length is: 12 + len(plaintext) + 16 = 28 + len(plaintext)
@@ -166,19 +103,18 @@ class TestEncryptionDecryption:
     def test_encryption_produces_different_ciphertext(self):
         """Same plaintext should produce different ciphertext (random nonce)."""
         plaintext = "secret"
-        url_key = generate_key()
-        server_key = generate_key()
+        key = generate_key()
         invite_id = generate_invite_id()
 
-        encrypted1 = encrypt_secret(plaintext, url_key, server_key, invite_id)
-        encrypted2 = encrypt_secret(plaintext, url_key, server_key, invite_id)
+        encrypted1 = encrypt_secret(plaintext, key, invite_id)
+        encrypted2 = encrypt_secret(plaintext, key, invite_id)
 
         # Different nonces mean different ciphertext
         assert encrypted1 != encrypted2
 
         # But both should decrypt to same plaintext
-        assert decrypt_secret(encrypted1, url_key, server_key, invite_id) == plaintext
-        assert decrypt_secret(encrypted2, url_key, server_key, invite_id) == plaintext
+        assert decrypt_secret(encrypted1, key, invite_id) == plaintext
+        assert decrypt_secret(encrypted2, key, invite_id) == plaintext
 
 
 class TestBase64Encoding:
@@ -219,8 +155,7 @@ class TestInviteSecrets:
         secrets = create_invite_secrets(mailbox_secret)
 
         assert len(secrets.invite_id) == 32
-        assert len(secrets.url_key) == 32
-        assert len(secrets.server_key) == 32
+        assert len(secrets.key) == 32
         assert len(secrets.encrypted_secret) > 0
 
     def test_invite_secrets_properties(self):
@@ -228,13 +163,9 @@ class TestInviteSecrets:
         mailbox_secret = "a" * 64
         secrets = create_invite_secrets(mailbox_secret)
 
-        # url_key_base64 should be URL-safe
-        assert "+" not in secrets.url_key_base64
-        assert "/" not in secrets.url_key_base64
-
-        # server_key_hex should be valid hex
-        int(secrets.server_key_hex, 16)
-        assert len(secrets.server_key_hex) == 64  # 32 bytes = 64 hex chars
+        # key_base64 should be URL-safe
+        assert "+" not in secrets.key_base64
+        assert "/" not in secrets.key_base64
 
         # encrypted_secret_hex should be valid hex
         int(secrets.encrypted_secret_hex, 16)
@@ -246,8 +177,7 @@ class TestInviteSecrets:
 
         decrypted = decrypt_invite_secret(
             encrypted_secret_hex=secrets.encrypted_secret_hex,
-            url_key_base64=secrets.url_key_base64,
-            server_key_hex=secrets.server_key_hex,
+            key_base64=secrets.key_base64,
             invite_id=secrets.invite_id,
         )
 
@@ -257,40 +187,32 @@ class TestInviteSecrets:
 class TestSecurityProperties:
     """Tests for security properties of the crypto system."""
 
-    def test_server_cannot_decrypt_without_url_key(self):
-        """Server with only server_key cannot decrypt."""
+    def test_server_cannot_decrypt_without_key(self):
+        """Server with only encrypted_secret cannot decrypt."""
         mailbox_secret = "secret123" * 7  # 63 chars
         secrets = create_invite_secrets(mailbox_secret)
 
-        # Server has: server_key, encrypted_secret, invite_id
-        # Server lacks: url_key
+        # Server has: encrypted_secret, invite_id
+        # Server lacks: key
 
-        # Try with a random url_key (simulating brute force)
-        wrong_url_key = bytes_to_base64url(generate_key())
+        # Try with a random key (simulating brute force)
+        wrong_key = bytes_to_base64url(generate_key())
 
         with pytest.raises(InvalidTag):
             decrypt_invite_secret(
                 encrypted_secret_hex=secrets.encrypted_secret_hex,
-                url_key_base64=wrong_url_key,
-                server_key_hex=secrets.server_key_hex,
+                key_base64=wrong_key,
                 invite_id=secrets.invite_id,
             )
 
-    def test_url_interceptor_cannot_decrypt_without_server_key(self):
-        """Someone with only the URL cannot decrypt."""
+    def test_wrong_invite_id_fails(self):
+        """Decryption with wrong invite_id fails (AAD mismatch)."""
         mailbox_secret = "topsecret" * 7
         secrets = create_invite_secrets(mailbox_secret)
-
-        # URL interceptor has: url_key, invite_id
-        # URL interceptor lacks: server_key, encrypted_secret
-
-        # Even if they somehow got encrypted_secret, they can't decrypt without server_key
-        wrong_server_key = generate_key().hex()
 
         with pytest.raises(InvalidTag):
             decrypt_invite_secret(
                 encrypted_secret_hex=secrets.encrypted_secret_hex,
-                url_key_base64=secrets.url_key_base64,
-                server_key_hex=wrong_server_key,
-                invite_id=secrets.invite_id,
+                key_base64=secrets.key_base64,
+                invite_id=generate_invite_id(),  # Wrong invite_id
             )

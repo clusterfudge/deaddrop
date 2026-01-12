@@ -581,7 +581,6 @@ class TestInvites:
             invite_id=secrets.invite_id,
             ns=ns_data["ns"],
             identity_id=id_data["id"],
-            server_key=secrets.server_key_hex,
             encrypted_secret=secrets.encrypted_secret_hex,
             display_name="Test Invite",
             expires_at=expires_at,
@@ -593,7 +592,7 @@ class TestInvites:
             "identity_id": id_data["id"],
             "identity_secret": id_data["secret"],
             "invite_id": secrets.invite_id,
-            "url_key": secrets.url_key_base64,
+            "key": secrets.key_base64,
             "secrets": secrets,
         }
 
@@ -619,19 +618,18 @@ class TestInvites:
         assert response.status_code == 200
         data = response.json()
 
-        # Should receive server_key and encrypted_secret
-        assert "server_key" in data
+        # Should receive encrypted_secret (no server_key in simplified model)
         assert "encrypted_secret" in data
+        assert "server_key" not in data
         assert data["ns"] == setup_invite["ns"]
         assert data["identity_id"] == setup_invite["identity_id"]
 
-        # Verify we can decrypt with url_key
+        # Verify we can decrypt with key from URL
         from deadrop.crypto import decrypt_invite_secret
 
         decrypted = decrypt_invite_secret(
             encrypted_secret_hex=data["encrypted_secret"],
-            url_key_base64=setup_invite["url_key"],
-            server_key_hex=data["server_key"],
+            key_base64=setup_invite["key"],
             invite_id=setup_invite["invite_id"],
         )
         assert decrypted == setup_invite["identity_secret"]

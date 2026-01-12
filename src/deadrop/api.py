@@ -118,7 +118,6 @@ class MessageInfo(BaseModel):
 
 
 class InviteClaimResponse(BaseModel):
-    server_key: str
     encrypted_secret: str
     ns: str
     namespace_slug: str | None
@@ -706,8 +705,8 @@ def claim_invite(invite_id: str, request: Request):
     """Claim an invite and receive the encrypted secret.
 
     This is a one-time operation. After claiming, the invite cannot be used again.
-    The response includes server_key and encrypted_secret which the client
-    combines with the url_key (from URL fragment) to decrypt the mailbox secret.
+    The response includes encrypted_secret which the client decrypts using
+    the key from the URL fragment.
     """
     # Get client IP for logging
     client_ip = request.client.host if request.client else None
@@ -724,7 +723,6 @@ def claim_invite(invite_id: str, request: Request):
             raise HTTPException(404, "Invite not found")
 
     return InviteClaimResponse(
-        server_key=invite["server_key"],
         encrypted_secret=invite["encrypted_secret"],
         ns=invite["ns"],
         namespace_slug=invite.get("namespace_slug"),

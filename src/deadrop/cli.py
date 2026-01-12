@@ -895,7 +895,6 @@ def create(
         invite_id=secrets.invite_id,
         ns=ns,
         identity_id=identity_id,
-        server_key=secrets.server_key_hex,
         encrypted_secret=secrets.encrypted_secret_hex,
         display_name=name or mb.display_name,
         created_by=None,  # Could track who created it
@@ -903,7 +902,7 @@ def create(
     )
 
     # Generate the invite URL
-    invite_url = f"{cfg.url}/join/{secrets.invite_id}#{secrets.url_key_base64}"
+    invite_url = f"{cfg.url}/join/{secrets.invite_id}#{secrets.key_base64}"
 
     print("Invite created!")
     print(f"  For: {mb.display_name or identity_id}")

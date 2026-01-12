@@ -121,7 +121,6 @@ def init_db():
             invite_id TEXT PRIMARY KEY,
             ns TEXT NOT NULL REFERENCES namespaces(ns) ON DELETE CASCADE,
             identity_id TEXT NOT NULL,
-            server_key TEXT NOT NULL,
             encrypted_secret TEXT NOT NULL,
             display_name TEXT,
             created_by TEXT,
@@ -767,7 +766,6 @@ def create_invite(
     invite_id: str,
     ns: str,
     identity_id: str,
-    server_key: str,
     encrypted_secret: str,
     display_name: str | None = None,
     created_by: str | None = None,
@@ -779,13 +777,12 @@ def create_invite(
 
     conn.execute(
         """INSERT INTO invites 
-           (invite_id, ns, identity_id, server_key, encrypted_secret, display_name, created_by, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (invite_id, ns, identity_id, encrypted_secret, display_name, created_by, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             invite_id,
             ns,
             identity_id,
-            server_key,
             encrypted_secret,
             display_name,
             created_by,
@@ -809,7 +806,7 @@ def get_invite(invite_id: str) -> dict | None:
     """Get an invite by ID."""
     conn = get_connection()
     cursor = conn.execute(
-        """SELECT invite_id, ns, identity_id, server_key, encrypted_secret, display_name,
+        """SELECT invite_id, ns, identity_id, encrypted_secret, display_name,
                   created_by, created_at, expires_at, claimed_at, claimed_by
            FROM invites WHERE invite_id = ?""",
         (invite_id,),
@@ -846,9 +843,9 @@ def get_invite_info(invite_id: str) -> dict | None:
 
 def claim_invite(invite_id: str, claimed_by: str | None = None) -> dict | None:
     """
-    Claim an invite (mark as used and return secrets).
+    Claim an invite (mark as used and return encrypted secret).
 
-    Returns the full invite record including server_key and encrypted_secret,
+    Returns the invite record including encrypted_secret,
     or None if invite doesn't exist, is already claimed, or is expired.
     """
     conn = get_connection()
@@ -856,7 +853,7 @@ def claim_invite(invite_id: str, claimed_by: str | None = None) -> dict | None:
 
     # Get invite and check validity
     cursor = conn.execute(
-        """SELECT invite_id, ns, identity_id, server_key, encrypted_secret, display_name,
+        """SELECT invite_id, ns, identity_id, encrypted_secret, display_name,
                   created_by, created_at, expires_at, claimed_at
            FROM invites 
            WHERE invite_id = ? 
