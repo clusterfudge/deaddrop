@@ -264,9 +264,13 @@ def create_namespace(
         metadata.setdefault("created_by", auth_info["key_id"])
 
     result = db.create_namespace(metadata, ttl_hours=ttl_hours, slug=slug)
+    # ns and secret are always present strings, slug may be None
+    ns = result["ns"]
+    secret = result["secret"]
+    assert ns is not None and secret is not None
     return CreateNamespaceResponse(
-        ns=result["ns"],
-        secret=result["secret"],
+        ns=ns,
+        secret=secret,
         slug=result.get("slug"),
         metadata=metadata or {},
         ttl_hours=ttl_hours,

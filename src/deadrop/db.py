@@ -214,7 +214,7 @@ def create_namespace(
     metadata: dict[str, Any] | None = None,
     ttl_hours: int = DEFAULT_TTL_HOURS,
     slug: str | None = None,
-) -> dict[str, str]:
+) -> dict[str, str | None]:
     """Create a new namespace. Returns {ns, secret, slug}."""
     secret = generate_secret()
     ns = derive_id(secret)
