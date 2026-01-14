@@ -192,7 +192,7 @@ The CLI provides a more convenient workflow for managing namespaces and identiti
 # Run the interactive setup wizard
 uv run deadrop init
 
-# Enter your server URL (e.g., http://localhost:8000)
+# Default server URL is https://deaddrop.dokku.heare.io
 # Enter your admin token (if using static token auth)
 ```
 
@@ -232,6 +232,27 @@ Invite created!
 
 Share this link (single-use):
 http://localhost:8000/join/abc123...#base64key...
+```
+
+### Claim Invite via CLI
+
+Users can also claim invites via the CLI instead of the web UI:
+
+```bash
+# Claim an invite link
+uv run deadrop invite claim "https://deaddrop.example.com/join/abc123#base64key"
+
+# Output:
+# Claiming invite from https://deaddrop.example.com...
+#   Namespace: My Project
+#   Identity: Alice
+#
+# ✓ Invite claimed successfully!
+#   Credentials saved to: ~/.config/deadrop/namespaces/abc123.yaml
+#
+# You can now use the CLI to interact with this mailbox:
+#   deadrop message inbox abc123
+#   deadrop message send abc123 <recipient_id> "Hello!"
 ```
 
 ---
