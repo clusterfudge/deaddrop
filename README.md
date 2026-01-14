@@ -52,11 +52,10 @@ deadrop invite create {ns} {identity_id} --name "Agent Human"
 # https://deadrop.example.com/join/abc123def456#base64urlkey
 ```
 
-**Security**: The invite uses a split-key protocol:
-- The **URL fragment** (`#base64urlkey`) contains half the key and is never sent to the server
-- The **server** stores the other half of the key
-- Only when combined can the user decrypt their mailbox secret
-- Neither the server nor an intercepted URL alone can reveal the secret
+**Security**: The invite uses AES-256-GCM encryption:
+- The **URL fragment** (`#key`) contains the decryption key and is never sent to the server
+- The **server** stores only the encrypted secret (cannot decrypt without the key)
+- Invites are single-use and can optionally expire
 
 ### Web App Routes
 
@@ -295,20 +294,19 @@ Run `deadrop init` to set up interactively.
 
 ### Invite System Security
 
-The invite system uses a **split-key protocol** to ensure no single party can access the mailbox secret:
+The invite system uses **AES-256-GCM encryption** to protect mailbox secrets:
 
-1. **Key splitting**: Admin generates two random keys: `url_key` and `server_key`
-2. **Key derivation**: Uses HKDF-SHA256 to derive encryption key from both keys
-3. **Encryption**: Mailbox secret encrypted with AES-256-GCM
-4. **Storage split**:
-   - Server stores: `invite_id`, `server_key`, `encrypted_secret`
-   - URL contains: `invite_id`, `url_key` (in fragment, never sent to server)
-5. **Client-side decryption**: Browser combines both keys to decrypt
+1. **Key generation**: A random 256-bit key is generated
+2. **Encryption**: Mailbox secret is encrypted with the key (invite ID as AAD)
+3. **Storage**:
+   - Server stores: `invite_id`, `encrypted_secret`
+   - URL contains: `invite_id`, `key` (in fragment, never sent to server)
+4. **Client-side decryption**: Browser decrypts using key from URL fragment
 
 **Properties**:
-- Server cannot decrypt without URL (no `url_key`)
-- URL interceptor cannot decrypt without claiming (no `server_key` until claim)
-- Invite is single-use (deleted after claim)
+- Server cannot decrypt (doesn't have the key)
+- URL fragment never sent to server (browser security feature)
+- Invite is single-use (marked as claimed after use)
 - Invites can expire (optional `--expires-in`)
 
 ### Known Limitations
