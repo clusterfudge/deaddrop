@@ -144,6 +144,7 @@ class InviteInfoResponse(BaseModel):
 
 class CreateInviteRequest(BaseModel):
     identity_id: str
+    invite_id: str  # Client provides this (used as AAD in encryption)
     encrypted_secret: str
     display_name: str | None = None
     expires_at: str | None = None
@@ -784,10 +785,9 @@ def create_invite(
     if not identity:
         raise HTTPException(404, "Identity not found")
 
-    # Generate invite ID on server side for security
-    from .crypto import generate_invite_id
-
-    invite_id = generate_invite_id()
+    # Use client-provided invite_id (needed because it's used as AAD in encryption)
+    # Client generates this randomly, we just need to ensure uniqueness
+    invite_id = req.invite_id
 
     # Create the invite
     result = db.create_invite(

@@ -897,6 +897,7 @@ def create(
         headers=headers,
         json={
             "identity_id": identity_id,
+            "invite_id": secrets.invite_id,  # Client provides this (used as AAD)
             "encrypted_secret": secrets.encrypted_secret_hex,
             "display_name": name or mb.display_name,
             "expires_at": expires_at,
@@ -908,11 +909,9 @@ def create(
         print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
         sys.exit(1)
 
-    result = response.json()
-    invite_id = result["invite_id"]
-
     # Generate the invite URL (key stays in fragment, never sent to server)
-    invite_url = f"{cfg.url}/join/{invite_id}#{secrets.key_base64}"
+    # Use secrets.invite_id since it was used as AAD in encryption
+    invite_url = f"{cfg.url}/join/{secrets.invite_id}#{secrets.key_base64}"
 
     print("Invite created!")
     print(f"  For: {mb.display_name or identity_id}")
