@@ -142,6 +142,22 @@ class InviteInfoResponse(BaseModel):
     claimed_at: str | None = None
 
 
+class CreateInviteRequest(BaseModel):
+    identity_id: str
+    encrypted_secret: str
+    display_name: str | None = None
+    expires_at: str | None = None
+
+
+class CreateInviteResponse(BaseModel):
+    invite_id: str
+    ns: str
+    identity_id: str
+    display_name: str | None
+    created_at: str
+    expires_at: str | None
+
+
 # --- Auth Helpers ---
 
 
@@ -689,6 +705,101 @@ def delete_message_endpoint(
 
 
 # --- Invite Endpoints ---
+
+
+@app.get("/{ns}/invites")
+def list_invites(
+    ns: str,
+    include_claimed: bool = False,
+    x_namespace_secret: str | None = Header(None),
+):
+    """List invites for a namespace.
+
+    Requires namespace secret authentication.
+    """
+    namespace = db.get_namespace(ns)
+    if not namespace:
+        raise HTTPException(404, "Namespace not found")
+
+    if not x_namespace_secret:
+        raise HTTPException(401, "X-Namespace-Secret header required")
+
+    if not db.verify_namespace_secret(ns, x_namespace_secret):
+        raise HTTPException(403, "Invalid namespace secret")
+
+    invites = db.list_invites(ns, include_claimed=include_claimed)
+    return invites
+
+
+@app.delete("/{ns}/invites/{invite_id}")
+def revoke_invite(
+    ns: str,
+    invite_id: str,
+    x_namespace_secret: str | None = Header(None),
+):
+    """Revoke (delete) an invite.
+
+    Requires namespace secret authentication.
+    """
+    namespace = db.get_namespace(ns)
+    if not namespace:
+        raise HTTPException(404, "Namespace not found")
+
+    if not x_namespace_secret:
+        raise HTTPException(401, "X-Namespace-Secret header required")
+
+    if not db.verify_namespace_secret(ns, x_namespace_secret):
+        raise HTTPException(403, "Invalid namespace secret")
+
+    if db.revoke_invite(invite_id):
+        return {"status": "ok", "invite_id": invite_id}
+    else:
+        raise HTTPException(404, "Invite not found")
+
+
+@app.post("/{ns}/invites", response_model=CreateInviteResponse)
+def create_invite(
+    ns: str,
+    req: CreateInviteRequest,
+    x_namespace_secret: str | None = Header(None),
+):
+    """Create an invite for an identity in a namespace.
+
+    Requires namespace secret authentication.
+    The client must generate the invite_id and encrypt the secret before calling this.
+    """
+    # Verify namespace secret
+    namespace = db.get_namespace(ns)
+    if not namespace:
+        raise HTTPException(404, "Namespace not found")
+
+    if not x_namespace_secret:
+        raise HTTPException(401, "X-Namespace-Secret header required")
+
+    if not db.verify_namespace_secret(ns, x_namespace_secret):
+        raise HTTPException(403, "Invalid namespace secret")
+
+    # Verify identity exists
+    identity = db.get_identity(ns, req.identity_id)
+    if not identity:
+        raise HTTPException(404, "Identity not found")
+
+    # Generate invite ID on server side for security
+    from .crypto import generate_invite_id
+
+    invite_id = generate_invite_id()
+
+    # Create the invite
+    result = db.create_invite(
+        invite_id=invite_id,
+        ns=ns,
+        identity_id=req.identity_id,
+        encrypted_secret=req.encrypted_secret,
+        display_name=req.display_name,
+        expires_at=req.expires_at,
+    )
+
+    return CreateInviteResponse(**result)
 
 
 @app.get("/api/invites/{invite_id}/info", response_model=InviteInfoResponse)

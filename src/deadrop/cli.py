@@ -864,7 +864,6 @@ def create(
     """
     from datetime import timedelta
 
-    from . import db
     from .crypto import create_invite_secrets
 
     ns_cfg = get_namespace_config(ns)
@@ -886,23 +885,34 @@ def create(
 
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
 
-    # Create the cryptographic secrets
+    # Create the cryptographic secrets (key stays local, encrypted_secret goes to server)
     secrets = create_invite_secrets(mb.secret)
 
-    # Register invite on server
-    db.init_db()
-    db.create_invite(
-        invite_id=secrets.invite_id,
-        ns=ns,
-        identity_id=identity_id,
-        encrypted_secret=secrets.encrypted_secret_hex,
-        display_name=name or mb.display_name,
-        created_by=None,  # Could track who created it
-        expires_at=expires_at,
+    # Register invite on server via API
+    url = f"{cfg.url}/{ns}/invites"
+    headers = {"X-Namespace-Secret": ns_cfg.secret}
+
+    response = httpx.post(
+        url,
+        headers=headers,
+        json={
+            "identity_id": identity_id,
+            "encrypted_secret": secrets.encrypted_secret_hex,
+            "display_name": name or mb.display_name,
+            "expires_at": expires_at,
+        },
+        timeout=30.0,
     )
 
-    # Generate the invite URL
-    invite_url = f"{cfg.url}/join/{secrets.invite_id}#{secrets.key_base64}"
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    result = response.json()
+    invite_id = result["invite_id"]
+
+    # Generate the invite URL (key stays in fragment, never sent to server)
+    invite_url = f"{cfg.url}/join/{invite_id}#{secrets.key_base64}"
 
     print("Invite created!")
     print(f"  For: {mb.display_name or identity_id}")
@@ -918,10 +928,21 @@ def list_invites(ns: str, *, include_claimed: bool = False):
 
     --include-claimed: Also show already-claimed invites
     """
-    from . import db
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
 
-    db.init_db()
-    invites = db.list_invites(ns, include_claimed=include_claimed)
+    # List invites via API
+    url = f"{cfg.url}/{ns}/invites"
+    params = {"include_claimed": str(include_claimed).lower()}
+    headers = {"X-Namespace-Secret": ns_cfg.secret}
+
+    response = httpx.get(url, headers=headers, params=params, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    invites = response.json()
 
     if not invites:
         print("No invites found.")
@@ -947,12 +968,20 @@ def revoke(ns: str, invite_id: str):
 
     The invite ID can be the full ID or a prefix.
     """
-    from . import db
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
 
-    db.init_db()
+    # List invites to find by prefix
+    url = f"{cfg.url}/{ns}/invites"
+    headers = {"X-Namespace-Secret": ns_cfg.secret}
 
-    # Try to find by prefix
-    invites = db.list_invites(ns, include_claimed=True)
+    response = httpx.get(url, headers=headers, params={"include_claimed": "true"}, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    invites = response.json()
     matches = [i for i in invites if i["invite_id"].startswith(invite_id)]
 
     if not matches:
@@ -960,16 +989,22 @@ def revoke(ns: str, invite_id: str):
         sys.exit(1)
 
     if len(matches) > 1:
-        print(f"Error: Multiple invites match '{invite_id}'. Be more specific.", file=sys.stderr)
+        print(
+            f"Error: Multiple invites match '{invite_id}'. Be more specific.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     full_id = matches[0]["invite_id"]
 
-    if db.revoke_invite(full_id):
-        print(f"Invite {full_id[:12]}... revoked.")
-    else:
-        print("Error: Failed to revoke invite.", file=sys.stderr)
+    # Revoke via API
+    response = httpx.delete(f"{cfg.url}/{ns}/invites/{full_id}", headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
         sys.exit(1)
+
+    print(f"Invite {full_id[:12]}... revoked.")
 
 
 @invite_app.command
@@ -1019,6 +1054,7 @@ def claim(invite_url: str):
         print("Error: Could not parse invite ID from URL", file=sys.stderr)
         sys.exit(1)
 
+    assert match is not None  # For type checker - we exit above if None
     invite_id = match.group(1)
     key_base64 = fragment
 
