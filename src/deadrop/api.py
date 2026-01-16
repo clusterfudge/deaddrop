@@ -9,9 +9,10 @@ from pydantic import BaseModel
 
 from . import db
 from .auth import derive_id
-from .heare_auth import (
+from .auth_provider import (
     extract_bearer_token,
-    is_heare_auth_enabled,
+    get_auth_method_name,
+    is_auth_enabled,
     verify_bearer_token,
 )
 
@@ -108,20 +109,20 @@ def require_admin(authorization: str | None, x_admin_token: str | None) -> dict:
     """
     Verify admin authentication.
 
-    Supports three modes:
+    Supports multiple modes:
     1. No-auth: DEADROP_NO_AUTH=1 (for development, no auth required)
-    2. heare-auth: Authorization: Bearer <token> (if HEARE_AUTH_URL is set)
+    2. Pluggable auth: DEADROP_AUTH_MODULE or HEARE_AUTH_URL (Bearer token)
     3. Legacy: X-Admin-Token header (fallback)
 
     Returns:
-        dict with auth info: {"method": "no-auth"|"heare-auth"|"legacy", "key_id": ..., "metadata": ...}
+        dict with auth info: {"method": "...", "key_id": ..., "metadata": ...}
     """
     # Development mode - no auth required
     if is_no_auth_mode():
         return {"method": "no-auth", "key_id": None, "metadata": {}}
 
-    # Try heare-auth first if configured
-    if is_heare_auth_enabled():
+    # Try pluggable auth (includes heare-auth) if configured
+    if is_auth_enabled():
         token = extract_bearer_token(authorization)
         if not token:
             raise HTTPException(401, "Authorization: Bearer <token> header required")
@@ -131,7 +132,7 @@ def require_admin(authorization: str | None, x_admin_token: str | None) -> dict:
             raise HTTPException(403, result.error or "Invalid token")
 
         return {
-            "method": "heare-auth",
+            "method": get_auth_method_name(),
             "key_id": result.key_id,
             "name": result.name,
             "metadata": result.metadata,
@@ -141,7 +142,9 @@ def require_admin(authorization: str | None, x_admin_token: str | None) -> dict:
     legacy_token = get_legacy_admin_token()
     if not legacy_token:
         raise HTTPException(
-            500, "No auth method configured (set HEARE_AUTH_URL or DEADROP_ADMIN_TOKEN)"
+            500,
+            "No auth method configured. Set DEADROP_AUTH_MODULE, HEARE_AUTH_URL, "
+            "or DEADROP_ADMIN_TOKEN",
         )
 
     if not x_admin_token:

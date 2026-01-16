@@ -1,6 +1,15 @@
-# deadrop
+# deaddrop
 
 Minimal inbox-only messaging for agents.
+
+## Installation
+
+```bash
+pip install deaddrop
+
+# With Turso support for production
+pip install deaddrop[turso]
+```
 
 ## Concepts
 
@@ -34,19 +43,19 @@ UNREAD (∞) → READ (TTL starts) → EXPIRED → DELETED
 
 **Sender can also set TTL** for ephemeral messages that expire from creation time (instead of read time).
 
-## CLI Configuration
+## Quick Start
 
-The CLI manages configuration in `~/.config/deadrop/`:
+### 1. Start the Server
 
+```bash
+# Development mode (no auth required)
+deadrop serve --no-auth
+
+# With auto-reload
+deadrop serve --no-auth --reload
 ```
-~/.config/deadrop/
-├── config.yaml              # Global config (URL, bearer token)
-└── namespaces/
-    ├── {ns_hash}.yaml       # Namespace config (secret + mailboxes)
-    └── ...
-```
 
-### First-Time Setup
+### 2. Configure the CLI
 
 ```bash
 # Interactive wizard
@@ -56,48 +65,95 @@ deadrop init
 deadrop config
 ```
 
-### Admin Workflow
+### 3. Create Resources
 
 ```bash
-# 1. Create a namespace (saved to local config)
+# Create a namespace
 deadrop ns create --display-name "My Project"
-deadrop ns create --display-name "Short TTL" --ttl-hours 1
 
-# 2. Create mailboxes (saved to namespace config)
-deadrop identity create abc123 --display-name "Agent 1"
-deadrop identity create abc123 --display-name "Agent 2"
+# Create identities (mailboxes)
+deadrop identity create {ns} --display-name "Agent 1"
+deadrop identity create {ns} --display-name "Agent 2"
 
-# 3. Export credentials for mailbox owners
-deadrop identity export abc123 f9e8d7c6b5a4
-deadrop identity export abc123 f9e8d7c6b5a4 --format json
-deadrop identity export abc123 f9e8d7c6b5a4 --format env
+# Send a message
+deadrop message send {ns} {recipient_id} "Hello!"
 
-# 4. List/manage
-deadrop ns list
-deadrop ns list --remote  # From server
-deadrop identity list abc123
+# Read inbox
+deadrop message inbox {ns}
 ```
 
-### Testing with CLI
+## Running the Server
+
+### Development Mode
 
 ```bash
-# Send a message (uses first mailbox in namespace config)
-deadrop message send abc123 {recipient_id} "Hello!"
+# No authentication required for admin endpoints
+deadrop serve --no-auth
+```
 
-# Read inbox (marks messages as read, starts TTL)
-deadrop message inbox abc123
-deadrop message inbox abc123 --unread       # Only unread
-deadrop message inbox abc123 --after {mid}  # Cursor pagination
+### Production Mode
 
-# Delete message immediately (instead of waiting for TTL)
-deadrop message delete abc123 {mid}
+Deaddrop supports pluggable authentication. Configure one of:
+
+```bash
+# Option 1: Custom auth module (recommended)
+export DEADROP_AUTH_MODULE=myapp.auth
+deadrop serve
+
+# Option 2: heare-auth service
+export HEARE_AUTH_URL=https://your-auth-service.com
+deadrop serve
+
+# Option 3: Legacy static token
+export DEADROP_ADMIN_TOKEN=your-secret-token
+deadrop serve
+```
+
+#### Custom Auth Module
+
+Create a Python module that exposes:
+
+```python
+# myapp/auth.py
+
+from deaddrop.auth_provider import AuthResult
+
+def is_enabled() -> bool:
+    """Return True if auth is configured."""
+    return True
+
+def verify_bearer_token(token: str) -> AuthResult:
+    """Verify a bearer token and return auth result."""
+    # Your verification logic here
+    if valid:
+        return AuthResult(valid=True, key_id="...", name="...", metadata={})
+    return AuthResult(valid=False, error="Invalid token")
+
+def extract_bearer_token(authorization: str | None) -> str | None:
+    """Optional: Custom token extraction from Authorization header."""
+    # Default implementation handles "Bearer <token>" format
+    ...
+```
+
+## Storage
+
+**Local (default)**: SQLite file
+```bash
+export DEADROP_DB=deadrop.db
+```
+
+**Production**: Turso (SQLite at the edge)
+```bash
+export TURSO_URL=libsql://your-db.turso.io
+export TURSO_AUTH_TOKEN=your-token
+pip install deaddrop[turso]
 ```
 
 ## API
 
 ### Admin Endpoints
 
-Requires bearer token (heare-auth) or `--no-auth` mode.
+Requires bearer token authentication (or `--no-auth` mode).
 
 ```bash
 POST /admin/namespaces              # Create namespace
@@ -138,59 +194,6 @@ GET /{ns}/inbox/{id}?after={mid}        # Cursor pagination
 DELETE /{ns}/inbox/{id}/{mid}
 ```
 
-## Running the Server
-
-### Development Mode
-
-```bash
-# No authentication required for admin endpoints
-deadrop serve --no-auth
-
-# With auto-reload
-deadrop serve --no-auth --reload
-```
-
-### Production Mode
-
-```bash
-# Option 1: heare-auth (recommended)
-export HEARE_AUTH_URL=https://your-heare-auth.com
-deadrop serve
-
-# Option 2: Legacy static token
-export DEADROP_ADMIN_TOKEN=your-secret-token
-deadrop serve
-```
-
-## Deployment (Dokku)
-
-```bash
-# Create app
-dokku apps:create deadrop
-
-# Set environment
-dokku config:set deadrop HEARE_AUTH_URL=https://your-heare-auth.com
-dokku config:set deadrop TURSO_URL=libsql://your-db.turso.io
-dokku config:set deadrop TURSO_AUTH_TOKEN=your-turso-token
-
-# Deploy
-git push dokku main
-```
-
-## Storage
-
-**Local (default)**: SQLite file
-```bash
-export DEADROP_DB=deadrop.db
-```
-
-**Production**: Turso (SQLite at the edge)
-```bash
-export TURSO_URL=libsql://your-db.turso.io
-export TURSO_AUTH_TOKEN=your-token
-pip install deadrop[turso]
-```
-
 ## Environment Variables
 
 ### Server
@@ -198,9 +201,10 @@ pip install deadrop[turso]
 | Variable | Description |
 |----------|-------------|
 | `DEADROP_NO_AUTH` | Set to `1` for development (no admin auth) |
-| `HEARE_AUTH_URL` | URL of heare-auth service |
+| `DEADROP_AUTH_MODULE` | Python module path for custom auth |
+| `HEARE_AUTH_URL` | URL of heare-auth service (built-in) |
 | `DEADROP_ADMIN_TOKEN` | Legacy static admin token |
-| `DEADROP_DB` | SQLite database path |
+| `DEADROP_DB` | SQLite database path (default: `deadrop.db`) |
 | `TURSO_URL` | Turso database URL |
 | `TURSO_AUTH_TOKEN` | Turso authentication token |
 
@@ -208,6 +212,31 @@ pip install deadrop[turso]
 
 The CLI uses `~/.config/deadrop/config.yaml` for configuration.
 Run `deadrop init` to set up interactively.
+
+## Deployment
+
+### Docker
+
+```dockerfile
+FROM python:3.11-slim
+RUN pip install deaddrop[turso]
+CMD ["deadrop", "serve"]
+```
+
+### Dokku
+
+```bash
+# Create app
+dokku apps:create deaddrop
+
+# Set environment
+dokku config:set deaddrop DEADROP_AUTH_MODULE=myapp.auth
+dokku config:set deaddrop TURSO_URL=libsql://your-db.turso.io
+dokku config:set deaddrop TURSO_AUTH_TOKEN=your-turso-token
+
+# Deploy
+git push dokku main
+```
 
 ## Security Notes
 
@@ -271,3 +300,7 @@ deadrop jobs ttl                # Process expired messages
 deadrop jobs ttl --dry-run      # Show what would be processed
 deadrop jobs ttl --archive-path /path/to/archives
 ```
+
+## License
+
+MIT
