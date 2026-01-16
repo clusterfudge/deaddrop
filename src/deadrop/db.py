@@ -25,7 +25,7 @@ def get_connection() -> sqlite3.Connection:
         db_url = os.environ.get("TURSO_URL", "")
 
         if db_url.startswith("libsql://"):
-            # Turso connection
+            # Turso connection (optional dependency)
             import libsql_experimental as libsql  # type: ignore[import-not-found]
 
             _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
@@ -398,9 +398,7 @@ def send_message(
     """
     # Verify recipient exists
     conn = get_connection()
-    cursor = conn.execute(
-        "SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id)
-    )
+    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id))
     row = cursor.fetchone()
 
     if not row:

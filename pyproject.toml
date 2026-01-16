@@ -1,5 +1,5 @@
 [project]
-name = "deadrop"
+name = "deaddrop"
 version = "0.1.0"
 description = "Minimal inbox-only messaging for agents"
 readme = "README.md"
@@ -35,6 +35,7 @@ dev = [
     "pytest-cov>=6.0.0",
     "pre-commit>=4.2.0",
     "ruff>=0.9.0",
+    "ty>=0.0.11",
 ]
 
 [tool.pytest.ini_options]

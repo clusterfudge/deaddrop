@@ -17,14 +17,14 @@ certifi==2026.1.4
     #   httpx
 click==8.3.1
     # via uvicorn
-cyclopts==4.4.4
-    # via deadrop (pyproject.toml)
+cyclopts==4.5.0
+    # via deaddrop (pyproject.toml)
 docstring-parser==0.17.0
     # via cyclopts
 docutils==0.22.4
     # via rich-rst
 fastapi==0.128.0
-    # via deadrop (pyproject.toml)
+    # via deaddrop (pyproject.toml)
 h11==0.16.0
     # via
     #   httpcore
@@ -34,13 +34,13 @@ httpcore==1.0.9
 httptools==0.7.1
     # via uvicorn
 httpx==0.28.1
-    # via deadrop (pyproject.toml)
+    # via deaddrop (pyproject.toml)
 idna==3.11
     # via
     #   anyio
     #   httpx
 libsql-experimental==0.0.55
-    # via deadrop (pyproject.toml)
+    # via deaddrop (pyproject.toml)
 markdown-it-py==4.0.0
     # via rich
 mdurl==0.1.2
@@ -55,7 +55,7 @@ python-dotenv==1.2.1
     # via uvicorn
 pyyaml==6.0.3
     # via
-    #   deadrop (pyproject.toml)
+    #   deaddrop (pyproject.toml)
     #   uvicorn
 rich==14.2.0
     # via
@@ -76,13 +76,13 @@ typing-extensions==4.15.0
 typing-inspection==0.4.2
     # via pydantic
 uuid7==0.1.0
-    # via deadrop (pyproject.toml)
+    # via deaddrop (pyproject.toml)
 uvicorn==0.40.0
-    # via deadrop (pyproject.toml)
+    # via deaddrop (pyproject.toml)
 uvloop==0.22.1
     # via uvicorn
 watchfiles==1.1.1
     # via uvicorn
-websockets==15.0.1
+websockets==16.0
     # via uvicorn
 -e .
