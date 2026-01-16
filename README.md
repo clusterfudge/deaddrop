@@ -1,6 +1,15 @@
-# deadrop
+# deaddrop
 
 Minimal inbox-only messaging for agents.
+
+## Installation
+
+```bash
+pip install deaddrop
+
+# With Turso support for production
+pip install deaddrop[turso]
+```
 
 ## Concepts
 
@@ -38,7 +47,7 @@ UNREAD (∞) → READ (TTL starts) → EXPIRED → DELETED
 
 ## Web App
 
-Deadrop includes a web-based messaging client for human users.
+Deaddrop includes a web-based messaging client for human users.
 
 ### Invite System
 
@@ -49,7 +58,7 @@ Admins can generate single-use invite links for human users:
 deadrop invite create {ns} {identity_id} --name "Agent Human"
 
 # The command outputs a shareable URL like:
-# https://deadrop.example.com/join/abc123def456#base64urlkey
+# https://your-server.com/join/abc123def456#base64urlkey
 ```
 
 **Security**: The invite uses AES-256-GCM encryption:
@@ -67,7 +76,6 @@ deadrop invite create {ns} {identity_id} --name "Agent Human"
 | `/app/{slug}` | Inbox view for a namespace |
 | `/app/{slug}/{peer_id}` | Conversation with a specific peer |
 | `/app/{slug}/archived` | Archived messages |
-| `/app/{slug}/settings` | Manage identities |
 
 ### Credential Storage
 
@@ -83,22 +91,22 @@ Set human-readable URLs for namespaces:
 
 ```bash
 # Instead of /app/abc123def456, use /app/project-alpha
-deadrop ns set-slug abc123def456 project-alpha
+deadrop ns set-slug {ns} project-alpha
 ```
 
-## CLI Configuration
+## Quick Start
 
-The CLI manages configuration in `~/.config/deadrop/`:
+### 1. Start the Server
 
+```bash
+# Development mode (no auth required)
+deadrop serve --no-auth
+
+# With auto-reload
+deadrop serve --no-auth --reload
 ```
-~/.config/deadrop/
-├── config.yaml              # Global config (URL, bearer token)
-└── namespaces/
-    ├── {ns_hash}.yaml       # Namespace config (secret + mailboxes)
-    └── ...
-```
 
-### First-Time Setup
+### 2. Configure the CLI
 
 ```bash
 # Interactive wizard
@@ -108,54 +116,95 @@ deadrop init
 deadrop config
 ```
 
-### Admin Workflow
+### 3. Create Resources
 
 ```bash
-# 1. Create a namespace (saved to local config)
+# Create a namespace
 deadrop ns create --display-name "My Project"
-deadrop ns create --display-name "Short TTL" --ttl-hours 1
-deadrop ns create --display-name "Persistent" --ttl-hours 0  # No expiration
 
-# 2. Create mailboxes (saved to namespace config)
-deadrop identity create abc123 --display-name "Agent 1"
-deadrop identity create abc123 --display-name "Agent 2"
+# Create identities (mailboxes)
+deadrop identity create {ns} --display-name "Agent 1"
+deadrop identity create {ns} --display-name "Agent 2"
 
-# 3. Export credentials for mailbox owners
-deadrop identity export abc123 f9e8d7c6b5a4
-deadrop identity export abc123 f9e8d7c6b5a4 --format json
-deadrop identity export abc123 f9e8d7c6b5a4 --format env
+# Send a message
+deadrop message send {ns} {recipient_id} "Hello!"
 
-# 4. Or create a shareable invite link
-deadrop invite create abc123 f9e8d7c6b5a4 --name "Alice"
-deadrop invite create abc123 f9e8d7c6b5a4 --expires-in 7d
-
-# 5. List/manage
-deadrop ns list
-deadrop ns list --remote  # From server
-deadrop identity list abc123
-deadrop invite list abc123
+# Read inbox
+deadrop message inbox {ns}
 ```
 
-### Testing with CLI
+## Running the Server
+
+### Development Mode
 
 ```bash
-# Send a message (uses first mailbox in namespace config)
-deadrop message send abc123 {recipient_id} "Hello!"
+# No authentication required for admin endpoints
+deadrop serve --no-auth
+```
 
-# Read inbox (marks messages as read, starts TTL)
-deadrop message inbox abc123
-deadrop message inbox abc123 --unread       # Only unread
-deadrop message inbox abc123 --after {mid}  # Cursor pagination
+### Production Mode
 
-# Delete message immediately (instead of waiting for TTL)
-deadrop message delete abc123 {mid}
+Deaddrop supports pluggable authentication. Configure one of:
+
+```bash
+# Option 1: Custom auth module (recommended)
+export DEADROP_AUTH_MODULE=myapp.auth
+deadrop serve
+
+# Option 2: heare-auth service
+export HEARE_AUTH_URL=https://your-auth-service.com
+deadrop serve
+
+# Option 3: Legacy static token
+export DEADROP_ADMIN_TOKEN=your-secret-token
+deadrop serve
+```
+
+#### Custom Auth Module
+
+Create a Python module that exposes:
+
+```python
+# myapp/auth.py
+
+from deaddrop.auth_provider import AuthResult
+
+def is_enabled() -> bool:
+    """Return True if auth is configured."""
+    return True
+
+def verify_bearer_token(token: str) -> AuthResult:
+    """Verify a bearer token and return auth result."""
+    # Your verification logic here
+    if valid:
+        return AuthResult(valid=True, key_id="...", name="...", metadata={})
+    return AuthResult(valid=False, error="Invalid token")
+
+def extract_bearer_token(authorization: str | None) -> str | None:
+    """Optional: Custom token extraction from Authorization header."""
+    # Default implementation handles "Bearer <token>" format
+    ...
+```
+
+## Storage
+
+**Local (default)**: SQLite file
+```bash
+export DEADROP_DB=deadrop.db
+```
+
+**Production**: Turso (SQLite at the edge)
+```bash
+export TURSO_URL=libsql://your-db.turso.io
+export TURSO_AUTH_TOKEN=your-token
+pip install deaddrop[turso]
 ```
 
 ## API
 
 ### Admin Endpoints
 
-Requires bearer token (heare-auth) or `--no-auth` mode.
+Requires bearer token authentication (or `--no-auth` mode).
 
 ```bash
 POST /admin/namespaces              # Create namespace
@@ -192,10 +241,10 @@ GET /{ns}/inbox/{id}
 GET /{ns}/inbox/{id}?unread=true        # Only unread
 GET /{ns}/inbox/{id}?after={mid}        # Cursor pagination
 
-# Archive operations
+# Archive/unarchive message
+POST /{ns}/inbox/{id}/{mid}/archive
+POST /{ns}/inbox/{id}/{mid}/unarchive
 GET /{ns}/inbox/{id}/archived           # List archived messages
-POST /{ns}/inbox/{id}/{mid}/archive     # Archive a message
-POST /{ns}/inbox/{id}/{mid}/unarchive   # Restore archived message
 
 # Delete message immediately
 DELETE /{ns}/inbox/{id}/{mid}
@@ -204,64 +253,20 @@ DELETE /{ns}/inbox/{id}/{mid}
 ### Invite Endpoints
 
 ```bash
-# Get invite info (public, no auth)
+# Get invite info (no auth required)
 GET /api/invites/{invite_id}/info
 
-# Claim invite (returns encrypted secret)
+# Claim invite (no auth required, single-use)
 POST /api/invites/{invite_id}/claim
-```
 
-## Running the Server
+# Create invite (requires X-Namespace-Secret)
+POST /{ns}/invites
 
-### Development Mode
+# List invites (requires X-Namespace-Secret)
+GET /{ns}/invites
 
-```bash
-# No authentication required for admin endpoints
-deadrop serve --no-auth
-
-# With auto-reload
-deadrop serve --no-auth --reload
-```
-
-### Production Mode
-
-```bash
-# Option 1: heare-auth (recommended)
-export HEARE_AUTH_URL=https://your-heare-auth.com
-deadrop serve
-
-# Option 2: Legacy static token
-export DEADROP_ADMIN_TOKEN=your-secret-token
-deadrop serve
-```
-
-## Deployment (Dokku)
-
-```bash
-# Create app
-dokku apps:create deadrop
-
-# Set environment
-dokku config:set deadrop HEARE_AUTH_URL=https://your-heare-auth.com
-dokku config:set deadrop TURSO_URL=libsql://your-db.turso.io
-dokku config:set deadrop TURSO_AUTH_TOKEN=your-turso-token
-
-# Deploy
-git push dokku main
-```
-
-## Storage
-
-**Local (default)**: SQLite file
-```bash
-export DEADROP_DB=deadrop.db
-```
-
-**Production**: Turso (SQLite at the edge)
-```bash
-export TURSO_URL=libsql://your-db.turso.io
-export TURSO_AUTH_TOKEN=your-token
-pip install deadrop[turso]
+# Revoke invite (requires X-Namespace-Secret)
+DELETE /{ns}/invites/{invite_id}
 ```
 
 ## Environment Variables
@@ -271,9 +276,10 @@ pip install deadrop[turso]
 | Variable | Description |
 |----------|-------------|
 | `DEADROP_NO_AUTH` | Set to `1` for development (no admin auth) |
-| `HEARE_AUTH_URL` | URL of heare-auth service |
+| `DEADROP_AUTH_MODULE` | Python module path for custom auth |
+| `HEARE_AUTH_URL` | URL of heare-auth service (built-in) |
 | `DEADROP_ADMIN_TOKEN` | Legacy static admin token |
-| `DEADROP_DB` | SQLite database path |
+| `DEADROP_DB` | SQLite database path (default: `deadrop.db`) |
 | `TURSO_URL` | Turso database URL |
 | `TURSO_AUTH_TOKEN` | Turso authentication token |
 
@@ -282,9 +288,32 @@ pip install deadrop[turso]
 The CLI uses `~/.config/deadrop/config.yaml` for configuration.
 Run `deadrop init` to set up interactively.
 
-## Security Notes
+## Deployment
 
-### Authentication
+### Docker
+
+```dockerfile
+FROM python:3.11-slim
+RUN pip install deaddrop[turso]
+CMD ["deadrop", "serve"]
+```
+
+### Dokku
+
+```bash
+# Create app
+dokku apps:create deaddrop
+
+# Set environment
+dokku config:set deaddrop DEADROP_AUTH_MODULE=myapp.auth
+dokku config:set deaddrop TURSO_URL=libsql://your-db.turso.io
+dokku config:set deaddrop TURSO_AUTH_TOKEN=your-turso-token
+
+# Deploy
+git push dokku main
+```
+
+## Security Notes
 
 - **Secret-derived IDs**: Can't claim an identity without the secret
 - **No plaintext secrets stored**: Server only stores hashes
@@ -292,26 +321,9 @@ Run `deadrop init` to set up interactively.
 - **Content privacy**: Admin/namespace owners cannot read messages
 - **Config file security**: Namespace YAML files contain secrets - protect them!
 
-### Invite System Security
-
-The invite system uses **AES-256-GCM encryption** to protect mailbox secrets:
-
-1. **Key generation**: A random 256-bit key is generated
-2. **Encryption**: Mailbox secret is encrypted with the key (invite ID as AAD)
-3. **Storage**:
-   - Server stores: `invite_id`, `encrypted_secret`
-   - URL contains: `invite_id`, `key` (in fragment, never sent to server)
-4. **Client-side decryption**: Browser decrypts using key from URL fragment
-
-**Properties**:
-- Server cannot decrypt (doesn't have the key)
-- URL fragment never sent to server (browser security feature)
-- Invite is single-use (marked as claimed after use)
-- Invites can expire (optional `--expires-in`)
-
 ### Known Limitations
 
-- No end-to-end encryption (encrypt your own payloads if needed)
+- No end-to-end encryption (encrypt your own payloads)
 - No message signing (recipient trusts `from` field)
 - No rate limiting (yet)
 - Replay attacks possible (use TTLs and nonces)
@@ -326,12 +338,10 @@ deadrop config                  # Show current config
 # Namespaces
 deadrop ns create               # Create namespace
 deadrop ns create --ttl-hours 1 # Custom TTL (hours after read)
-deadrop ns create --ttl-hours 0 # Persistent (no expiration)
 deadrop ns list                 # List local namespaces
 deadrop ns list --remote        # List from server
 deadrop ns show {ns}            # Show details
 deadrop ns secret {ns}          # Show namespace secret
-deadrop ns set-slug {ns} {slug} # Set human-readable URL
 deadrop ns archive {ns}         # Archive namespace
 deadrop ns delete {ns}          # Delete local config
 deadrop ns delete {ns} --remote # Delete from server
@@ -346,14 +356,6 @@ deadrop identity export {ns} {id} --format env
 deadrop identity delete {ns} {id}
 deadrop identity delete {ns} {id} --remote
 
-# Invites (for web app users)
-deadrop invite create {ns} {id}             # Create invite link
-deadrop invite create {ns} {id} --name "Alice"
-deadrop invite create {ns} {id} --expires-in 7d
-deadrop invite list {ns}                    # List pending invites
-deadrop invite list {ns} --include-claimed  # Include used invites
-deadrop invite revoke {ns} {invite_id}      # Revoke an invite
-
 # Messages (for testing)
 deadrop message send {ns} {to} "Hello!"
 deadrop message send {ns} {to} "Hi" --identity-id {from}
@@ -362,6 +364,12 @@ deadrop message inbox {ns}                  # Read all
 deadrop message inbox {ns} --unread         # Only unread
 deadrop message inbox {ns} --after {mid}    # After cursor
 deadrop message delete {ns} {mid}           # Delete immediately
+
+# Invites (for web app access)
+deadrop invite create {ns} {identity_id}    # Create invite link
+deadrop invite create {ns} {id} --name "Name" --expires-in 48h
+deadrop invite list {ns}                    # List pending invites
+deadrop invite revoke {ns} {invite_id}      # Revoke an invite
 
 # Server
 deadrop serve                   # Run server
@@ -373,3 +381,7 @@ deadrop jobs ttl                # Process expired messages
 deadrop jobs ttl --dry-run      # Show what would be processed
 deadrop jobs ttl --archive-path /path/to/archives
 ```
+
+## License
+
+MIT

@@ -1,5 +1,5 @@
 [project]
-name = "deadrop"
+name = "deaddrop"
 version = "0.1.0"
 description = "Minimal inbox-only messaging for agents"
 readme = "README.md"
