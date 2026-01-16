@@ -25,12 +25,10 @@ def get_connection() -> sqlite3.Connection:
         db_url = os.environ.get("TURSO_URL", "")
 
         if db_url.startswith("libsql://"):
-            # Turso connection
-            import libsql_experimental as libsql
+            # Turso connection (optional dependency)
+            import libsql_experimental as libsql  # type: ignore[import-not-found]
 
-            _conn = libsql.connect(  # type: ignore[attr-defined]
-                db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")
-            )
+            _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
             _is_libsql = True
         else:
             # Local SQLite
