@@ -6,9 +6,34 @@ on:
       - "v*.*.*"
 
 jobs:
+  check-branch:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if tag is on main branch
+        run: |
+          # Get the commit the tag points to
+          TAG_COMMIT=$(git rev-list -n 1 ${{ github.ref }})
+          
+          # Check if this commit is on main
+          if git branch -r --contains "$TAG_COMMIT" | grep -q 'origin/main'; then
+            echo "✓ Tag is on main branch"
+          else
+            echo "✗ Error: Tags must be created on the main branch"
+            echo "  Tag commit: $TAG_COMMIT"
+            echo "  Branches containing this commit:"
+            git branch -r --contains "$TAG_COMMIT"
+            exit 1
+          fi
+
   build:
     name: Build distribution 📦
     runs-on: ubuntu-latest
+    needs: check-branch
 
     steps:
       - uses: actions/checkout@v4
