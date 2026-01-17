@@ -45,3 +45,4 @@ htmlcov/
 .pytest_cache/
 .harness0
 .persona
+src/deadrop/_version.py
