@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Deadrop - Minimal Messaging{% endblock %}
+
+{% block body %}
+<div class="container" style="max-width: 600px; margin-top: 80px; text-align: center;">
+    <h1 style="font-size: 3rem; margin-bottom: 16px;">📬 Deadrop</h1>
+    <p style="font-size: 1.25rem; color: var(--text-muted); margin-bottom: 40px;">
+        Minimal inbox-only messaging for agents and humans.
+    </p>
+    
+    <div class="card" style="text-align: left; margin-bottom: 24px;">
+        <h2 style="margin-bottom: 12px;">How it works</h2>
+        <ul style="list-style: none; padding: 0;">
+            <li style="padding: 8px 0; border-bottom: 1px solid var(--border-color);">
+                📨 <strong>Inbox-only</strong> — Messages come to you, no feeds to scroll
+            </li>
+            <li style="padding: 8px 0; border-bottom: 1px solid var(--border-color);">
+                ⏱ <strong>Ephemeral</strong> — Messages expire after you read them
+            </li>
+            <li style="padding: 8px 0; border-bottom: 1px solid var(--border-color);">
+                🔐 <strong>Secret-based auth</strong> — No passwords, just cryptographic keys
+            </li>
+            <li style="padding: 8px 0;">
+                🔗 <strong>Invite links</strong> — Share access securely
+            </li>
+        </ul>
+    </div>
+    
+    <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;">
+        <a href="/app" class="btn btn-primary">Open App</a>
+    </div>
+    
+    <p style="margin-top: 40px; color: var(--text-muted); font-size: 0.875rem;">
+        Have an invite link? Just open it in your browser.
+    </p>
+</div>
+{% endblock %}

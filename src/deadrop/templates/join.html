@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+
+{% block title %}Join Deadrop{% endblock %}
+
+{% block body %}
+<div class="invite-container">
+    <div class="invite-card" id="invite-card">
+        <div class="invite-icon">🔐</div>
+        <h1 class="invite-title">You've been invited</h1>
+        
+        <div id="loading" class="loading">
+            <div class="spinner"></div>
+        </div>
+        
+        <div id="error" class="error-message hidden"></div>
+        
+        <div id="invite-info" class="hidden">
+            <div class="invite-details">
+                <div class="invite-detail">
+                    <span class="invite-detail-label">Namespace</span>
+                    <span class="invite-detail-value" id="namespace-name">—</span>
+                </div>
+                <div class="invite-detail">
+                    <span class="invite-detail-label">Your identity</span>
+                    <span class="invite-detail-value" id="identity-name">—</span>
+                </div>
+                <div class="invite-detail">
+                    <span class="invite-detail-label">Message TTL</span>
+                    <span class="invite-detail-value" id="ttl-info">—</span>
+                </div>
+            </div>
+            
+            <button id="accept-btn" class="btn btn-primary" style="width: 100%;">
+                Accept Invitation
+            </button>
+            
+            <p class="invite-warning">
+                ⚠️ This link can only be used once.
+            </p>
+        </div>
+        
+        <div id="already-claimed" class="hidden">
+            <p style="margin-bottom: 16px;">This invite has already been claimed.</p>
+            <a href="/app" class="btn btn-secondary">Go to App</a>
+        </div>
+        
+        <div id="success" class="hidden">
+            <div style="font-size: 3rem; margin-bottom: 16px;">✅</div>
+            <p style="margin-bottom: 16px;">You're in! Redirecting to the app...</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const inviteId = '{{ invite_id }}';
+    
+    async function loadInviteInfo() {
+        const loading = document.getElementById('loading');
+        const error = document.getElementById('error');
+        const inviteInfo = document.getElementById('invite-info');
+        const alreadyClaimed = document.getElementById('already-claimed');
+        
+        try {
+            const info = await DeadropAPI.getInviteInfo(inviteId);
+            
+            document.getElementById('namespace-name').textContent = 
+                info.namespace_display_name || info.ns.substring(0, 8) + '...';
+            document.getElementById('identity-name').textContent = 
+                info.identity_display_name || info.display_name || info.identity_id.substring(0, 8) + '...';
+            document.getElementById('ttl-info').textContent = 
+                info.namespace_ttl_hours === 0 ? 'Persistent' : `${info.namespace_ttl_hours}h after read`;
+            
+            loading.classList.add('hidden');
+            inviteInfo.classList.remove('hidden');
+        } catch (e) {
+            loading.classList.add('hidden');
+            if (e.message.includes('already claimed')) {
+                alreadyClaimed.classList.remove('hidden');
+            } else {
+                error.textContent = e.message || 'Failed to load invite';
+                error.classList.remove('hidden');
+            }
+        }
+    }
+    
+    async function acceptInvite() {
+        const error = document.getElementById('error');
+        const inviteInfo = document.getElementById('invite-info');
+        const success = document.getElementById('success');
+        const acceptBtn = document.getElementById('accept-btn');
+        
+        // Get URL key from fragment
+        const urlKey = window.location.hash.substring(1);
+        if (!urlKey) {
+            error.textContent = 'Invalid invite link (missing key)';
+            error.classList.remove('hidden');
+            return;
+        }
+        
+        acceptBtn.disabled = true;
+        acceptBtn.textContent = 'Claiming...';
+        
+        try {
+            // Claim the invite
+            const result = await DeadropAPI.claimInvite(inviteId);
+            
+            // Decrypt the secret using key from URL fragment
+            const secret = await DeadropCrypto.decryptInviteSecret(
+                result.encrypted_secret,
+                urlKey,
+                inviteId
+            );
+            
+            // Store credentials
+            CredentialStore.addIdentity(
+                result.ns,
+                result.namespace_slug,
+                result.namespace_display_name,
+                result.namespace_ttl_hours,
+                {
+                    id: result.identity_id,
+                    secret: secret,
+                    displayName: result.identity_display_name || result.display_name,
+                }
+            );
+            
+            // Clear the fragment from URL (security)
+            history.replaceState(null, '', window.location.pathname);
+            
+            // Show success and redirect
+            inviteInfo.classList.add('hidden');
+            success.classList.remove('hidden');
+            
+            setTimeout(() => {
+                const slug = result.namespace_slug || result.ns;
+                window.location.href = `/app/${slug}`;
+            }, 1500);
+            
+        } catch (e) {
+            acceptBtn.disabled = false;
+            acceptBtn.textContent = 'Accept Invitation';
+            error.textContent = e.message || 'Failed to claim invite';
+            error.classList.remove('hidden');
+        }
+    }
+    
+    document.getElementById('accept-btn').addEventListener('click', acceptInvite);
+    loadInviteInfo();
+</script>
+{% endblock %}

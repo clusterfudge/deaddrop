@@ -544,3 +544,219 @@ class TestMessaging:
         assert len(messages) == 1
         # expires_at should be set even though we just read it
         assert messages[0]["expires_at"] is not None
+
+
+class TestInvites:
+    """Tests for the invite system."""
+
+    @pytest.fixture
+    def setup_invite(self, client, admin_headers):
+        """Create namespace, identity, and invite."""
+        from deadrop import db
+        from deadrop.crypto import create_invite_secrets
+        from datetime import datetime, timedelta, timezone
+
+        # Create namespace
+        ns_response = client.post(
+            "/admin/namespaces",
+            json={"metadata": {"display_name": "Test NS"}, "slug": "test-ns"},
+            headers=admin_headers,
+        )
+        ns_data = ns_response.json()
+
+        # Create identity
+        id_response = client.post(
+            f"/{ns_data['ns']}/identities",
+            json={"metadata": {"display_name": "Agent 1"}},
+            headers={"X-Namespace-Secret": ns_data["secret"]},
+        )
+        id_data = id_response.json()
+
+        # Create invite secrets
+        secrets = create_invite_secrets(id_data["secret"])
+
+        # Store invite in DB
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        db.create_invite(
+            invite_id=secrets.invite_id,
+            ns=ns_data["ns"],
+            identity_id=id_data["id"],
+            encrypted_secret=secrets.encrypted_secret_hex,
+            display_name="Test Invite",
+            expires_at=expires_at,
+        )
+
+        return {
+            "ns": ns_data["ns"],
+            "ns_secret": ns_data["secret"],
+            "identity_id": id_data["id"],
+            "identity_secret": id_data["secret"],
+            "invite_id": secrets.invite_id,
+            "key": secrets.key_base64,
+            "secrets": secrets,
+        }
+
+    def test_get_invite_info(self, client, setup_invite):
+        """Get public invite info without secrets."""
+        response = client.get(f"/api/invites/{setup_invite['invite_id']}/info")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["invite_id"] == setup_invite["invite_id"]
+        assert data["ns"] == setup_invite["ns"]
+        assert data["identity_id"] == setup_invite["identity_id"]
+        assert "server_key" not in data  # Should not expose secrets
+        assert "encrypted_secret" not in data
+
+    def test_get_invite_info_not_found(self, client):
+        """404 for non-existent invite."""
+        response = client.get("/api/invites/nonexistent/info")
+        assert response.status_code == 404
+
+    def test_claim_invite(self, client, setup_invite):
+        """Claim invite and receive encrypted secret."""
+        response = client.post(f"/api/invites/{setup_invite['invite_id']}/claim")
+        assert response.status_code == 200
+        data = response.json()
+
+        # Should receive encrypted_secret (no server_key in simplified model)
+        assert "encrypted_secret" in data
+        assert "server_key" not in data
+        assert data["ns"] == setup_invite["ns"]
+        assert data["identity_id"] == setup_invite["identity_id"]
+
+        # Verify we can decrypt with key from URL
+        from deadrop.crypto import decrypt_invite_secret
+
+        decrypted = decrypt_invite_secret(
+            encrypted_secret_hex=data["encrypted_secret"],
+            key_base64=setup_invite["key"],
+            invite_id=setup_invite["invite_id"],
+        )
+        assert decrypted == setup_invite["identity_secret"]
+
+    def test_claim_invite_only_once(self, client, setup_invite):
+        """Invite can only be claimed once."""
+        # First claim succeeds
+        response = client.post(f"/api/invites/{setup_invite['invite_id']}/claim")
+        assert response.status_code == 200
+
+        # Second claim fails
+        response = client.post(f"/api/invites/{setup_invite['invite_id']}/claim")
+        assert response.status_code == 410  # Gone
+
+    def test_get_invite_info_after_claim(self, client, setup_invite):
+        """Getting info for claimed invite returns 410."""
+        # Claim it
+        client.post(f"/api/invites/{setup_invite['invite_id']}/claim")
+
+        # Try to get info
+        response = client.get(f"/api/invites/{setup_invite['invite_id']}/info")
+        assert response.status_code == 410  # Gone
+
+
+class TestMessageArchive:
+    """Tests for message archiving."""
+
+    @pytest.fixture
+    def setup_with_message(self, client, admin_headers):
+        """Create namespace, agents, and a message."""
+        # Create namespace
+        ns_response = client.post(
+            "/admin/namespaces",
+            json={"metadata": {"display_name": "Test"}},
+            headers=admin_headers,
+        )
+        ns_data = ns_response.json()
+
+        # Create two agents
+        a1_response = client.post(
+            f"/{ns_data['ns']}/identities",
+            json={"metadata": {"display_name": "Agent 1"}},
+            headers={"X-Namespace-Secret": ns_data["secret"]},
+        )
+        a1_data = a1_response.json()
+
+        a2_response = client.post(
+            f"/{ns_data['ns']}/identities",
+            json={"metadata": {"display_name": "Agent 2"}},
+            headers={"X-Namespace-Secret": ns_data["secret"]},
+        )
+        a2_data = a2_response.json()
+
+        # Send a message
+        send_response = client.post(
+            f"/{ns_data['ns']}/send",
+            json={"to": a2_data["id"], "body": "Test message"},
+            headers={"X-Inbox-Secret": a1_data["secret"]},
+        )
+        mid = send_response.json()["mid"]
+
+        return {
+            "ns": ns_data["ns"],
+            "agent1": {"id": a1_data["id"], "secret": a1_data["secret"]},
+            "agent2": {"id": a2_data["id"], "secret": a2_data["secret"]},
+            "mid": mid,
+        }
+
+    def test_archive_message(self, client, setup_with_message):
+        """Archive a message."""
+        ns = setup_with_message["ns"]
+        agent2 = setup_with_message["agent2"]
+        mid = setup_with_message["mid"]
+
+        # Archive the message
+        response = client.post(
+            f"/{ns}/inbox/{agent2['id']}/{mid}/archive",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        assert response.status_code == 200
+
+        # Message should no longer appear in inbox
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        assert len(response.json()["messages"]) == 0
+
+        # But should appear in archived
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}/archived",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        messages = response.json()["messages"]
+        assert len(messages) == 1
+        assert messages[0]["mid"] == mid
+        assert messages[0]["archived_at"] is not None
+
+    def test_unarchive_message(self, client, setup_with_message):
+        """Unarchive a message."""
+        ns = setup_with_message["ns"]
+        agent2 = setup_with_message["agent2"]
+        mid = setup_with_message["mid"]
+
+        # Archive first
+        client.post(
+            f"/{ns}/inbox/{agent2['id']}/{mid}/archive",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+
+        # Unarchive
+        response = client.post(
+            f"/{ns}/inbox/{agent2['id']}/{mid}/unarchive",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        assert response.status_code == 200
+
+        # Message should be back in inbox
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        assert len(response.json()["messages"]) == 1
+
+        # And not in archived
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}/archived",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        assert len(response.json()["messages"]) == 0

@@ -23,7 +23,7 @@ def temp_config_dir(monkeypatch):
 class TestGlobalConfig:
     def test_default_values(self, temp_config_dir):
         config = GlobalConfig()
-        assert config.url == "http://localhost:8000"
+        assert config.url == "https://deaddrop.dokku.heare.io"
         assert config.bearer_token is None
 
     def test_save_and_load(self, temp_config_dir):
@@ -39,7 +39,7 @@ class TestGlobalConfig:
 
     def test_load_returns_defaults_when_no_file(self, temp_config_dir):
         config = GlobalConfig.load()
-        assert config.url == "http://localhost:8000"
+        assert config.url == "https://deaddrop.dokku.heare.io"
         assert config.bearer_token is None
 
     def test_exists(self, temp_config_dir):

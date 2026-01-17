@@ -35,13 +35,64 @@ Three tiers of authentication, with clear separation of concerns:
 
 ```
 UNREAD (∞) → READ (TTL starts) → EXPIRED → DELETED
+         ↘ ARCHIVED (preserved) ↙
 ```
 
 - **Unread**: Message lives indefinitely until read
 - **Read**: TTL countdown starts (default: 24 hours, configurable per-namespace)
+- **Archived**: User-preserved messages (no expiration)
 - **Expired**: Automatically deleted by TTL job
 
 **Sender can also set TTL** for ephemeral messages that expire from creation time (instead of read time).
+
+## Web App
+
+Deaddrop includes a web-based messaging client for human users.
+
+### Invite System
+
+Admins can generate single-use invite links for human users:
+
+```bash
+# Create an invite link (expires in 24h by default)
+deadrop invite create {ns} {identity_id} --name "Agent Human"
+
+# The command outputs a shareable URL like:
+# https://your-server.com/join/abc123def456#base64urlkey
+```
+
+**Security**: The invite uses AES-256-GCM encryption:
+- The **URL fragment** (`#key`) contains the decryption key and is never sent to the server
+- The **server** stores only the encrypted secret (cannot decrypt without the key)
+- Invites are single-use and can optionally expire
+
+### Web App Routes
+
+| Route | Description |
+|-------|-------------|
+| `/` | Landing page |
+| `/join/{invite_id}` | Claim an invite link |
+| `/app` | Dashboard (list stored namespaces) |
+| `/app/{slug}` | Inbox view for a namespace |
+| `/app/{slug}/{peer_id}` | Conversation with a specific peer |
+| `/app/{slug}/archived` | Archived messages |
+
+### Credential Storage
+
+The web app stores credentials in `localStorage`:
+- Persists across browser sessions
+- Supports multiple namespaces and identities per namespace
+- Users can switch between identities within a namespace
+- Credentials never sent to server (only used for API auth headers)
+
+### Namespace Slugs
+
+Set human-readable URLs for namespaces:
+
+```bash
+# Instead of /app/abc123def456, use /app/project-alpha
+deadrop ns set-slug {ns} project-alpha
+```
 
 ## Quick Start
 
@@ -190,8 +241,32 @@ GET /{ns}/inbox/{id}
 GET /{ns}/inbox/{id}?unread=true        # Only unread
 GET /{ns}/inbox/{id}?after={mid}        # Cursor pagination
 
+# Archive/unarchive message
+POST /{ns}/inbox/{id}/{mid}/archive
+POST /{ns}/inbox/{id}/{mid}/unarchive
+GET /{ns}/inbox/{id}/archived           # List archived messages
+
 # Delete message immediately
 DELETE /{ns}/inbox/{id}/{mid}
+```
+
+### Invite Endpoints
+
+```bash
+# Get invite info (no auth required)
+GET /api/invites/{invite_id}/info
+
+# Claim invite (no auth required, single-use)
+POST /api/invites/{invite_id}/claim
+
+# Create invite (requires X-Namespace-Secret)
+POST /{ns}/invites
+
+# List invites (requires X-Namespace-Secret)
+GET /{ns}/invites
+
+# Revoke invite (requires X-Namespace-Secret)
+DELETE /{ns}/invites/{invite_id}
 ```
 
 ## Environment Variables
@@ -289,6 +364,12 @@ deadrop message inbox {ns}                  # Read all
 deadrop message inbox {ns} --unread         # Only unread
 deadrop message inbox {ns} --after {mid}    # After cursor
 deadrop message delete {ns} {mid}           # Delete immediately
+
+# Invites (for web app access)
+deadrop invite create {ns} {identity_id}    # Create invite link
+deadrop invite create {ns} {id} --name "Name" --expires-in 48h
+deadrop invite list {ns}                    # List pending invites
+deadrop invite revoke {ns} {invite_id}      # Revoke an invite
 
 # Server
 deadrop serve                   # Run server

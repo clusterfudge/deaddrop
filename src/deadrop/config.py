@@ -38,11 +38,14 @@ def ensure_config_dir() -> Path:
     return config_dir
 
 
+DEFAULT_SERVER_URL = "https://deaddrop.dokku.heare.io"
+
+
 @dataclass
 class GlobalConfig:
     """Global CLI configuration."""
 
-    url: str = "http://localhost:8000"
+    url: str = DEFAULT_SERVER_URL
     bearer_token: str | None = None
 
     def save(self) -> None:
@@ -69,7 +72,7 @@ class GlobalConfig:
             data = yaml.safe_load(f) or {}
 
         return cls(
-            url=data.get("url", "http://localhost:8000"),
+            url=data.get("url", DEFAULT_SERVER_URL),
             bearer_token=data.get("bearer_token"),
         )
 
@@ -224,10 +227,9 @@ def init_wizard() -> GlobalConfig:
     print("Let's set up your configuration.\n")
 
     # URL
-    default_url = "http://localhost:8000"
-    url = input(f"Deadrop server URL [{default_url}]: ").strip()
+    url = input(f"Deadrop server URL [{DEFAULT_SERVER_URL}]: ").strip()
     if not url:
-        url = default_url
+        url = DEFAULT_SERVER_URL
 
     # Bearer token
     print("\nFor admin operations (creating namespaces), you need a bearer token.")

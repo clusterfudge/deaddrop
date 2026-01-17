@@ -2,9 +2,13 @@
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from . import db
@@ -22,6 +26,12 @@ def is_no_auth_mode() -> bool:
     return os.environ.get("DEADROP_NO_AUTH", "").lower() in ("1", "true", "yes")
 
 
+# Get the package directory for static files and templates
+PACKAGE_DIR = Path(__file__).parent
+STATIC_DIR = PACKAGE_DIR / "static"
+TEMPLATES_DIR = PACKAGE_DIR / "templates"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup database."""
@@ -37,6 +47,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Mount static files if directory exists
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# Initialize templates if directory exists
+templates = Jinja2Templates(directory=TEMPLATES_DIR) if TEMPLATES_DIR.exists() else None
+
 
 # --- Request/Response Models ---
 
@@ -44,17 +61,20 @@ app = FastAPI(
 class CreateNamespaceRequest(BaseModel):
     metadata: dict[str, Any] | None = None
     ttl_hours: int = 24
+    slug: str | None = None
 
 
 class CreateNamespaceResponse(BaseModel):
     ns: str
     secret: str
+    slug: str | None
     metadata: dict[str, Any]
     ttl_hours: int
 
 
 class NamespaceInfo(BaseModel):
     ns: str
+    slug: str | None = None
     metadata: dict[str, Any]
     ttl_hours: int
     created_at: str
@@ -94,6 +114,49 @@ class MessageInfo(BaseModel):
     body: str
     created_at: str
     read_at: str | None
+    expires_at: str | None
+    archived_at: str | None = None
+
+
+class InviteClaimResponse(BaseModel):
+    encrypted_secret: str
+    ns: str
+    namespace_slug: str | None
+    namespace_display_name: str | None
+    namespace_ttl_hours: int | None
+    identity_id: str
+    identity_display_name: str | None
+    display_name: str | None
+
+
+class InviteInfoResponse(BaseModel):
+    invite_id: str
+    ns: str
+    namespace_slug: str | None = None
+    namespace_display_name: str | None = None
+    namespace_ttl_hours: int | None = None
+    identity_id: str
+    identity_display_name: str | None = None
+    display_name: str | None = None
+    created_at: str
+    expires_at: str | None = None
+    claimed_at: str | None = None
+
+
+class CreateInviteRequest(BaseModel):
+    identity_id: str
+    invite_id: str  # Client provides this (used as AAD in encryption)
+    encrypted_secret: str
+    display_name: str | None = None
+    expires_at: str | None = None
+
+
+class CreateInviteResponse(BaseModel):
+    invite_id: str
+    ns: str
+    identity_id: str
+    display_name: str | None
+    created_at: str
     expires_at: str | None
 
 
@@ -213,16 +276,22 @@ def create_namespace(
     auth_info = require_admin(authorization, x_admin_token)
     metadata = request.metadata if request else None
     ttl_hours = request.ttl_hours if request else 24
+    slug = request.slug if request else None
 
     # Optionally include auth info in namespace metadata
     if auth_info.get("key_id"):
         metadata = metadata or {}
         metadata.setdefault("created_by", auth_info["key_id"])
 
-    result = db.create_namespace(metadata, ttl_hours=ttl_hours)
+    result = db.create_namespace(metadata, ttl_hours=ttl_hours, slug=slug)
+    # ns and secret are always present strings, slug may be None
+    ns = result["ns"]
+    secret = result["secret"]
+    assert ns is not None and secret is not None
     return CreateNamespaceResponse(
-        ns=result["ns"],
-        secret=result["secret"],
+        ns=ns,
+        secret=secret,
+        slug=result.get("slug"),
         metadata=metadata or {},
         ttl_hours=ttl_hours,
     )
@@ -530,6 +599,35 @@ def get_inbox(
                 "created_at": m["created_at"],
                 "read_at": m["read_at"],
                 "expires_at": m["expires_at"],
+                "archived_at": m.get("archived_at"),
+            }
+            for m in messages
+        ]
+    }
+
+
+@app.get("/{ns}/inbox/{identity_id}/archived")
+def get_archived_messages(
+    ns: str,
+    identity_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get archived messages for own inbox."""
+    require_inbox_secret(ns, identity_id, x_inbox_secret)
+
+    messages = db.get_archived_messages(ns=ns, identity_id=identity_id)
+
+    return {
+        "messages": [
+            {
+                "mid": m["mid"],
+                "from": m["from"],
+                "to": m["to"],
+                "body": m["body"],
+                "created_at": m["created_at"],
+                "read_at": m["read_at"],
+                "expires_at": m["expires_at"],
+                "archived_at": m["archived_at"],
             }
             for m in messages
         ]
@@ -558,7 +656,40 @@ def get_message(
         "created_at": message["created_at"],
         "read_at": message["read_at"],
         "expires_at": message["expires_at"],
+        "archived_at": message.get("archived_at"),
     }
+
+
+@app.post("/{ns}/inbox/{identity_id}/{mid}/archive")
+def archive_message(
+    ns: str,
+    identity_id: str,
+    mid: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Archive a message (hide from inbox but preserve)."""
+    require_inbox_secret(ns, identity_id, x_inbox_secret)
+
+    if not db.archive_message(ns, identity_id, mid):
+        raise HTTPException(404, "Message not found or already archived")
+
+    return {"ok": True}
+
+
+@app.post("/{ns}/inbox/{identity_id}/{mid}/unarchive")
+def unarchive_message(
+    ns: str,
+    identity_id: str,
+    mid: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Unarchive a message (restore to inbox)."""
+    require_inbox_secret(ns, identity_id, x_inbox_secret)
+
+    if not db.unarchive_message(ns, identity_id, mid):
+        raise HTTPException(404, "Message not found")
+
+    return {"ok": True}
 
 
 @app.delete("/{ns}/inbox/{identity_id}/{mid}")
@@ -575,6 +706,245 @@ def delete_message_endpoint(
         raise HTTPException(404, "Message not found")
 
     return {"ok": True}
+
+
+# --- Invite Endpoints ---
+
+
+@app.get("/{ns}/invites")
+def list_invites(
+    ns: str,
+    include_claimed: bool = False,
+    x_namespace_secret: str | None = Header(None),
+):
+    """List invites for a namespace.
+
+    Requires namespace secret authentication.
+    """
+    namespace = db.get_namespace(ns)
+    if not namespace:
+        raise HTTPException(404, "Namespace not found")
+
+    if not x_namespace_secret:
+        raise HTTPException(401, "X-Namespace-Secret header required")
+
+    if not db.verify_namespace_secret(ns, x_namespace_secret):
+        raise HTTPException(403, "Invalid namespace secret")
+
+    invites = db.list_invites(ns, include_claimed=include_claimed)
+    return invites
+
+
+@app.delete("/{ns}/invites/{invite_id}")
+def revoke_invite(
+    ns: str,
+    invite_id: str,
+    x_namespace_secret: str | None = Header(None),
+):
+    """Revoke (delete) an invite.
+
+    Requires namespace secret authentication.
+    """
+    namespace = db.get_namespace(ns)
+    if not namespace:
+        raise HTTPException(404, "Namespace not found")
+
+    if not x_namespace_secret:
+        raise HTTPException(401, "X-Namespace-Secret header required")
+
+    if not db.verify_namespace_secret(ns, x_namespace_secret):
+        raise HTTPException(403, "Invalid namespace secret")
+
+    if db.revoke_invite(invite_id):
+        return {"status": "ok", "invite_id": invite_id}
+    else:
+        raise HTTPException(404, "Invite not found")
+
+
+@app.post("/{ns}/invites", response_model=CreateInviteResponse)
+def create_invite(
+    ns: str,
+    req: CreateInviteRequest,
+    x_namespace_secret: str | None = Header(None),
+):
+    """Create an invite for an identity in a namespace.
+
+    Requires namespace secret authentication.
+    The client must generate the invite_id and encrypt the secret before calling this.
+    """
+    # Verify namespace secret
+    namespace = db.get_namespace(ns)
+    if not namespace:
+        raise HTTPException(404, "Namespace not found")
+
+    if not x_namespace_secret:
+        raise HTTPException(401, "X-Namespace-Secret header required")
+
+    if not db.verify_namespace_secret(ns, x_namespace_secret):
+        raise HTTPException(403, "Invalid namespace secret")
+
+    # Verify identity exists
+    identity = db.get_identity(ns, req.identity_id)
+    if not identity:
+        raise HTTPException(404, "Identity not found")
+
+    # Use client-provided invite_id (needed because it's used as AAD in encryption)
+    # Client generates this randomly, we just need to ensure uniqueness
+    invite_id = req.invite_id
+
+    # Create the invite
+    result = db.create_invite(
+        invite_id=invite_id,
+        ns=ns,
+        identity_id=req.identity_id,
+        encrypted_secret=req.encrypted_secret,
+        display_name=req.display_name,
+        expires_at=req.expires_at,
+    )
+
+    return CreateInviteResponse(**result)
+
+
+@app.get("/api/invites/{invite_id}/info", response_model=InviteInfoResponse)
+def get_invite_info(invite_id: str):
+    """Get public info about an invite (no auth required, no secrets returned)."""
+    invite = db.get_invite_info(invite_id)
+    if not invite:
+        raise HTTPException(404, "Invite not found")
+
+    if invite.get("claimed_at"):
+        raise HTTPException(410, "Invite already claimed")
+
+    return InviteInfoResponse(**invite)
+
+
+@app.post("/api/invites/{invite_id}/claim", response_model=InviteClaimResponse)
+def claim_invite(invite_id: str, request: Request):
+    """Claim an invite and receive the encrypted secret.
+
+    This is a one-time operation. After claiming, the invite cannot be used again.
+    The response includes encrypted_secret which the client decrypts using
+    the key from the URL fragment.
+    """
+    # Get client IP for logging
+    client_ip = request.client.host if request.client else None
+
+    invite = db.claim_invite(invite_id, claimed_by=client_ip)
+    if not invite:
+        # Check if it exists but was already claimed
+        existing = db.get_invite(invite_id)
+        if existing and existing.get("claimed_at"):
+            raise HTTPException(410, "Invite already claimed")
+        elif existing:
+            raise HTTPException(410, "Invite expired")
+        else:
+            raise HTTPException(404, "Invite not found")
+
+    return InviteClaimResponse(
+        encrypted_secret=invite["encrypted_secret"],
+        ns=invite["ns"],
+        namespace_slug=invite.get("namespace_slug"),
+        namespace_display_name=invite.get("namespace_display_name"),
+        namespace_ttl_hours=invite.get("namespace_ttl_hours"),
+        identity_id=invite["identity_id"],
+        identity_display_name=invite.get("identity_display_name"),
+        display_name=invite.get("display_name"),
+    )
+
+
+# --- Web App Routes ---
+
+
+@app.get("/", response_class=HTMLResponse)
+def landing_page(request: Request):
+    """Landing page."""
+    if templates:
+        return templates.TemplateResponse("landing.html", {"request": request})
+    return HTMLResponse("<h1>Deadrop</h1><p>Minimal inbox-only messaging for agents.</p>")
+
+
+@app.get("/join/{invite_id}", response_class=HTMLResponse)
+def join_page(request: Request, invite_id: str):
+    """Invite redemption page."""
+    if templates:
+        # Get invite info for display (but not secrets)
+        invite = db.get_invite_info(invite_id)
+        return templates.TemplateResponse(
+            "join.html",
+            {
+                "request": request,
+                "invite_id": invite_id,
+                "invite": invite,
+            },
+        )
+    return HTMLResponse(f"<h1>Join Invite</h1><p>Invite ID: {invite_id}</p>")
+
+
+@app.get("/app", response_class=HTMLResponse)
+def app_page(request: Request):
+    """Main web app - namespace list."""
+    if templates:
+        return templates.TemplateResponse("app.html", {"request": request})
+    return HTMLResponse("<h1>Deadrop App</h1><p>Web interface coming soon.</p>")
+
+
+@app.get("/app/{slug}", response_class=HTMLResponse)
+def app_namespace_page(request: Request, slug: str):
+    """Web app - inbox view for a namespace."""
+    if templates:
+        return templates.TemplateResponse(
+            "app.html",
+            {
+                "request": request,
+                "slug": slug,
+            },
+        )
+    return HTMLResponse(f"<h1>Deadrop App</h1><p>Namespace: {slug}</p>")
+
+
+@app.get("/app/{slug}/{peer_id}", response_class=HTMLResponse)
+def app_conversation_page(request: Request, slug: str, peer_id: str):
+    """Web app - conversation view with a peer."""
+    if templates:
+        return templates.TemplateResponse(
+            "app.html",
+            {
+                "request": request,
+                "slug": slug,
+                "peer_id": peer_id,
+            },
+        )
+    return HTMLResponse(f"<h1>Conversation</h1><p>With: {peer_id}</p>")
+
+
+@app.get("/app/{slug}/archived", response_class=HTMLResponse)
+def app_archived_page(request: Request, slug: str):
+    """Web app - archived messages view."""
+    if templates:
+        return templates.TemplateResponse(
+            "app.html",
+            {
+                "request": request,
+                "slug": slug,
+                "view": "archived",
+            },
+        )
+    return HTMLResponse(f"<h1>Archived Messages</h1><p>Namespace: {slug}</p>")
+
+
+@app.get("/app/{slug}/settings", response_class=HTMLResponse)
+def app_settings_page(request: Request, slug: str):
+    """Web app - namespace settings."""
+    if templates:
+        return templates.TemplateResponse(
+            "app.html",
+            {
+                "request": request,
+                "slug": slug,
+                "view": "settings",
+            },
+        )
+    return HTMLResponse(f"<h1>Settings</h1><p>Namespace: {slug}</p>")
 
 
 # --- Health Check ---
