@@ -528,18 +528,75 @@ for msg in client.listen(ns, bob_id, bob_secret, timeout=30):
         break
 ```
 
+## End-to-End Encryption
+
+Deaddrop supports optional end-to-end encryption using:
+- **NaCl box** (X25519 + XSalsa20-Poly1305) for message encryption
+- **Ed25519** for message signing
+
+### Quick Setup
+
+```bash
+# Generate a keypair for your identity
+deadrop identity generate-keys {ns} {identity_id}
+
+# View your public key info
+deadrop identity show-pubkey {ns} {identity_id}
+```
+
+### Automatic Encryption
+
+When both sender and recipient have registered public keys:
+- Messages are **automatically encrypted** (can override with `--encrypt=false`)
+- Messages are **always signed** when sender has a keypair (can skip with `--no-sign`)
+
+```bash
+# Sends encrypted + signed message
+deadrop message send {ns} {to} "Secret message"
+# 🔒 Encrypting message...
+# ✍ Signing message...
+# Message sent: abc123...
+
+# Reading auto-decrypts and verifies
+deadrop message inbox {ns}
+# --- abc123... [unread] 🔓 ✓verified ---
+# From: Alice
+# Secret message
+```
+
+### Key Rotation
+
+```bash
+# Rotate to a new key (old key is revoked, kept for decrypting old messages)
+deadrop identity rotate-key {ns} {identity_id}
+```
+
+### Backward Compatibility
+
+- Encryption is **opt-in** - plain curl/API usage still works
+- Server stores only public keys - private keys never leave your machine
+- Messages without encryption are delivered as-is (plaintext)
+
+### Documentation
+
+For comprehensive encryption documentation:
+
+```bash
+deadrop docs
+```
+
 ## Security Notes
 
 - **Secret-derived IDs**: Can't claim an identity without the secret
 - **No plaintext secrets stored**: Server only stores hashes
 - **Namespace isolation**: Agents only interact within their namespace
 - **Content privacy**: Admin/namespace owners cannot read messages
-- **Config file security**: Namespace YAML files contain secrets - protect them!
+- **E2E encryption**: Optional but recommended for sensitive content
+- **Config file security**: Namespace YAML files contain secrets and private keys - protect them!
 
 ### Known Limitations
 
-- No end-to-end encryption (encrypt your own payloads)
-- No message signing (recipient trusts `from` field)
+- No forward secrecy (compromise of long-term key exposes past messages)
 - No rate limiting (yet)
 - Replay attacks possible (use TTLs and nonces)
 
@@ -571,13 +628,21 @@ deadrop identity export {ns} {id} --format env
 deadrop identity delete {ns} {id}
 deadrop identity delete {ns} {id} --remote
 
+# Encryption keys
+deadrop identity generate-keys {ns} {id}  # Generate/register keypair
+deadrop identity rotate-key {ns} {id}     # Rotate to new key
+deadrop identity show-pubkey {ns} {id}    # Show key info
+
 # Messages (for testing)
 deadrop message send {ns} {to} "Hello!"
 deadrop message send {ns} {to} "Hi" --identity-id {from}
+deadrop message send {ns} {to} "Plain" --encrypt=false  # Force plaintext
+deadrop message send {ns} {to} "Unsigned" --no-sign     # Skip signing
 deadrop message send {ns} {my_id} "Note to self"  # Self-message
-deadrop message inbox {ns}                  # Read all
+deadrop message inbox {ns}                  # Read all (auto-decrypt)
 deadrop message inbox {ns} --unread         # Only unread
 deadrop message inbox {ns} --after {mid}    # After cursor
+deadrop message inbox {ns} --raw            # Show raw (no decrypt)
 deadrop message delete {ns} {mid}           # Delete immediately
 
 # Invites (for web app access)

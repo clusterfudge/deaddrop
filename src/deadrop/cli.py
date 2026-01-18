@@ -109,6 +109,33 @@ def print_json(data):
     print(json.dumps(data, indent=2, default=str))
 
 
+# --- Docs Command ---
+
+
+@app.command
+def docs():
+    """Show comprehensive usage documentation.
+
+    Outputs the built-in documentation in Markdown format.
+    Covers concepts, authentication, CLI usage, API reference, and encryption.
+    """
+    import importlib.resources
+
+    # Read the bundled documentation file
+    try:
+        # Python 3.9+ way
+        files = importlib.resources.files("deadrop.docs")
+        doc_content = (files / "USAGE.md").read_text()
+    except (AttributeError, TypeError):
+        # Fallback for older Python
+        import importlib.resources as resources
+
+        with resources.open_text("deadrop.docs", "USAGE.md") as f:
+            doc_content = f.read()
+
+    print(doc_content)
+
+
 # --- Claim Helpers (needed early for top-level command) ---
 
 
