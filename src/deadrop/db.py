@@ -44,7 +44,7 @@ DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
 # v1: Base schema
-# v2: Add rooms tables for group communication  
+# v2: Add rooms tables for group communication
 # v3: Add e2e encryption infrastructure (pubkeys table, encryption columns)
 SCHEMA_VERSION = 3
 
@@ -2162,6 +2162,8 @@ def get_room_member_info(
         row["metadata"] = json.loads(row.get("metadata") or "{}")
 
     return row
+
+
 # --- Public Key Operations ---
 
 
