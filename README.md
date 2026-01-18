@@ -606,6 +606,7 @@ deadrop docs
 # Configuration
 deadrop init                    # Setup wizard
 deadrop config                  # Show current config
+deadrop docs                    # Show full documentation
 
 # Namespaces
 deadrop ns create               # Create namespace
