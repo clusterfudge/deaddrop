@@ -16,7 +16,9 @@ certifi==2026.1.4
     #   httpcore
     #   httpx
 cffi==2.0.0
-    # via cryptography
+    # via
+    #   cryptography
+    #   pynacl
 click==8.3.1
     # via uvicorn
 cryptography==46.0.3
@@ -61,6 +63,8 @@ pydantic-core==2.41.5
     # via pydantic
 pygments==2.19.2
     # via rich
+pynacl==1.6.2
+    # via deaddrop (pyproject.toml)
 python-dotenv==1.2.1
     # via uvicorn
 python-multipart==0.0.21
