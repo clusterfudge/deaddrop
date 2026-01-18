@@ -1240,13 +1240,13 @@ def inbox(
         print("No messages.")
         return
 
-    # Cache for sender public keys (fetched from server)
-    sender_pubkeys: dict[str, bytes | None] = {}
+    # Cache for sender info (fetched from server)
+    sender_info_cache: dict[str, dict | None] = {}
 
-    def get_sender_pubkey(sender_id: str, sender_pubkey_id: str | None) -> bytes | None:
-        """Fetch sender's signing public key from server."""
-        if sender_id in sender_pubkeys:
-            return sender_pubkeys[sender_id]
+    def get_sender_info(sender_id: str) -> dict | None:
+        """Fetch sender's identity info from server (includes both encryption and signing keys)."""
+        if sender_id in sender_info_cache:
+            return sender_info_cache[sender_id]
 
         try:
             url = f"{cfg.url}/{ns}/identities/{sender_id}"
@@ -1254,12 +1254,11 @@ def inbox(
             resp = httpx.get(url, headers=headers, timeout=10.0)
             if resp.status_code == 200:
                 info = resp.json()
-                if info.get("signing_public_key"):
-                    sender_pubkeys[sender_id] = base64url_to_bytes(info["signing_public_key"])
-                    return sender_pubkeys[sender_id]
+                sender_info_cache[sender_id] = info
+                return info
         except Exception:
             pass
-        sender_pubkeys[sender_id] = None
+        sender_info_cache[sender_id] = None
         return None
 
     for msg in messages:
@@ -1282,12 +1281,13 @@ def inbox(
             if recipient_keypair:
                 # Try to decrypt
                 try:
-                    # Get sender's public key for decryption
-                    sender_pubkey = get_sender_pubkey(msg["from"], None)
-                    if sender_pubkey:
+                    # Get sender's encryption public key (X25519, not signing key)
+                    sender_info = get_sender_info(msg["from"])
+                    if sender_info and sender_info.get("public_key"):
+                        sender_enc_pubkey = base64url_to_bytes(sender_info["public_key"])
                         ciphertext = base64url_to_bytes(msg["body"])
                         body = decrypt_message(
-                            ciphertext, sender_pubkey, recipient_keypair.private_key
+                            ciphertext, sender_enc_pubkey, recipient_keypair.private_key
                         )
                         enc_status = " 🔓"
                     else:
@@ -1303,13 +1303,16 @@ def inbox(
         # Verify signature
         if msg.get("signature") and not raw:
             sig_meta = msg["signature"]
-            sender_pubkey = get_sender_pubkey(msg["from"], sig_meta.get("sender_pubkey_id"))
-            if sender_pubkey and sig_meta.get("value"):
+            sender_info = get_sender_info(msg["from"])
+            sender_signing_key = None
+            if sender_info and sender_info.get("signing_public_key"):
+                sender_signing_key = base64url_to_bytes(sender_info["signing_public_key"])
+            if sender_signing_key and sig_meta.get("value"):
                 try:
                     sig_bytes = base64url_to_bytes(sig_meta["value"])
                     # Signature is over the original body (ciphertext for encrypted, plaintext for plain)
                     sig_body = msg["body"]
-                    if verify_signature(sig_body, sig_bytes, sender_pubkey):
+                    if verify_signature(sig_body, sig_bytes, sender_signing_key):
                         sig_status = " ✓verified"
                     else:
                         sig_status = " ⚠signature invalid"
