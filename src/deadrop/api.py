@@ -519,18 +519,20 @@ def get_identity(
     x_namespace_secret: Annotated[str | None, Header()] = None,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
-    """Get identity details."""
-    # Either namespace secret OR matching inbox secret
+    """Get identity details.
+
+    Requires authentication as either:
+    - Namespace owner (X-Namespace-Secret)
+    - Any identity in the namespace (X-Inbox-Secret) - for fetching peer pubkeys
+    """
+    # Either namespace secret OR any inbox secret in the namespace
     if x_namespace_secret:
         if not db.verify_namespace_secret(ns, x_namespace_secret):
             raise HTTPException(403, "Invalid namespace secret")
     elif x_inbox_secret:
-        # Must be this identity's secret
-        derived_id = derive_id(x_inbox_secret)
-        if derived_id != identity_id:
-            raise HTTPException(403, "Can only view own identity")
-        if not db.verify_identity_secret(ns, identity_id, x_inbox_secret):
-            raise HTTPException(403, "Invalid inbox secret")
+        # Any identity in the namespace can view other identities (for pubkey exchange)
+        if not db.verify_identity_in_namespace(ns, x_inbox_secret):
+            raise HTTPException(403, "Invalid inbox secret for this namespace")
     else:
         raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
 
