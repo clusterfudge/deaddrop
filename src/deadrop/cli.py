@@ -99,6 +99,33 @@ def print_json(data):
     print(json.dumps(data, indent=2, default=str))
 
 
+# --- Docs Command ---
+
+
+@app.command
+def docs():
+    """Show comprehensive usage documentation.
+
+    Outputs the built-in documentation in Markdown format.
+    Covers concepts, authentication, CLI usage, API reference, and encryption.
+    """
+    import importlib.resources
+
+    # Read the bundled documentation file
+    try:
+        # Python 3.9+ way
+        files = importlib.resources.files("deadrop.docs")
+        doc_content = (files / "USAGE.md").read_text()
+    except (AttributeError, TypeError):
+        # Fallback for older Python
+        import importlib.resources as resources
+
+        with resources.open_text("deadrop.docs", "USAGE.md") as f:
+            doc_content = f.read()
+
+    print(doc_content)
+
+
 # --- Init Command ---
 
 
@@ -489,6 +516,129 @@ def identity_export(ns: str, identity_id: str, *, format: str = "text"):
 
 
 @identity_app.command
+def generate_keys(ns: str, identity_id: str):
+    """Generate and register an encryption keypair for an identity.
+
+    Creates a new keypair and registers the public key with the server.
+    The private key is stored locally and never sent to the server.
+
+    If the identity already has a keypair, this will rotate the key
+    (old key revoked, new key becomes active).
+    """
+    from deadrop.crypto import generate_keypair
+
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    if identity_id not in ns_cfg.mailboxes:
+        print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+        sys.exit(1)
+
+    mb = ns_cfg.mailboxes[identity_id]
+
+    # Generate keypair
+    keypair = generate_keypair()
+
+    # Register with server
+    url = f"{cfg.url}/{ns}/inbox/{identity_id}/pubkey"
+    headers = {"X-Inbox-Secret": mb.secret}
+    payload = {
+        "public_key": keypair.public_key_base64,
+        "signing_public_key": keypair.signing_public_key_base64,
+        "algorithm": "nacl-box",
+    }
+
+    response = httpx.put(url, headers=headers, json=payload, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    result = response.json()
+
+    # Save private key locally
+    mb.private_key = keypair.private_key_base64
+    mb.pubkey_id = result["pubkey_id"]
+    ns_cfg.save()
+
+    print("Keypair generated and registered!")
+    print(f"  Public key ID: {result['pubkey_id']}")
+    print(f"  Version: {result['version']}")
+    print(f"  Algorithm: {result['algorithm']}")
+    print("\nPrivate key saved to local config.")
+    print("You can now send encrypted messages and sign outgoing messages.")
+
+
+@identity_app.command
+def rotate_key(ns: str, identity_id: str):
+    """Rotate the encryption keypair for an identity.
+
+    Generates a new keypair, registers it with the server (revoking the old one),
+    and keeps the old private key for decrypting historical messages.
+
+    Alias for generate-keys (same behavior).
+    """
+    # Just call generate_keys - it handles rotation automatically
+    generate_keys(ns, identity_id)
+
+
+@identity_app.command
+def show_pubkey(ns: str, identity_id: str):
+    """Show public key information for an identity.
+
+    Shows both local keypair status and server-registered public key.
+    """
+    from deadrop.crypto import KeyPair, pubkey_id
+
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    if identity_id not in ns_cfg.mailboxes:
+        print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+        sys.exit(1)
+
+    mb = ns_cfg.mailboxes[identity_id]
+
+    print(f"Identity: {identity_id}")
+    print(f"Display name: {mb.display_name or '(none)'}")
+    print()
+
+    # Local keypair status
+    print("Local keypair:")
+    if mb.private_key:
+        keypair = KeyPair.from_private_key_base64(mb.private_key)
+        print("  ✓ Private key present")
+        print(f"  Public key: {keypair.public_key_base64}")
+        print(f"  Signing key: {keypair.signing_public_key_base64}")
+        local_pubkey_id = pubkey_id(keypair.public_key)
+        print(f"  Pubkey ID: {local_pubkey_id}")
+        if mb.pubkey_id:
+            if mb.pubkey_id == local_pubkey_id:
+                print("  ✓ Matches server pubkey_id")
+            else:
+                print(f"  ⚠ Different from server pubkey_id: {mb.pubkey_id}")
+    else:
+        print("  ✗ No private key (run 'deadrop identity generate-keys' to create one)")
+
+    # Server-side pubkey
+    print("\nServer pubkey:")
+    url = f"{cfg.url}/{ns}/identities/{identity_id}"
+    headers = {"X-Inbox-Secret": mb.secret}
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"  Error fetching: {response.status_code}")
+    else:
+        identity = response.json()
+        if identity.get("pubkey_id"):
+            print(f"  Pubkey ID: {identity['pubkey_id']}")
+            print(f"  Algorithm: {identity.get('algorithm', 'unknown')}")
+            print(f"  Version: {identity.get('pubkey_version', 'unknown')}")
+        else:
+            print("  ✗ No public key registered on server")
+
+
+@identity_app.command
 def identity_delete(ns: str, identity_id: str, *, force: bool = False, remote: bool = False):
     """Delete an identity.
 
@@ -543,12 +693,26 @@ def send(
     *,
     identity_id: str | None = None,
     ttl: int | None = None,
+    encrypt: bool | None = None,
+    no_sign: bool = False,
 ):
     """Send a message to another identity.
 
     Uses the first mailbox in the namespace config, or specify --identity-id.
-    Primarily for testing - mailbox owners typically use the API directly.
+
+    Encryption: If sender has a keypair and recipient has a public key registered,
+    the message will be encrypted by default. Use --encrypt=false to send plaintext.
+
+    Signing: If sender has a keypair, messages are always signed (unless --no-sign).
     """
+    from deadrop.crypto import (
+        KeyPair,
+        bytes_to_base64url,
+        encrypt_message,
+        pubkey_id,
+        sign_message,
+    )
+
     ns_cfg = get_namespace_config(ns)
     cfg = get_config()
 
@@ -567,12 +731,86 @@ def send(
         sender = next(iter(ns_cfg.mailboxes.values()))
         print(f"Sending as: {sender.display_name or sender.id}")
 
+    # Check sender keypair
+    sender_keypair = None
+    if sender.private_key:
+        sender_keypair = KeyPair.from_private_key_base64(sender.private_key)
+
+    # Get recipient's public key (fetch from server - server is authority)
+    recipient_pubkey = None
+    recipient_pubkey_id = None
+    url = f"{cfg.url}/{ns}/identities/{to}"
+    headers = {"X-Inbox-Secret": sender.secret}
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code == 200:
+        recipient_info = response.json()
+        if recipient_info.get("public_key"):
+            from deadrop.crypto import base64url_to_bytes
+
+            recipient_pubkey = base64url_to_bytes(recipient_info["public_key"])
+            recipient_pubkey_id = recipient_info.get("pubkey_id")
+
+    # Determine if we should encrypt
+    should_encrypt = False
+    if encrypt is True:
+        if not sender_keypair:
+            print(
+                "Error: --encrypt requires a keypair. Run 'deadrop identity generate-keys'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not recipient_pubkey:
+            print("Error: Recipient has no public key registered. Cannot encrypt.", file=sys.stderr)
+            sys.exit(1)
+        should_encrypt = True
+    elif encrypt is False:
+        should_encrypt = False
+    else:
+        # Auto-encrypt if both parties have keys
+        should_encrypt = sender_keypair is not None and recipient_pubkey is not None
+
+    # Build the message payload
+    json_data: dict = {"to": to}
+    if ttl is not None:
+        json_data["ttl_hours"] = ttl
+
+    message_body = body  # Body to sign (plaintext for plaintext msgs, or ciphertext for encrypted)
+
+    if should_encrypt:
+        # Encrypt the message (type guards ensure these are not None at this point)
+        assert sender_keypair is not None
+        assert recipient_pubkey is not None
+        ciphertext = encrypt_message(body, recipient_pubkey, sender_keypair.private_key)
+        message_body = bytes_to_base64url(ciphertext)
+        json_data["body"] = message_body
+        json_data["encrypted"] = True
+        json_data["encryption"] = {
+            "algorithm": "nacl-box",
+            "recipient_pubkey_id": recipient_pubkey_id,
+        }
+        print("🔒 Encrypting message...")
+    else:
+        json_data["body"] = body
+        json_data["encrypted"] = False
+        if recipient_pubkey and not sender_keypair:
+            print("⚠ Recipient has encryption key but you don't. Sending plaintext.")
+            print("  Run 'deadrop identity generate-keys' to enable encryption.")
+
+    # Sign the message (always, unless --no-sign)
+    if sender_keypair and not no_sign:
+        signature = sign_message(message_body, sender_keypair.private_key)
+        sender_pubkey_id = pubkey_id(sender_keypair.public_key)
+        json_data["signature"] = {
+            "algorithm": "ed25519",
+            "sender_pubkey_id": sender_pubkey_id,
+            "value": bytes_to_base64url(signature),
+        }
+        print("✍ Signing message...")
+
     # Send message
     url = f"{cfg.url}/{ns}/send"
     headers = {"X-Inbox-Secret": sender.secret}
-    json_data = {"to": to, "body": body}
-    if ttl is not None:
-        json_data["ttl"] = ttl
 
     response = httpx.post(url, headers=headers, json=json_data, timeout=30.0)
 
@@ -592,15 +830,27 @@ def inbox(
     unread: bool = False,
     after: str | None = None,
     json_output: bool = False,
+    raw: bool = False,
 ):
     """Read messages from an inbox.
 
     Uses the first mailbox in the namespace config, or specify identity-id.
     Reading marks messages as read and starts the TTL countdown.
 
+    Encrypted messages are automatically decrypted if you have the private key.
+    Signatures are verified when the sender's public key is available.
+
     --unread: Only show unread messages
     --after: Only show messages after this message ID (cursor for pagination)
+    --raw: Show raw message data without decryption
     """
+    from deadrop.crypto import (
+        KeyPair,
+        base64url_to_bytes,
+        decrypt_message,
+        verify_signature,
+    )
+
     ns_cfg = get_namespace_config(ns)
     cfg = get_config()
 
@@ -616,6 +866,11 @@ def inbox(
             sys.exit(1)
         mb = next(iter(ns_cfg.mailboxes.values()))
         print(f"Reading inbox for: {mb.display_name or mb.id}\n")
+
+    # Get recipient keypair (for decryption)
+    recipient_keypair = None
+    if mb.private_key:
+        recipient_keypair = KeyPair.from_private_key_base64(mb.private_key)
 
     # Fetch messages
     url = f"{cfg.url}/{ns}/inbox/{mb.id}"
@@ -645,6 +900,27 @@ def inbox(
         print("No messages.")
         return
 
+    # Cache for sender info (fetched from server)
+    sender_info_cache: dict[str, dict | None] = {}
+
+    def get_sender_info(sender_id: str) -> dict | None:
+        """Fetch sender's identity info from server (includes both encryption and signing keys)."""
+        if sender_id in sender_info_cache:
+            return sender_info_cache[sender_id]
+
+        try:
+            url = f"{cfg.url}/{ns}/identities/{sender_id}"
+            headers = {"X-Inbox-Secret": mb.secret}
+            resp = httpx.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                info = resp.json()
+                sender_info_cache[sender_id] = info
+                return info
+        except Exception:
+            pass
+        sender_info_cache[sender_id] = None
+        return None
+
     for msg in messages:
         status = ""
         if msg.get("acked_at"):
@@ -654,6 +930,57 @@ def inbox(
         else:
             status = " [unread]"
 
+        # Encryption/signature status
+        enc_status = ""
+        sig_status = ""
+
+        body = msg["body"]
+        is_encrypted = msg.get("encrypted", False)
+
+        if is_encrypted and not raw:
+            if recipient_keypair:
+                # Try to decrypt
+                try:
+                    # Get sender's encryption public key (X25519, not signing key)
+                    sender_info = get_sender_info(msg["from"])
+                    if sender_info and sender_info.get("public_key"):
+                        sender_enc_pubkey = base64url_to_bytes(sender_info["public_key"])
+                        ciphertext = base64url_to_bytes(msg["body"])
+                        body = decrypt_message(
+                            ciphertext, sender_enc_pubkey, recipient_keypair.private_key
+                        )
+                        enc_status = " 🔓"
+                    else:
+                        body = "[encrypted - sender pubkey not found]"
+                        enc_status = " 🔒"
+                except Exception as e:
+                    body = f"[decryption failed: {e}]"
+                    enc_status = " 🔒❌"
+            else:
+                body = "[encrypted - no private key]"
+                enc_status = " 🔒"
+
+        # Verify signature
+        if msg.get("signature") and not raw:
+            sig_meta = msg["signature"]
+            sender_info = get_sender_info(msg["from"])
+            sender_signing_key = None
+            if sender_info and sender_info.get("signing_public_key"):
+                sender_signing_key = base64url_to_bytes(sender_info["signing_public_key"])
+            if sender_signing_key and sig_meta.get("value"):
+                try:
+                    sig_bytes = base64url_to_bytes(sig_meta["value"])
+                    # Signature is over the original body (ciphertext for encrypted, plaintext for plain)
+                    sig_body = msg["body"]
+                    if verify_signature(sig_body, sig_bytes, sender_signing_key):
+                        sig_status = " ✓verified"
+                    else:
+                        sig_status = " ⚠signature invalid"
+                except Exception:
+                    sig_status = " ⚠signature error"
+            elif sig_meta.get("value"):
+                sig_status = " (unverified - sender pubkey unknown)"
+
         # Try to resolve sender name from local config
         from_name = msg["from"]
         if msg["from"] in ns_cfg.mailboxes:
@@ -661,10 +988,10 @@ def inbox(
             if mb_from.display_name:
                 from_name = f"{mb_from.display_name} ({msg['from'][:8]}...)"
 
-        print(f"--- {msg['mid'][:8]}...{status} ---")
+        print(f"--- {msg['mid'][:8]}...{status}{enc_status}{sig_status} ---")
         print(f"From: {from_name}")
         print(f"At:   {msg['created_at']}")
-        print(f"\n{msg['body']}\n")
+        print(f"\n{body}\n")
 
 
 @message_app.command

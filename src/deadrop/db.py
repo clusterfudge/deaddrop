@@ -14,6 +14,9 @@ from .auth import derive_id, generate_secret, hash_secret
 # Default TTL in hours when messages are read
 DEFAULT_TTL_HOURS = 24
 
+# Current schema version
+SCHEMA_VERSION = 2
+
 # Connection singleton
 _conn: sqlite3.Connection | None = None
 _is_libsql: bool = False
@@ -72,10 +75,32 @@ def close_db():
         _is_libsql = False
 
 
-def init_db():
-    """Initialize database schema."""
-    conn = get_connection()
+def _get_schema_version(conn: sqlite3.Connection) -> int:
+    """Get current schema version from database."""
+    try:
+        cursor = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    """Set schema version in database."""
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (?, CURRENT_TIMESTAMP)", (version,)
+    )
+    conn.commit()
+
+
+def _migrate_v0_to_v1(conn: sqlite3.Connection) -> None:
+    """Initial schema (v1)."""
     conn.executescript("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
         CREATE TABLE IF NOT EXISTS namespaces (
             ns TEXT PRIMARY KEY,
             secret_hash TEXT NOT NULL,
@@ -145,11 +170,97 @@ def init_db():
     conn.commit()
 
 
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Add e2e encryption support (v2).
+
+    Adds:
+    - pubkeys table for versioned public keys
+    - identities.current_pubkey_id reference
+    - messages.encrypted flag
+    - messages.signature for Ed25519 signatures
+    - messages.encryption_meta for encryption metadata (algorithm, pubkey_id)
+    """
+    conn.executescript("""
+        -- Versioned public keys table
+        CREATE TABLE IF NOT EXISTS pubkeys (
+            pubkey_id TEXT PRIMARY KEY,
+            ns TEXT NOT NULL,
+            identity_id TEXT NOT NULL,
+            public_key TEXT NOT NULL,
+            signing_public_key TEXT NOT NULL,
+            algorithm TEXT NOT NULL DEFAULT 'nacl-box',
+            version INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            revoked_at TIMESTAMP,
+            FOREIGN KEY (ns, identity_id) REFERENCES identities(ns, id) ON DELETE CASCADE,
+            UNIQUE(ns, identity_id, version)
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_pubkeys_identity ON pubkeys(ns, identity_id);
+        CREATE INDEX IF NOT EXISTS idx_pubkeys_active ON pubkeys(ns, identity_id, revoked_at) 
+            WHERE revoked_at IS NULL;
+    """)
+    conn.commit()
+
+    # Add columns to existing tables (SQLite requires separate ALTER statements)
+    # Check if columns exist before adding (for idempotency)
+    cursor = conn.execute("PRAGMA table_info(identities)")
+    identity_columns = {row[1] for row in cursor.fetchall()}
+
+    if "current_pubkey_id" not in identity_columns:
+        conn.execute("ALTER TABLE identities ADD COLUMN current_pubkey_id TEXT")
+
+    cursor = conn.execute("PRAGMA table_info(messages)")
+    message_columns = {row[1] for row in cursor.fetchall()}
+
+    if "encrypted" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN encrypted BOOLEAN DEFAULT FALSE")
+    if "signature" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN signature TEXT")
+    if "encryption_meta" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN encryption_meta JSON")
+    if "signature_meta" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN signature_meta JSON")
+
+    conn.commit()
+
+
+# Migration registry: version -> migration function
+_MIGRATIONS = {
+    1: _migrate_v0_to_v1,
+    2: _migrate_v1_to_v2,
+}
+
+
+def init_db():
+    """Initialize database schema and run any pending migrations."""
+    conn = get_connection()
+
+    # Check if this is a fresh database
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    )
+    has_schema_table = cursor.fetchone() is not None
+
+    # Get current version (0 if fresh database)
+    current_version = _get_schema_version(conn) if has_schema_table else 0
+
+    # Run migrations
+    for version in sorted(_MIGRATIONS.keys()):
+        if version > current_version:
+            _MIGRATIONS[version](conn)
+            _set_schema_version(conn, version)
+
+    conn.commit()
+
+
 def reset_db():
     """Reset database (for testing)."""
     conn = get_connection()
     conn.executescript("""
+        DROP TABLE IF EXISTS schema_version;
         DROP TABLE IF EXISTS archive_batches;
+        DROP TABLE IF EXISTS pubkeys;
         DROP TABLE IF EXISTS invites;
         DROP TABLE IF EXISTS messages;
         DROP TABLE IF EXISTS identities;
@@ -428,19 +539,32 @@ def create_identity(ns: str, metadata: dict[str, Any] | None = None) -> dict[str
 
 
 def get_identity(ns: str, identity_id: str) -> dict | None:
-    """Get identity by ID."""
+    """Get identity by ID, including current pubkey info."""
     conn = get_connection()
     cursor = conn.execute(
-        "SELECT id, metadata, created_at FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
+        """SELECT i.id, i.metadata, i.created_at, i.current_pubkey_id,
+                  p.public_key, p.signing_public_key, p.algorithm, p.version as pubkey_version
+           FROM identities i
+           LEFT JOIN pubkeys p ON i.current_pubkey_id = p.pubkey_id
+           WHERE i.ns = ? AND i.id = ?""",
+        (ns, identity_id),
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if row:
-        return {
+        result = {
             "id": row["id"],
             "metadata": json.loads(row["metadata"] or "{}"),
             "created_at": row["created_at"],
         }
+        # Add pubkey info if present
+        if row.get("current_pubkey_id"):
+            result["pubkey_id"] = row["current_pubkey_id"]
+            result["public_key"] = row["public_key"]
+            result["signing_public_key"] = row["signing_public_key"]
+            result["algorithm"] = row["algorithm"]
+            result["pubkey_version"] = row["pubkey_version"]
+        return result
     return None
 
 
@@ -455,21 +579,35 @@ def get_identity_secret_hash(ns: str, identity_id: str) -> str | None:
 
 
 def list_identities(ns: str) -> list[dict]:
-    """List all identities in a namespace."""
+    """List all identities in a namespace, including current pubkey info."""
     conn = get_connection()
     cursor = conn.execute(
-        "SELECT id, metadata, created_at FROM identities WHERE ns = ? ORDER BY created_at", (ns,)
+        """SELECT i.id, i.metadata, i.created_at, i.current_pubkey_id,
+                  p.public_key, p.signing_public_key, p.algorithm, p.version as pubkey_version
+           FROM identities i
+           LEFT JOIN pubkeys p ON i.current_pubkey_id = p.pubkey_id
+           WHERE i.ns = ? 
+           ORDER BY i.created_at""",
+        (ns,),
     )
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
-    return [
-        {
+    result = []
+    for row in rows:
+        item = {
             "id": row["id"],
             "metadata": json.loads(row["metadata"] or "{}"),
             "created_at": row["created_at"],
         }
-        for row in rows
-    ]
+        # Add pubkey info if present
+        if row.get("current_pubkey_id"):
+            item["pubkey_id"] = row["current_pubkey_id"]
+            item["public_key"] = row["public_key"]
+            item["signing_public_key"] = row["signing_public_key"]
+            item["algorithm"] = row["algorithm"]
+            item["pubkey_version"] = row["pubkey_version"]
+        result.append(item)
+    return result
 
 
 def verify_identity_secret(ns: str, identity_id: str, secret: str) -> bool:
@@ -541,6 +679,10 @@ def send_message(
     to_id: str,
     body: str,
     ttl_hours: int | None = None,
+    encrypted: bool = False,
+    encryption_meta: dict | None = None,
+    signature: str | None = None,
+    signature_meta: dict | None = None,
 ) -> dict:
     """Send a message. Returns message info.
 
@@ -548,8 +690,12 @@ def send_message(
         ns: Namespace
         from_id: Sender identity
         to_id: Recipient identity
-        body: Message body
+        body: Message body (plaintext or base64 ciphertext if encrypted)
         ttl_hours: Optional TTL override (for ephemeral messages that expire from creation)
+        encrypted: Whether the body is encrypted
+        encryption_meta: Encryption metadata (algorithm, recipient_pubkey_id)
+        signature: Base64-encoded signature
+        signature_meta: Signature metadata (algorithm, sender_pubkey_id)
     """
     # Verify recipient exists
     conn = get_connection()
@@ -567,14 +713,38 @@ def send_message(
     if ttl_hours is not None and ttl_hours > 0:
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
 
+    # Store signature in signature_meta if provided
+    if signature and signature_meta:
+        signature_meta = {**signature_meta, "value": signature}
+
     conn.execute(
-        """INSERT INTO messages (mid, ns, to_id, from_id, body, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (mid, ns, to_id, from_id, body, now, expires_at),
+        """INSERT INTO messages (mid, ns, to_id, from_id, body, created_at, expires_at,
+                                 encrypted, encryption_meta, signature_meta)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            mid,
+            ns,
+            to_id,
+            from_id,
+            body,
+            now,
+            expires_at,
+            encrypted,
+            json.dumps(encryption_meta) if encryption_meta else None,
+            json.dumps(signature_meta) if signature_meta else None,
+        ),
     )
     conn.commit()
 
-    return {"mid": mid, "from": from_id, "to": to_id, "created_at": now}
+    return {
+        "mid": mid,
+        "from": from_id,
+        "to": to_id,
+        "created_at": now,
+        "encrypted": encrypted,
+        "encryption_meta": encryption_meta,
+        "signature_meta": signature_meta,
+    }
 
 
 def get_messages(
@@ -606,7 +776,8 @@ def get_messages(
 
     # Build query
     query = """
-        SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
+        SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at,
+               encrypted, encryption_meta, signature_meta
         FROM messages 
         WHERE ns = ? AND to_id = ?
         AND (expires_at IS NULL OR expires_at > ?)
@@ -629,8 +800,9 @@ def get_messages(
     cursor = conn.execute(query, tuple(params))
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
-    messages = [
-        {
+    messages = []
+    for row in rows:
+        msg = {
             "mid": row["mid"],
             "from": row["from_id"],
             "to": row["to_id"],
@@ -639,9 +811,14 @@ def get_messages(
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
             "archived_at": row.get("archived_at"),
+            "encrypted": bool(row.get("encrypted")),
         }
-        for row in rows
-    ]
+        # Parse JSON metadata fields
+        if row.get("encryption_meta"):
+            msg["encryption_meta"] = json.loads(row["encryption_meta"])
+        if row.get("signature_meta"):
+            msg["signature_meta"] = json.loads(row["signature_meta"])
+        messages.append(msg)
 
     # Mark unread messages as read and set expiration (if requested and namespace has TTL)
     if mark_as_read:
@@ -674,7 +851,8 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
+        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at,
+                  encrypted, encryption_meta, signature_meta
            FROM messages 
            WHERE ns = ? AND to_id = ? AND mid = ?
            AND (expires_at IS NULL OR expires_at > ?)""",
@@ -683,7 +861,7 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if row:
-        return {
+        msg = {
             "mid": row["mid"],
             "from": row["from_id"],
             "to": row["to_id"],
@@ -692,7 +870,13 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
             "archived_at": row.get("archived_at"),
+            "encrypted": bool(row.get("encrypted")),
         }
+        if row.get("encryption_meta"):
+            msg["encryption_meta"] = json.loads(row["encryption_meta"])
+        if row.get("signature_meta"):
+            msg["signature_meta"] = json.loads(row["signature_meta"])
+        return msg
     return None
 
 
@@ -736,7 +920,8 @@ def get_archived_messages(ns: str, identity_id: str) -> list[dict]:
     """Get archived messages for an identity."""
     conn = get_connection()
     cursor = conn.execute(
-        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
+        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at,
+                  encrypted, encryption_meta, signature_meta
            FROM messages 
            WHERE ns = ? AND to_id = ? AND archived_at IS NOT NULL
            ORDER BY archived_at DESC""",
@@ -744,8 +929,9 @@ def get_archived_messages(ns: str, identity_id: str) -> list[dict]:
     )
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
-    return [
-        {
+    messages = []
+    for row in rows:
+        msg = {
             "mid": row["mid"],
             "from": row["from_id"],
             "to": row["to_id"],
@@ -754,9 +940,14 @@ def get_archived_messages(ns: str, identity_id: str) -> list[dict]:
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
             "archived_at": row["archived_at"],
+            "encrypted": bool(row.get("encrypted")),
         }
-        for row in rows
-    ]
+        if row.get("encryption_meta"):
+            msg["encryption_meta"] = json.loads(row["encryption_meta"])
+        if row.get("signature_meta"):
+            msg["signature_meta"] = json.loads(row["signature_meta"])
+        messages.append(msg)
+    return messages
 
 
 # --- Invite Operations ---
@@ -1000,3 +1191,141 @@ def get_archive_batches(ns: str | None = None) -> list[dict]:
         cursor = conn.execute("SELECT * FROM archive_batches ORDER BY created_at")
 
     return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+# --- Public Key Operations ---
+
+
+def create_pubkey(
+    ns: str,
+    identity_id: str,
+    public_key: str,
+    signing_public_key: str,
+    algorithm: str = "nacl-box",
+) -> dict:
+    """
+    Create a new public key for an identity.
+
+    Automatically increments version and revokes any existing key.
+
+    Args:
+        ns: Namespace
+        identity_id: Identity ID
+        public_key: Base64-encoded X25519 public key
+        signing_public_key: Base64-encoded Ed25519 public key
+        algorithm: Encryption algorithm (default: nacl-box)
+
+    Returns:
+        Dict with pubkey_id, version, and other metadata
+    """
+    from .crypto import pubkey_id as compute_pubkey_id, base64url_to_bytes
+
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Compute pubkey_id from the public key
+    pk_bytes = base64url_to_bytes(public_key)
+    pubkey_id = compute_pubkey_id(pk_bytes)
+
+    # Get next version number
+    cursor = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM pubkeys WHERE ns = ? AND identity_id = ?",
+        (ns, identity_id),
+    )
+    current_max = cursor.fetchone()[0]
+    new_version = current_max + 1
+
+    # Revoke any existing active keys
+    conn.execute(
+        "UPDATE pubkeys SET revoked_at = ? WHERE ns = ? AND identity_id = ? AND revoked_at IS NULL",
+        (now, ns, identity_id),
+    )
+
+    # Insert new key
+    conn.execute(
+        """INSERT INTO pubkeys 
+           (pubkey_id, ns, identity_id, public_key, signing_public_key, algorithm, version, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pubkey_id, ns, identity_id, public_key, signing_public_key, algorithm, new_version, now),
+    )
+
+    # Update identity's current_pubkey_id
+    conn.execute(
+        "UPDATE identities SET current_pubkey_id = ? WHERE ns = ? AND id = ?",
+        (pubkey_id, ns, identity_id),
+    )
+
+    conn.commit()
+
+    return {
+        "pubkey_id": pubkey_id,
+        "ns": ns,
+        "identity_id": identity_id,
+        "public_key": public_key,
+        "signing_public_key": signing_public_key,
+        "algorithm": algorithm,
+        "version": new_version,
+        "created_at": now,
+        "revoked_at": None,
+    }
+
+
+def get_pubkey(pubkey_id: str) -> dict | None:
+    """Get a public key by its ID."""
+    conn = get_connection()
+    cursor = conn.execute(
+        """SELECT pubkey_id, ns, identity_id, public_key, signing_public_key, 
+                  algorithm, version, created_at, revoked_at
+           FROM pubkeys WHERE pubkey_id = ?""",
+        (pubkey_id,),
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def get_current_pubkey(ns: str, identity_id: str) -> dict | None:
+    """Get the current (active) public key for an identity."""
+    conn = get_connection()
+    cursor = conn.execute(
+        """SELECT pubkey_id, ns, identity_id, public_key, signing_public_key,
+                  algorithm, version, created_at, revoked_at
+           FROM pubkeys 
+           WHERE ns = ? AND identity_id = ? AND revoked_at IS NULL
+           ORDER BY version DESC LIMIT 1""",
+        (ns, identity_id),
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def get_pubkey_history(ns: str, identity_id: str) -> list[dict]:
+    """Get all public keys for an identity (for key rotation history)."""
+    conn = get_connection()
+    cursor = conn.execute(
+        """SELECT pubkey_id, ns, identity_id, public_key, signing_public_key,
+                  algorithm, version, created_at, revoked_at
+           FROM pubkeys 
+           WHERE ns = ? AND identity_id = ?
+           ORDER BY version DESC""",
+        (ns, identity_id),
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def revoke_pubkey(pubkey_id: str) -> bool:
+    """Revoke a public key (without setting a new one)."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "UPDATE pubkeys SET revoked_at = ? WHERE pubkey_id = ? AND revoked_at IS NULL",
+        (now, pubkey_id),
+    )
+
+    if cursor.rowcount > 0:
+        # Clear current_pubkey_id on identity if this was the current key
+        conn.execute(
+            """UPDATE identities SET current_pubkey_id = NULL 
+               WHERE current_pubkey_id = ?""",
+            (pubkey_id,),
+        )
+        conn.commit()
+        return True
+    return False
