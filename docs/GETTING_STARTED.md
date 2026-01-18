@@ -348,11 +348,84 @@ print(f'Alice invite: http://localhost:8000/join/{secrets.invite_id}#{secrets.ke
 
 ---
 
+---
+
+## End-to-End Encryption
+
+Deaddrop supports optional end-to-end encryption for sensitive communications.
+
+### Setup Encryption Keys
+
+```bash
+# Generate a keypair for an identity
+uv run deadrop identity generate-keys {ns} {identity_id}
+
+# Verify keys are registered
+uv run deadrop identity show-pubkey {ns} {identity_id}
+```
+
+### Sending Encrypted Messages
+
+When both sender and recipient have registered public keys, messages are **automatically encrypted**:
+
+```bash
+# Both parties need keys
+uv run deadrop identity generate-keys $NS $ALICE_ID
+uv run deadrop identity generate-keys $NS $BOB_ID
+
+# Bob sends to Alice - auto-encrypted!
+uv run deadrop message send $NS $ALICE_ID "Secret message" --identity-id $BOB_ID
+# Output:
+# 🔒 Encrypting message...
+# ✍ Signing message...
+# Message sent: abc123...
+```
+
+### Reading Encrypted Messages
+
+The CLI automatically decrypts messages when you have the private key:
+
+```bash
+uv run deadrop message inbox $NS $ALICE_ID
+# Output:
+# --- abc123... [unread] 🔓 ✓verified ---
+# From: Bob (def456...)
+# At: 2026-01-18T12:00:00Z
+#
+# Secret message
+```
+
+### Key Rotation
+
+If you need to rotate keys (e.g., suspected compromise):
+
+```bash
+uv run deadrop identity rotate-key {ns} {identity_id}
+```
+
+This:
+1. Generates a new keypair
+2. Registers the new public key on the server
+3. Revokes the old key
+4. Keeps the old private key locally for decrypting historical messages
+
+### Comprehensive Documentation
+
+For full encryption documentation:
+
+```bash
+uv run deadrop docs
+```
+
+---
+
 ## Security Considerations
 
 - **Invite links are single-use**: Once claimed, they cannot be reused
 - **URL fragments are never sent to server**: The decryption key stays client-side
 - **Secrets are never stored in plaintext**: Server only stores hashes
 - **TTL protects message lifecycle**: Messages auto-expire after being read
+- **E2E encryption is optional**: Enable it for sensitive communications
+- **Private keys are local-only**: Never transmitted to the server
 
 See the main [README.md](../README.md) for more security details.

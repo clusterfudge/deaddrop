@@ -216,3 +216,213 @@ class TestSecurityProperties:
                 key_base64=secrets.key_base64,
                 invite_id=generate_invite_id(),  # Wrong invite_id
             )
+
+
+# =============================================================================
+# E2E Encryption Tests (NaCl box + Ed25519)
+# =============================================================================
+
+
+class TestKeypairGeneration:
+    """Tests for keypair generation."""
+
+    def test_generate_keypair_produces_valid_keys(self):
+        """Keypair should have 32-byte keys."""
+        from deadrop.crypto import generate_keypair
+
+        kp = generate_keypair()
+        assert len(kp.private_key) == 32
+        assert len(kp.public_key) == 32
+        assert len(kp.signing_public_key) == 32
+
+    def test_generate_keypair_randomness(self):
+        """Generated keypairs should be unique."""
+        from deadrop.crypto import generate_keypair
+
+        keypairs = [generate_keypair() for _ in range(5)]
+        private_keys = [kp.private_key for kp in keypairs]
+        assert len(set(private_keys)) == 5
+
+    def test_keypair_from_seed_reproducible(self):
+        """Same seed should produce same keypair."""
+        from deadrop.crypto import KeyPair
+
+        seed = b"x" * 32
+        kp1 = KeyPair.from_seed(seed)
+        kp2 = KeyPair.from_seed(seed)
+
+        assert kp1.public_key == kp2.public_key
+        assert kp1.signing_public_key == kp2.signing_public_key
+
+    def test_keypair_serialization_roundtrip(self):
+        """Keypair should serialize/deserialize correctly."""
+        from deadrop.crypto import generate_keypair, KeyPair
+
+        kp = generate_keypair()
+        serialized = kp.private_key_base64
+        restored = KeyPair.from_private_key_base64(serialized)
+
+        assert restored.private_key == kp.private_key
+        assert restored.public_key == kp.public_key
+        assert restored.signing_public_key == kp.signing_public_key
+
+
+class TestPubkeyId:
+    """Tests for pubkey ID generation."""
+
+    def test_pubkey_id_deterministic(self):
+        """Same public key should produce same ID."""
+        from deadrop.crypto import generate_keypair, pubkey_id
+
+        kp = generate_keypair()
+        id1 = pubkey_id(kp.public_key)
+        id2 = pubkey_id(kp.public_key)
+
+        assert id1 == id2
+
+    def test_pubkey_id_format(self):
+        """Pubkey ID should be 32 hex characters."""
+        from deadrop.crypto import generate_keypair, pubkey_id
+
+        kp = generate_keypair()
+        pk_id = pubkey_id(kp.public_key)
+
+        assert len(pk_id) == 32
+        # Should be valid hex
+        int(pk_id, 16)
+
+    def test_pubkey_id_different_keys(self):
+        """Different keys should have different IDs."""
+        from deadrop.crypto import generate_keypair, pubkey_id
+
+        kp1 = generate_keypair()
+        kp2 = generate_keypair()
+
+        assert pubkey_id(kp1.public_key) != pubkey_id(kp2.public_key)
+
+
+class TestMessageEncryption:
+    """Tests for NaCl box message encryption."""
+
+    def test_encrypt_decrypt_roundtrip(self):
+        """Encrypted message should decrypt correctly."""
+        from deadrop.crypto import (
+            generate_keypair,
+            encrypt_message,
+            decrypt_message,
+        )
+
+        sender = generate_keypair()
+        recipient = generate_keypair()
+
+        plaintext = "Hello, encrypted world!"
+        ciphertext = encrypt_message(plaintext, recipient.public_key, sender.private_key)
+        decrypted = decrypt_message(ciphertext, sender.public_key, recipient.private_key)
+
+        assert decrypted == plaintext
+
+    def test_encryption_produces_different_ciphertext(self):
+        """Same message encrypted twice should produce different ciphertext (random nonce)."""
+        from deadrop.crypto import generate_keypair, encrypt_message
+
+        sender = generate_keypair()
+        recipient = generate_keypair()
+
+        plaintext = "Same message"
+        ct1 = encrypt_message(plaintext, recipient.public_key, sender.private_key)
+        ct2 = encrypt_message(plaintext, recipient.public_key, sender.private_key)
+
+        assert ct1 != ct2  # Different nonce each time
+
+    def test_wrong_recipient_key_fails(self):
+        """Decryption with wrong key should fail."""
+        from deadrop.crypto import generate_keypair, encrypt_message, decrypt_message
+        from nacl.exceptions import CryptoError
+
+        sender = generate_keypair()
+        recipient = generate_keypair()
+        wrong_recipient = generate_keypair()
+
+        ciphertext = encrypt_message("secret", recipient.public_key, sender.private_key)
+
+        with pytest.raises(CryptoError):
+            decrypt_message(ciphertext, sender.public_key, wrong_recipient.private_key)
+
+    def test_tampered_ciphertext_fails(self):
+        """Tampered ciphertext should fail decryption."""
+        from deadrop.crypto import generate_keypair, encrypt_message, decrypt_message
+        from nacl.exceptions import CryptoError
+
+        sender = generate_keypair()
+        recipient = generate_keypair()
+
+        ciphertext = encrypt_message("secret", recipient.public_key, sender.private_key)
+        tampered = ciphertext[:-1] + bytes([ciphertext[-1] ^ 1])
+
+        with pytest.raises(CryptoError):
+            decrypt_message(tampered, sender.public_key, recipient.private_key)
+
+    def test_encrypt_unicode(self):
+        """Encryption should handle unicode text."""
+        from deadrop.crypto import generate_keypair, encrypt_message, decrypt_message
+
+        sender = generate_keypair()
+        recipient = generate_keypair()
+
+        plaintext = "Hello 世界! 🔐🔑"
+        ciphertext = encrypt_message(plaintext, recipient.public_key, sender.private_key)
+        decrypted = decrypt_message(ciphertext, sender.public_key, recipient.private_key)
+
+        assert decrypted == plaintext
+
+
+class TestMessageSigning:
+    """Tests for Ed25519 message signing."""
+
+    def test_sign_verify_roundtrip(self):
+        """Signed message should verify correctly."""
+        from deadrop.crypto import generate_keypair, sign_message, verify_signature
+
+        kp = generate_keypair()
+        message = "This is my authentic message"
+
+        signature = sign_message(message, kp.private_key)
+        assert verify_signature(message, signature, kp.signing_public_key)
+
+    def test_signature_length(self):
+        """Signature should be 64 bytes."""
+        from deadrop.crypto import generate_keypair, sign_message
+
+        kp = generate_keypair()
+        signature = sign_message("test", kp.private_key)
+
+        assert len(signature) == 64
+
+    def test_wrong_key_verification_fails(self):
+        """Verification with wrong key should fail."""
+        from deadrop.crypto import generate_keypair, sign_message, verify_signature
+
+        signer = generate_keypair()
+        wrong_key = generate_keypair()
+
+        signature = sign_message("test", signer.private_key)
+        assert not verify_signature("test", signature, wrong_key.signing_public_key)
+
+    def test_tampered_message_verification_fails(self):
+        """Tampered message should fail verification."""
+        from deadrop.crypto import generate_keypair, sign_message, verify_signature
+
+        kp = generate_keypair()
+        signature = sign_message("original message", kp.private_key)
+
+        assert not verify_signature("tampered message", signature, kp.signing_public_key)
+
+    def test_sign_unicode(self):
+        """Signing should handle unicode text."""
+        from deadrop.crypto import generate_keypair, sign_message, verify_signature
+
+        kp = generate_keypair()
+        message = "Signed message 日本語 🖊️"
+
+        signature = sign_message(message, kp.private_key)
+        assert verify_signature(message, signature, kp.signing_public_key)
