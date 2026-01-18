@@ -26,6 +26,7 @@ certifi==2026.1.4 \
     # via
     #   httpcore
     #   httpx
+<<<<<<< HEAD
 cffi==2.0.0 ; platform_python_implementation != 'PyPy' \
     --hash=sha256:00bdf7acc5f795150faa6957054fbbca2439db2f775ce831222b66f192f03beb \
     --hash=sha256:07b271772c100085dd28b74fa0cd81c8fb1a3ba18b21e03d7c27f3436a10606b \
@@ -91,6 +92,13 @@ cffi==2.0.0 ; platform_python_implementation != 'PyPy' \
 click==8.3.1 \
     --hash=sha256:12ff4785d337a1bb490bb7e9c2b1ee5da3112e94a8622f26a6c77f5d2fc6842a \
     --hash=sha256:981153a64e25f12d547d3426c367a4857371575ee7ad18df2a6183ab0545b2a6
+=======
+cffi==2.0.0
+    # via
+    #   cryptography
+    #   pynacl
+click==8.3.1
+>>>>>>> 3a22249 (feat: Add e2e encryption infrastructure)
     # via uvicorn
 colorama==0.4.6 ; sys_platform == 'win32' \
     --hash=sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44 \
@@ -414,9 +422,15 @@ pygments==2.19.2 \
     --hash=sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887 \
     --hash=sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b
     # via rich
+<<<<<<< HEAD
 python-dotenv==1.2.1 \
     --hash=sha256:42667e897e16ab0d66954af0e60a9caa94f0fd4ecf3aaf6d2d260eec1aa36ad6 \
     --hash=sha256:b81ee9561e9ca4004139c6cbba3a238c32b03e4894671e181b671e8cb8425d61
+=======
+pynacl==1.6.2
+    # via deaddrop (pyproject.toml)
+python-dotenv==1.2.1
+>>>>>>> 3a22249 (feat: Add e2e encryption infrastructure)
     # via uvicorn
 python-multipart==0.0.22 \
     --hash=sha256:2b2cd894c83d21bf49d702499531c7bafd057d730c201782048f7945d82de155 \

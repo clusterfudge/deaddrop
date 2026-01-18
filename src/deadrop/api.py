@@ -95,19 +95,61 @@ class IdentityInfo(BaseModel):
     id: str
     metadata: dict[str, Any]
     created_at: str
+    # Public key info (optional - present if identity has registered a key)
+    pubkey_id: str | None = None
+    public_key: str | None = None
+    signing_public_key: str | None = None
+    algorithm: str | None = None
+    pubkey_version: int | None = None
+
+
+class SetPubkeyRequest(BaseModel):
+    public_key: str  # Base64-encoded X25519 public key
+    signing_public_key: str  # Base64-encoded Ed25519 public key
+    algorithm: str = "nacl-box"
+
+
+class PubkeyInfo(BaseModel):
+    pubkey_id: str
+    ns: str
+    identity_id: str
+    public_key: str
+    signing_public_key: str
+    algorithm: str
+    version: int
+    created_at: str
+    revoked_at: str | None = None
 
 
 class UpdateMetadataRequest(BaseModel):
     metadata: dict[str, Any]
 
 
+class EncryptionMeta(BaseModel):
+    """Metadata for encrypted messages."""
+
+    algorithm: str  # e.g., "nacl-box"
+    recipient_pubkey_id: str  # Which key was used to encrypt
+
+
+class SignatureMeta(BaseModel):
+    """Metadata for signed messages."""
+
+    algorithm: str  # e.g., "ed25519"
+    sender_pubkey_id: str  # Which key signed
+    value: str  # Base64-encoded signature
+
+
 class SendMessageRequest(BaseModel):
     to: str
-    body: str
+    body: str  # Plaintext OR base64-encoded ciphertext (if encrypted=True)
     content_type: str = (
         "text/plain"  # MIME type (e.g., text/plain, text/markdown, text/html, application/json)
     )
     ttl_hours: int | None = None  # Optional TTL override (ephemeral messages)
+    encrypted: bool = False  # Whether body is encrypted
+    encryption: EncryptionMeta | None = None  # Required if encrypted=True
+    signature: SignatureMeta | None = None  # Optional signature
 
 
 class MessageInfo(BaseModel):
@@ -120,6 +162,9 @@ class MessageInfo(BaseModel):
     read_at: str | None
     expires_at: str | None
     archived_at: str | None = None
+    encrypted: bool = False
+    encryption: EncryptionMeta | None = None
+    signature: SignatureMeta | None = None
 
 
 class InviteClaimResponse(BaseModel):
@@ -495,6 +540,68 @@ def get_identity(
     return IdentityInfo(**identity)
 
 
+@app.put("/{ns}/inbox/{identity_id}/pubkey", response_model=PubkeyInfo)
+def set_pubkey(
+    ns: str,
+    identity_id: str,
+    request: SetPubkeyRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Set or rotate public key for own identity.
+
+    This endpoint allows the mailbox owner to register their public key
+    for end-to-end encryption. If a key already exists, it will be rotated
+    (old key revoked, new key becomes active).
+
+    Requires X-Inbox-Secret header matching the identity.
+    """
+    # Only mailbox owner can set their pubkey
+    require_inbox_secret(ns, identity_id, x_inbox_secret)
+
+    # Verify identity exists
+    identity = db.get_identity(ns, identity_id)
+    if identity is None:
+        raise HTTPException(404, "Identity not found")
+
+    # Create/rotate pubkey
+    pubkey = db.create_pubkey(
+        ns=ns,
+        identity_id=identity_id,
+        public_key=request.public_key,
+        signing_public_key=request.signing_public_key,
+        algorithm=request.algorithm,
+    )
+
+    return PubkeyInfo(**pubkey)
+
+
+@app.get("/{ns}/identities/{identity_id}/pubkeys", response_model=list[PubkeyInfo])
+def get_pubkey_history(
+    ns: str,
+    identity_id: str,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get public key history for an identity.
+
+    Returns all public keys (current and revoked) for key rotation scenarios.
+    Useful for decrypting old messages encrypted with previous keys.
+    """
+    # Either namespace secret OR any inbox secret in the namespace
+    if x_namespace_secret:
+        if not db.verify_namespace_secret(ns, x_namespace_secret):
+            raise HTTPException(403, "Invalid namespace secret")
+    elif x_inbox_secret:
+        # Any identity in the namespace can view pubkey history
+        if not db.verify_identity_in_namespace(ns, x_inbox_secret):
+            raise HTTPException(403, "Invalid inbox secret for this namespace")
+    else:
+        raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
+
+    history = db.get_pubkey_history(ns, identity_id)
+    return [PubkeyInfo(**pk) for pk in history]
+
+
 @app.patch("/{ns}/identities/{identity_id}", response_model=IdentityInfo)
 def update_identity(
     ns: str,
@@ -543,6 +650,9 @@ def send_message(
 
     Messages are delivered instantly. Optionally set ttl_hours for ephemeral
     messages that expire from creation time (instead of read time).
+
+    For encrypted messages, set encrypted=True and include encryption metadata.
+    For signed messages, include signature metadata (recommended when sender has a keypair).
     """
     require_active_namespace(ns)
 
@@ -553,6 +663,10 @@ def send_message(
     if not from_id:
         raise HTTPException(403, "Invalid inbox secret or not in namespace")
 
+    # Validate encryption metadata if encrypted
+    if request.encrypted and not request.encryption:
+        raise HTTPException(400, "encryption metadata required when encrypted=True")
+
     try:
         result = db.send_message(
             ns=ns,
@@ -561,6 +675,17 @@ def send_message(
             body=request.body,
             content_type=request.content_type,
             ttl_hours=request.ttl_hours,
+            encrypted=request.encrypted,
+            encryption_meta=request.encryption.model_dump() if request.encryption else None,
+            signature=request.signature.value if request.signature else None,
+            signature_meta=(
+                {
+                    "algorithm": request.signature.algorithm,
+                    "sender_pubkey_id": request.signature.sender_pubkey_id,
+                }
+                if request.signature
+                else None
+            ),
         )
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -624,6 +749,9 @@ async def get_inbox(
                 "read_at": m["read_at"],
                 "expires_at": m["expires_at"],
                 "archived_at": m.get("archived_at"),
+                "encrypted": m.get("encrypted", False),
+                "encryption": m.get("encryption_meta"),
+                "signature": m.get("signature_meta"),
             }
             for m in messages
         ]
@@ -631,7 +759,7 @@ async def get_inbox(
 
 
 @app.get("/{ns}/inbox/{identity_id}/archived")
-def get_archived_messages(
+def get_archived_messages_endpoint(
     ns: str,
     identity_id: str,
     x_inbox_secret: Annotated[str | None, Header()] = None,
@@ -653,6 +781,9 @@ def get_archived_messages(
                 "read_at": m["read_at"],
                 "expires_at": m["expires_at"],
                 "archived_at": m["archived_at"],
+                "encrypted": m.get("encrypted", False),
+                "encryption": m.get("encryption_meta"),
+                "signature": m.get("signature_meta"),
             }
             for m in messages
         ]
@@ -660,7 +791,7 @@ def get_archived_messages(
 
 
 @app.get("/{ns}/inbox/{identity_id}/{mid}")
-def get_message(
+def get_message_endpoint(
     ns: str,
     identity_id: str,
     mid: str,
@@ -679,6 +810,9 @@ def get_message(
         "to": message["to"],
         "body": message["body"],
         "content_type": message.get("content_type", "text/plain"),
+        "encrypted": message.get("encrypted", False),
+        "encryption": message.get("encryption_meta"),
+        "signature": message.get("signature_meta"),
         "created_at": message["created_at"],
         "read_at": message["read_at"],
         "expires_at": message["expires_at"],
