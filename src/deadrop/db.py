@@ -103,6 +103,7 @@ def init_db():
             to_id TEXT NOT NULL,
             from_id TEXT NOT NULL,
             body TEXT NOT NULL,
+            content_type TEXT DEFAULT 'text/plain',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             read_at TIMESTAMP,
             expires_at TIMESTAMP,
@@ -540,6 +541,7 @@ def send_message(
     from_id: str,
     to_id: str,
     body: str,
+    content_type: str = "text/plain",
     ttl_hours: int | None = None,
 ) -> dict:
     """Send a message. Returns message info.
@@ -549,6 +551,7 @@ def send_message(
         from_id: Sender identity
         to_id: Recipient identity
         body: Message body
+        content_type: MIME type of the body (default: text/plain)
         ttl_hours: Optional TTL override (for ephemeral messages that expire from creation)
     """
     # Verify recipient exists
@@ -568,13 +571,19 @@ def send_message(
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
 
     conn.execute(
-        """INSERT INTO messages (mid, ns, to_id, from_id, body, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (mid, ns, to_id, from_id, body, now, expires_at),
+        """INSERT INTO messages (mid, ns, to_id, from_id, body, content_type, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mid, ns, to_id, from_id, body, content_type, now, expires_at),
     )
     conn.commit()
 
-    return {"mid": mid, "from": from_id, "to": to_id, "created_at": now}
+    return {
+        "mid": mid,
+        "from": from_id,
+        "to": to_id,
+        "content_type": content_type,
+        "created_at": now,
+    }
 
 
 def get_messages(
@@ -606,7 +615,7 @@ def get_messages(
 
     # Build query
     query = """
-        SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
+        SELECT mid, from_id, to_id, body, content_type, created_at, read_at, expires_at, archived_at
         FROM messages 
         WHERE ns = ? AND to_id = ?
         AND (expires_at IS NULL OR expires_at > ?)
@@ -635,6 +644,7 @@ def get_messages(
             "from": row["from_id"],
             "to": row["to_id"],
             "body": row["body"],
+            "content_type": row.get("content_type") or "text/plain",
             "created_at": row["created_at"],
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
@@ -674,7 +684,7 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
+        """SELECT mid, from_id, to_id, body, content_type, created_at, read_at, expires_at, archived_at
            FROM messages 
            WHERE ns = ? AND to_id = ? AND mid = ?
            AND (expires_at IS NULL OR expires_at > ?)""",
@@ -688,6 +698,7 @@ def get_message(ns: str, identity_id: str, mid: str) -> dict | None:
             "from": row["from_id"],
             "to": row["to_id"],
             "body": row["body"],
+            "content_type": row.get("content_type") or "text/plain",
             "created_at": row["created_at"],
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
@@ -736,7 +747,7 @@ def get_archived_messages(ns: str, identity_id: str) -> list[dict]:
     """Get archived messages for an identity."""
     conn = get_connection()
     cursor = conn.execute(
-        """SELECT mid, from_id, to_id, body, created_at, read_at, expires_at, archived_at
+        """SELECT mid, from_id, to_id, body, content_type, created_at, read_at, expires_at, archived_at
            FROM messages 
            WHERE ns = ? AND to_id = ? AND archived_at IS NOT NULL
            ORDER BY archived_at DESC""",
@@ -750,6 +761,7 @@ def get_archived_messages(ns: str, identity_id: str) -> list[dict]:
             "from": row["from_id"],
             "to": row["to_id"],
             "body": row["body"],
+            "content_type": row.get("content_type") or "text/plain",
             "created_at": row["created_at"],
             "read_at": row["read_at"],
             "expires_at": row["expires_at"],
@@ -936,7 +948,7 @@ def get_expired_messages(limit: int = 1000) -> list[dict]:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        """SELECT mid, ns, to_id, from_id, body, created_at, read_at, expires_at
+        """SELECT mid, ns, to_id, from_id, body, content_type, created_at, read_at, expires_at
            FROM messages 
            WHERE expires_at IS NOT NULL AND expires_at <= ? AND archived_at IS NULL
            ORDER BY expires_at

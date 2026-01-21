@@ -654,6 +654,217 @@ class TestInvites:
         assert response.status_code == 410  # Gone
 
 
+class TestContentType:
+    """Tests for message content-type support."""
+
+    @pytest.fixture
+    def setup_agents(self, client, admin_headers):
+        """Create namespace with two agents."""
+        # Create namespace
+        ns_response = client.post(
+            "/admin/namespaces",
+            json={"metadata": {"display_name": "Test"}},
+            headers=admin_headers,
+        )
+        ns_data = ns_response.json()
+
+        # Create two agents
+        a1_response = client.post(
+            f"/{ns_data['ns']}/identities",
+            json={"metadata": {"display_name": "Agent 1"}},
+            headers={"X-Namespace-Secret": ns_data["secret"]},
+        )
+        a1_data = a1_response.json()
+
+        a2_response = client.post(
+            f"/{ns_data['ns']}/identities",
+            json={"metadata": {"display_name": "Agent 2"}},
+            headers={"X-Namespace-Secret": ns_data["secret"]},
+        )
+        a2_data = a2_response.json()
+
+        return {
+            "ns": ns_data["ns"],
+            "ns_secret": ns_data["secret"],
+            "agent1": {"id": a1_data["id"], "secret": a1_data["secret"]},
+            "agent2": {"id": a2_data["id"], "secret": a2_data["secret"]},
+        }
+
+    def test_default_content_type_is_plain_text(self, client, setup_agents):
+        """Messages without explicit content_type default to text/plain."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        # Send message without content_type
+        response = client.post(
+            f"/{ns}/send",
+            json={"to": agent2["id"], "body": "Hello!"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["content_type"] == "text/plain"
+
+        # Verify in inbox
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        messages = response.json()["messages"]
+        assert len(messages) == 1
+        assert messages[0]["content_type"] == "text/plain"
+
+    def test_send_markdown_message(self, client, setup_agents):
+        """Can send markdown messages."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        markdown_body = "# Hello\n\nThis is **bold** and *italic*."
+        response = client.post(
+            f"/{ns}/send",
+            json={"to": agent2["id"], "body": markdown_body, "content_type": "text/markdown"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["content_type"] == "text/markdown"
+
+        # Verify in inbox
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        messages = response.json()["messages"]
+        assert messages[0]["content_type"] == "text/markdown"
+        assert messages[0]["body"] == markdown_body
+
+    def test_send_html_message(self, client, setup_agents):
+        """Can send HTML messages."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        html_body = "<h1>Hello</h1><p>This is <strong>HTML</strong>.</p>"
+        response = client.post(
+            f"/{ns}/send",
+            json={"to": agent2["id"], "body": html_body, "content_type": "text/html"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["content_type"] == "text/html"
+
+    def test_send_json_message(self, client, setup_agents):
+        """Can send JSON messages."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        import json
+
+        json_body = json.dumps({"action": "deploy", "target": "production", "version": "1.2.3"})
+        response = client.post(
+            f"/{ns}/send",
+            json={"to": agent2["id"], "body": json_body, "content_type": "application/json"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["content_type"] == "application/json"
+
+        # Verify body is preserved correctly
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        messages = response.json()["messages"]
+        assert messages[0]["content_type"] == "application/json"
+        parsed = json.loads(messages[0]["body"])
+        assert parsed["action"] == "deploy"
+
+    def test_send_svg_message(self, client, setup_agents):
+        """Can send SVG messages."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        svg_body = '<svg xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="40"/></svg>'
+        response = client.post(
+            f"/{ns}/send",
+            json={"to": agent2["id"], "body": svg_body, "content_type": "image/svg+xml"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["content_type"] == "image/svg+xml"
+
+    def test_arbitrary_content_type_allowed(self, client, setup_agents):
+        """Any MIME type can be specified."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        response = client.post(
+            f"/{ns}/send",
+            json={
+                "to": agent2["id"],
+                "body": "custom data",
+                "content_type": "application/x-custom-format",
+            },
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["content_type"] == "application/x-custom-format"
+
+    def test_content_type_in_single_message_view(self, client, setup_agents):
+        """Content type is included when fetching single message."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        # Send markdown message
+        send_response = client.post(
+            f"/{ns}/send",
+            json={"to": agent2["id"], "body": "# Test", "content_type": "text/markdown"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        mid = send_response.json()["mid"]
+
+        # Get single message
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}/{mid}",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["content_type"] == "text/markdown"
+
+    def test_content_type_in_archived_messages(self, client, setup_agents):
+        """Content type is preserved in archived messages."""
+        ns = setup_agents["ns"]
+        agent1 = setup_agents["agent1"]
+        agent2 = setup_agents["agent2"]
+
+        # Send HTML message
+        send_response = client.post(
+            f"/{ns}/send",
+            json={"to": agent2["id"], "body": "<p>Archive me</p>", "content_type": "text/html"},
+            headers={"X-Inbox-Secret": agent1["secret"]},
+        )
+        mid = send_response.json()["mid"]
+
+        # Archive it
+        client.post(
+            f"/{ns}/inbox/{agent2['id']}/{mid}/archive",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+
+        # Get archived messages
+        response = client.get(
+            f"/{ns}/inbox/{agent2['id']}/archived",
+            headers={"X-Inbox-Secret": agent2["secret"]},
+        )
+        messages = response.json()["messages"]
+        assert len(messages) == 1
+        assert messages[0]["content_type"] == "text/html"
+
+
 class TestMessageArchive:
     """Tests for message archiving."""
 
