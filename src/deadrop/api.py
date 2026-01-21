@@ -104,6 +104,9 @@ class UpdateMetadataRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     to: str
     body: str
+    content_type: str = (
+        "text/plain"  # MIME type (e.g., text/plain, text/markdown, text/html, application/json)
+    )
     ttl_hours: int | None = None  # Optional TTL override (ephemeral messages)
 
 
@@ -112,6 +115,7 @@ class MessageInfo(BaseModel):
     from_id: str
     to: str
     body: str
+    content_type: str = "text/plain"
     created_at: str
     read_at: str | None
     expires_at: str | None
@@ -555,6 +559,7 @@ def send_message(
             from_id=from_id,
             to_id=request.to,
             body=request.body,
+            content_type=request.content_type,
             ttl_hours=request.ttl_hours,
         )
     except ValueError as e:
@@ -596,6 +601,7 @@ def get_inbox(
                 "from": m["from"],
                 "to": m["to"],
                 "body": m["body"],
+                "content_type": m.get("content_type", "text/plain"),
                 "created_at": m["created_at"],
                 "read_at": m["read_at"],
                 "expires_at": m["expires_at"],
@@ -624,6 +630,7 @@ def get_archived_messages(
                 "from": m["from"],
                 "to": m["to"],
                 "body": m["body"],
+                "content_type": m.get("content_type", "text/plain"),
                 "created_at": m["created_at"],
                 "read_at": m["read_at"],
                 "expires_at": m["expires_at"],
@@ -653,6 +660,7 @@ def get_message(
         "from": message["from"],
         "to": message["to"],
         "body": message["body"],
+        "content_type": message.get("content_type", "text/plain"),
         "created_at": message["created_at"],
         "read_at": message["read_at"],
         "expires_at": message["expires_at"],
