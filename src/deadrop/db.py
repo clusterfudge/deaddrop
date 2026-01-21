@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
 from typing import Any
 
 from uuid_extensions import uuid7 as make_uuid7
@@ -13,6 +14,9 @@ from .auth import derive_id, generate_secret, hash_secret
 
 # Default TTL in hours when messages are read
 DEFAULT_TTL_HOURS = 24
+
+# Current schema version (increment when adding migrations)
+SCHEMA_VERSION = 1
 
 # Connection singleton
 _conn: sqlite3.Connection | None = None
@@ -72,8 +76,95 @@ def close_db():
         _is_libsql = False
 
 
+# --- Schema Version Tracking ---
+
+
+def _ensure_schema_version_table(conn: sqlite3.Connection) -> None:
+    """Create the schema_version table if it doesn't exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            description TEXT
+        )
+    """)
+    conn.commit()
+
+
+def get_schema_version(conn: sqlite3.Connection | None = None) -> int:
+    """Get the current schema version from the database.
+
+    Returns 0 if no migrations have been applied yet.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    _ensure_schema_version_table(conn)
+
+    cursor = conn.execute("SELECT MAX(version) FROM schema_version")
+    row = cursor.fetchone()
+    return row[0] if row and row[0] is not None else 0
+
+
+def record_migration(conn: sqlite3.Connection, version: int, description: str) -> None:
+    """Record that a migration has been applied."""
+    conn.execute(
+        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
+        (version, description),
+    )
+    conn.commit()
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Check if a column exists in a table."""
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    columns = [row[1] for row in cursor.fetchall()]
+    return column in columns
+
+
+# --- Migration Functions ---
+
+
+def _migrate_001_add_content_type(conn: sqlite3.Connection) -> None:
+    """Migration 001: Add content_type column to messages table."""
+    if not _column_exists(conn, "messages", "content_type"):
+        conn.execute("ALTER TABLE messages ADD COLUMN content_type TEXT DEFAULT 'text/plain'")
+        conn.commit()
+
+
+# Migration registry: (version, description, migration_function)
+MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
+    (1, "Add content_type column to messages", _migrate_001_add_content_type),
+]
+
+
+def run_migrations(conn: sqlite3.Connection | None = None) -> list[int]:
+    """Run any pending migrations.
+
+    Returns a list of migration versions that were applied.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    _ensure_schema_version_table(conn)
+    current_version = get_schema_version(conn)
+    applied: list[int] = []
+
+    for version, description, migrate_fn in MIGRATIONS:
+        if version > current_version:
+            try:
+                migrate_fn(conn)
+                record_migration(conn, version, description)
+                applied.append(version)
+            except Exception as e:
+                # Log error but don't fail - let caller handle it
+                raise RuntimeError(f"Migration {version} failed: {e}") from e
+
+    return applied
+
+
 def init_db():
-    """Initialize database schema."""
+    """Initialize database schema and run any pending migrations."""
     conn = get_connection()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS namespaces (
@@ -144,6 +235,9 @@ def init_db():
         );
     """)
     conn.commit()
+
+    # Run any pending migrations
+    run_migrations(conn)
 
 
 def reset_db():
