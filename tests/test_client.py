@@ -308,3 +308,68 @@ class TestDeaddropContextManager:
         ns = client.create_namespace(display_name="Test")
         assert ns["ns"] is not None
         client.close()
+
+
+class TestDeaddropLongPolling:
+    """Test long-polling support in Deaddrop client."""
+
+    def test_get_inbox_with_wait(self):
+        """get_inbox should support wait parameter."""
+        import time
+
+        client = Deaddrop.in_memory()
+        setup = client.quick_setup("Test", ["Alice", "Bob"])
+        ns = setup["namespace"]["ns"]
+        bob = setup["identities"]["Bob"]
+
+        # No messages - should wait
+        start = time.time()
+        messages = client.get_inbox(ns, bob["id"], bob["secret"], wait=1)
+        elapsed = time.time() - start
+
+        assert len(messages) == 0
+        assert elapsed >= 0.9
+
+    def test_wait_for_messages(self):
+        """wait_for_messages convenience method should work."""
+        import time
+
+        client = Deaddrop.in_memory()
+        setup = client.quick_setup("Test", ["Alice", "Bob"])
+        ns = setup["namespace"]["ns"]
+        alice = setup["identities"]["Alice"]
+        bob = setup["identities"]["Bob"]
+
+        # Send a message
+        client.send_message(ns, alice["secret"], bob["id"], "Hello!")
+
+        # Should return immediately
+        start = time.time()
+        messages = client.wait_for_messages(ns, bob["id"], bob["secret"], timeout=5)
+        elapsed = time.time() - start
+
+        assert len(messages) == 1
+        assert messages[0]["body"] == "Hello!"
+        assert elapsed < 1.0
+
+    def test_listen_generator(self):
+        """listen() generator should yield messages."""
+        client = Deaddrop.in_memory()
+        setup = client.quick_setup("Test", ["Alice", "Bob"])
+        ns = setup["namespace"]["ns"]
+        alice = setup["identities"]["Alice"]
+        bob = setup["identities"]["Bob"]
+
+        # Send some messages
+        client.send_message(ns, alice["secret"], bob["id"], "Message 1")
+        client.send_message(ns, alice["secret"], bob["id"], "Message 2")
+        client.send_message(ns, alice["secret"], bob["id"], "Message 3")
+
+        # Listen and collect messages
+        received = []
+        for msg in client.listen(ns, bob["id"], bob["secret"], timeout=1):
+            received.append(msg["body"])
+            if len(received) >= 3:
+                break
+
+        assert received == ["Message 1", "Message 2", "Message 3"]

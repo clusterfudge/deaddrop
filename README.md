@@ -323,6 +323,7 @@ POST /{ns}/send
 GET /{ns}/inbox/{id}
 GET /{ns}/inbox/{id}?unread=true        # Only unread
 GET /{ns}/inbox/{id}?after={mid}        # Cursor pagination
+GET /{ns}/inbox/{id}?wait=30            # Long-poll for 30 seconds
 
 # Archive/unarchive message
 POST /{ns}/inbox/{id}/{mid}/archive
@@ -394,6 +395,60 @@ dokku config:set deaddrop TURSO_AUTH_TOKEN=your-turso-token
 
 # Deploy
 git push dokku main
+```
+
+## Long-Polling
+
+Deaddrop supports long-polling for efficient real-time message delivery without constant polling.
+
+### API Usage
+
+Add the `wait` query parameter (1-60 seconds) to the inbox endpoint:
+
+```bash
+# Wait up to 30 seconds for new messages
+GET /{ns}/inbox/{id}?wait=30
+
+# Combine with other parameters
+GET /{ns}/inbox/{id}?wait=30&unread=true
+GET /{ns}/inbox/{id}?wait=30&after={mid}
+```
+
+**Behavior:**
+- If messages exist, returns immediately
+- If no messages, holds connection open until messages arrive or timeout
+- Returns same response format as regular inbox endpoint
+- Server polls internally every 500ms
+
+### Python Library
+
+```python
+from deadrop import Deaddrop
+
+client = Deaddrop.in_memory()  # or .local() or .remote()
+setup = client.quick_setup("Test", ["Alice", "Bob"])
+
+# Single long-poll call
+messages = client.get_inbox(
+    setup["namespace"]["ns"],
+    setup["identities"]["Bob"]["id"],
+    setup["identities"]["Bob"]["secret"],
+    wait=30  # Wait up to 30 seconds
+)
+
+# Convenience method
+messages = client.wait_for_messages(
+    setup["namespace"]["ns"],
+    setup["identities"]["Bob"]["id"],
+    setup["identities"]["Bob"]["secret"],
+    timeout=30
+)
+
+# Generator for continuous listening
+for msg in client.listen(ns, bob_id, bob_secret, timeout=30):
+    print(f"Received: {msg['body']}")
+    if should_stop():
+        break
 ```
 
 ## Security Notes

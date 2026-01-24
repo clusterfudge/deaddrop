@@ -791,6 +791,50 @@ def send_message(
     }
 
 
+def has_new_messages(
+    ns: str,
+    identity_id: str,
+    after_mid: str | None = None,
+    unread_only: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Check if there are new messages without fetching them.
+
+    This is a lightweight check using COUNT - more efficient than get_messages
+    when you only need to know if messages exist.
+
+    Args:
+        ns: Namespace ID
+        identity_id: Identity ID
+        after_mid: Only count messages after this message ID
+        unread_only: Only count unread messages
+
+    Returns:
+        True if there are matching messages, False otherwise.
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+
+    query = """
+        SELECT COUNT(*) FROM messages 
+        WHERE ns = ? AND to_id = ?
+        AND (expires_at IS NULL OR expires_at > ?)
+        AND archived_at IS NULL
+    """
+    params: list[Any] = [ns, identity_id, now]
+
+    if unread_only:
+        query += " AND read_at IS NULL"
+
+    if after_mid:
+        query += " AND mid > ?"
+        params.append(after_mid)
+
+    cursor = conn.execute(query, tuple(params))
+    count = cursor.fetchone()[0]
+    return count > 0
+
+
 def get_messages(
     ns: str,
     identity_id: str,

@@ -170,6 +170,7 @@ class Backend(ABC):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
+        wait: int = 0,
     ) -> list[dict[str, Any]]:
         """Get messages for an identity.
 
@@ -180,6 +181,8 @@ class Backend(ABC):
             unread_only: Only return unread messages
             after_mid: Cursor for pagination
             mark_as_read: Whether to mark messages as read
+            wait: Long-poll timeout in seconds (0-60). If no messages,
+                  wait up to this many seconds for new messages.
         """
         ...
 
@@ -480,10 +483,27 @@ class LocalBackend(Backend):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
+        wait: int = 0,
     ) -> list[dict[str, Any]]:
+        import time
+
         # Verify owner
         if not db.verify_identity_secret(ns, identity_id, secret, conn=self._conn):
             raise PermissionError("Invalid inbox secret")
+
+        # Long-polling: wait for messages if none exist and wait > 0
+        if wait > 0:
+            poll_interval = 0.5  # Check every 500ms
+            elapsed = 0.0
+            max_wait = min(wait, 60)  # Cap at 60 seconds
+
+            while elapsed < max_wait:
+                if db.has_new_messages(
+                    ns, identity_id, after_mid=after_mid, unread_only=unread_only, conn=self._conn
+                ):
+                    break
+                time.sleep(poll_interval)
+                elapsed += poll_interval
 
         return db.get_messages(
             ns=ns,
@@ -571,6 +591,7 @@ class RemoteBackend(Backend):
         *,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         """Make an HTTP request."""
         url = f"{self._url}{path}"
@@ -581,6 +602,7 @@ class RemoteBackend(Backend):
             url,
             json=json,
             headers=request_headers,
+            timeout=timeout,
         )
 
         if response.status_code >= 400:
@@ -765,21 +787,28 @@ class RemoteBackend(Backend):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
+        wait: int = 0,
     ) -> list[dict[str, Any]]:
         params = []
         if unread_only:
             params.append("unread=true")
         if after_mid:
             params.append(f"after={after_mid}")
+        if wait > 0:
+            params.append(f"wait={min(wait, 60)}")
 
         path = f"/{ns}/inbox/{identity_id}"
         if params:
             path += "?" + "&".join(params)
 
+        # For long-polling, we need a longer timeout
+        timeout = max(30.0, wait + 5) if wait > 0 else 30.0
+
         result = self._request(
             "GET",
             path,
             headers=self._inbox_headers(secret),
+            timeout=timeout,
         )
         return result.get("messages", [])
 

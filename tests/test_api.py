@@ -971,3 +971,175 @@ class TestMessageArchive:
             headers={"X-Inbox-Secret": agent2["secret"]},
         )
         assert len(response.json()["messages"]) == 0
+
+
+class TestLongPolling:
+    """Test long-polling support."""
+
+    def test_has_new_messages_basic(self, reset_database):
+        """Test has_new_messages function."""
+        from deadrop import db
+
+        # Create namespace and identities
+        ns = db.create_namespace()
+        ns_id = str(ns["ns"])
+        alice = db.create_identity(ns_id)
+        alice_id = str(alice["id"])
+        bob = db.create_identity(ns_id)
+        bob_id = str(bob["id"])
+
+        # No messages initially
+        assert db.has_new_messages(ns_id, bob_id) is False
+
+        # Send a message
+        db.send_message(ns_id, alice_id, bob_id, "Hello!")
+
+        # Now there are messages
+        assert db.has_new_messages(ns_id, bob_id) is True
+
+    def test_has_new_messages_after_mid(self, reset_database):
+        """Test has_new_messages with after_mid cursor."""
+        from deadrop import db
+
+        ns = db.create_namespace()
+        ns_id = str(ns["ns"])
+        alice = db.create_identity(ns_id)
+        alice_id = str(alice["id"])
+        bob = db.create_identity(ns_id)
+        bob_id = str(bob["id"])
+
+        # Send first message
+        msg1 = db.send_message(ns_id, alice_id, bob_id, "First")
+        msg1_mid = str(msg1["mid"])
+
+        # No messages after msg1
+        assert db.has_new_messages(ns_id, bob_id, after_mid=msg1_mid) is False
+
+        # Send second message
+        db.send_message(ns_id, alice_id, bob_id, "Second")
+
+        # Now there are messages after msg1
+        assert db.has_new_messages(ns_id, bob_id, after_mid=msg1_mid) is True
+
+    def test_has_new_messages_unread_only(self, reset_database):
+        """Test has_new_messages with unread_only filter."""
+        from deadrop import db
+
+        ns = db.create_namespace()
+        ns_id = str(ns["ns"])
+        alice = db.create_identity(ns_id)
+        alice_id = str(alice["id"])
+        bob = db.create_identity(ns_id)
+        bob_id = str(bob["id"])
+
+        # Send a message
+        db.send_message(ns_id, alice_id, bob_id, "Hello!")
+
+        # Unread messages exist
+        assert db.has_new_messages(ns_id, bob_id, unread_only=True) is True
+
+        # Read the messages
+        db.get_messages(ns_id, bob_id, mark_as_read=True)
+
+        # No more unread messages
+        assert db.has_new_messages(ns_id, bob_id, unread_only=True) is False
+
+        # But messages still exist (read)
+        assert db.has_new_messages(ns_id, bob_id, unread_only=False) is True
+
+    def test_inbox_long_poll_immediate_return(self, client, admin_headers):
+        """Long-poll should return immediately if messages exist."""
+        import time
+
+        # Create namespace and identities
+        response = client.post("/admin/namespaces", headers=admin_headers)
+        ns_data = response.json()
+        ns = ns_data["ns"]
+        ns_secret = ns_data["secret"]
+
+        response = client.post(
+            f"/{ns}/identities",
+            headers={"X-Namespace-Secret": ns_secret},
+        )
+        alice = response.json()
+
+        response = client.post(
+            f"/{ns}/identities",
+            headers={"X-Namespace-Secret": ns_secret},
+        )
+        bob = response.json()
+
+        # Send a message first
+        client.post(
+            f"/{ns}/send",
+            json={"to": bob["id"], "body": "Hello!"},
+            headers={"X-Inbox-Secret": alice["secret"]},
+        )
+
+        # Long-poll should return immediately (not wait full 5s)
+        start = time.time()
+        response = client.get(
+            f"/{ns}/inbox/{bob['id']}?wait=5",
+            headers={"X-Inbox-Secret": bob["secret"]},
+        )
+        elapsed = time.time() - start
+
+        assert response.status_code == 200
+        assert len(response.json()["messages"]) == 1
+        assert elapsed < 1.0  # Should return almost immediately
+
+    def test_inbox_long_poll_timeout(self, client, admin_headers):
+        """Long-poll should timeout and return empty if no messages."""
+        import time
+
+        # Create namespace and identity
+        response = client.post("/admin/namespaces", headers=admin_headers)
+        ns_data = response.json()
+        ns = ns_data["ns"]
+        ns_secret = ns_data["secret"]
+
+        response = client.post(
+            f"/{ns}/identities",
+            headers={"X-Namespace-Secret": ns_secret},
+        )
+        bob = response.json()
+
+        # Long-poll with short timeout should wait then return empty
+        start = time.time()
+        response = client.get(
+            f"/{ns}/inbox/{bob['id']}?wait=1",
+            headers={"X-Inbox-Secret": bob["secret"]},
+        )
+        elapsed = time.time() - start
+
+        assert response.status_code == 200
+        assert len(response.json()["messages"]) == 0
+        assert elapsed >= 0.9  # Should wait close to full second
+
+    def test_inbox_no_wait_returns_immediately(self, client, admin_headers):
+        """Without wait parameter, should return immediately."""
+        import time
+
+        # Create namespace and identity
+        response = client.post("/admin/namespaces", headers=admin_headers)
+        ns_data = response.json()
+        ns = ns_data["ns"]
+        ns_secret = ns_data["secret"]
+
+        response = client.post(
+            f"/{ns}/identities",
+            headers={"X-Namespace-Secret": ns_secret},
+        )
+        bob = response.json()
+
+        # No wait should return immediately with empty
+        start = time.time()
+        response = client.get(
+            f"/{ns}/inbox/{bob['id']}",
+            headers={"X-Inbox-Secret": bob["secret"]},
+        )
+        elapsed = time.time() - start
+
+        assert response.status_code == 200
+        assert len(response.json()["messages"]) == 0
+        assert elapsed < 0.5  # Should be very fast

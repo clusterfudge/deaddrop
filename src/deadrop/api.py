@@ -569,11 +569,12 @@ def send_message(
 
 
 @app.get("/{ns}/inbox/{identity_id}")
-def get_inbox(
+async def get_inbox(
     ns: str,
     identity_id: str,
     unread: Annotated[bool, Query()] = False,
     after: Annotated[str | None, Query()] = None,
+    wait: Annotated[int, Query(ge=0, le=60)] = 0,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages for own inbox.
@@ -583,10 +584,27 @@ def get_inbox(
     Query parameters:
     - unread: Only return unread messages
     - after: Only return messages after this message ID (cursor for pagination)
+    - wait: Long-poll timeout in seconds (0-60). If no messages, wait up to this
+            many seconds for new messages before returning empty response.
     """
+    import asyncio
+
     # Only mailbox owner can read their inbox
     require_inbox_secret(ns, identity_id, x_inbox_secret)
 
+    # Long-polling: wait for messages if none exist and wait > 0
+    if wait > 0:
+        poll_interval = 0.5  # Check every 500ms
+        elapsed = 0.0
+
+        while elapsed < wait:
+            # Check if messages exist (lightweight query)
+            if db.has_new_messages(ns, identity_id, after_mid=after, unread_only=unread):
+                break
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+    # Fetch and return messages
     messages = db.get_messages(
         ns=ns,
         identity_id=identity_id,
