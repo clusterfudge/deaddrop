@@ -4,14 +4,21 @@ Manages configuration in ~/.config/deadrop/:
 - config.yaml: Global config (URL, bearer token)
 - namespaces/{ns_hash}.yaml: Per-namespace config with mailbox credentials
 
+Also supports local .deaddrop directories for offline/testing use:
+- .deaddrop/config.yaml: Local namespace registry
+- .deaddrop/data.db: SQLite database
+
 The CLI is for administrators to manage namespaces and mailboxes.
 Mailbox owners receive their credentials from the admin and use the API directly.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import cyclopts
 import httpx
@@ -22,6 +29,7 @@ from .config import (
     get_config_dir,
     init_wizard,
 )
+from .discovery import find_deaddrop_dir
 
 app = cyclopts.App(
     name="deadrop",
@@ -144,20 +152,62 @@ def ns_create(
     display_name: str | None = None,
     metadata_json: str | None = None,
     ttl_hours: int = 24,
+    *,
+    local: bool = False,
+    path: str | None = None,
 ):
     """Create a new namespace.
 
-    Creates the namespace on the server and saves credentials locally.
+    Creates the namespace on the server (or locally with --local) and saves credentials.
 
     --ttl-hours: TTL in hours for messages after they are read (default: 24)
+    --local: Create a local namespace in .deaddrop directory
+    --path: Path for local .deaddrop directory (default: git root or cwd)
     """
-    cfg = get_config()
-
     metadata = {}
     if display_name:
         metadata["display_name"] = display_name
     if metadata_json:
         metadata.update(json.loads(metadata_json))
+
+    if local or path:
+        # Create local namespace
+        from .client import Deaddrop
+
+        if path:
+            deaddrop_path = Path(path)
+        else:
+            # Auto-discover or create
+            existing = find_deaddrop_dir()
+            if existing:
+                deaddrop_path = existing
+            else:
+                from .discovery import get_deaddrop_init_path
+
+                deaddrop_path = get_deaddrop_init_path()
+
+        # Create or open local deaddrop
+        if deaddrop_path.exists():
+            client = Deaddrop.local(path=deaddrop_path)
+        else:
+            client = Deaddrop.create_local(path=deaddrop_path)
+
+        ns = client.create_namespace(
+            display_name=display_name,
+            ttl_hours=ttl_hours,
+            metadata=metadata if metadata else None,
+        )
+        client.close()
+
+        print("Local namespace created!")
+        print(f"  ID: {ns['ns']}")
+        print(f"  Location: {deaddrop_path}")
+        if ns.get("slug"):
+            print(f"  Slug: {ns['slug']}")
+        return
+
+    # Remote namespace (existing behavior)
+    cfg = get_config()
 
     json_data = {"ttl_hours": ttl_hours}
     if metadata:
@@ -188,12 +238,40 @@ def ns_create(
 
 
 @ns_app.command
-def ns_list(*, remote: bool = False):
+def ns_list(*, remote: bool = False, local: bool = False):
     """List namespaces.
 
-    By default, lists namespaces from local config.
+    By default, lists namespaces from ~/.config/deadrop config.
+    Use --local to list from .deaddrop directory.
     Use --remote to list from server (requires admin auth).
     """
+    # Check for local .deaddrop
+    local_deaddrop = find_deaddrop_dir()
+
+    if local:
+        # List from local .deaddrop only
+        if not local_deaddrop:
+            print("No local .deaddrop directory found.")
+            print("Create one with: deadrop ns create --local")
+            return
+
+        from .client import Deaddrop
+
+        client = Deaddrop.local(path=local_deaddrop)
+        namespaces = client.list_namespaces()
+        client.close()
+
+        if not namespaces:
+            print("No namespaces in local .deaddrop.")
+            return
+
+        print(f"Local namespaces (from {local_deaddrop}):")
+        for ns in namespaces:
+            name = ns.get("metadata", {}).get("display_name", "(unnamed)")
+            archived = " [ARCHIVED]" if ns.get("archived_at") else ""
+            print(f"  {ns['ns']}  {name}{archived}")
+        return
+
     if remote:
         cfg = get_config()
         response = api_request("GET", "/admin/namespaces", config=cfg)
@@ -207,22 +285,43 @@ def ns_list(*, remote: bool = False):
         for ns in namespaces:
             name = ns.get("metadata", {}).get("display_name", "(unnamed)")
             archived = " [ARCHIVED]" if ns.get("archived_at") else ""
-            local = " (local)" if NamespaceConfig.load(ns["ns"]) else ""
-            print(f"  {ns['ns']}  {name}{archived}{local}")
-    else:
-        namespaces = NamespaceConfig.list_all()
+            local_marker = " (local)" if NamespaceConfig.load(ns["ns"]) else ""
+            print(f"  {ns['ns']}  {name}{archived}{local_marker}")
+        return
 
-        if not namespaces:
-            print("No namespaces in local config.")
-            print("Use 'deadrop ns create' to create one.")
-            return
+    # Default: list from ~/.config/deadrop
+    namespaces = NamespaceConfig.list_all()
+    has_config_ns = bool(namespaces)
 
-        print("Local namespaces:")
+    if has_config_ns:
+        print("Config namespaces (~/.config/deadrop):")
         for ns_id in namespaces:
             ns_cfg = NamespaceConfig.load(ns_id)
             if ns_cfg:
                 name = ns_cfg.display_name or "(unnamed)"
                 print(f"  {ns_id}  {name}  ({len(ns_cfg.mailboxes)} mailboxes)")
+
+    # Also show local .deaddrop if it exists
+    if local_deaddrop:
+        from .client import Deaddrop
+
+        client = Deaddrop.local(path=local_deaddrop)
+        local_namespaces = client.list_namespaces()
+        client.close()
+
+        if local_namespaces:
+            if has_config_ns:
+                print()
+            print(f"Local namespaces ({local_deaddrop}):")
+            for ns in local_namespaces:
+                name = ns.get("metadata", {}).get("display_name", "(unnamed)")
+                archived = " [ARCHIVED]" if ns.get("archived_at") else ""
+                print(f"  {ns['ns']}  {name}{archived}")
+
+    if not has_config_ns and not local_deaddrop:
+        print("No namespaces found.")
+        print("Use 'deadrop ns create' to create one.")
+        print("Use 'deadrop ns create --local' for local/offline use.")
 
 
 @ns_app.command
