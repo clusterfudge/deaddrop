@@ -1,11 +1,15 @@
 """Tests for deadrop.testing fixtures."""
 
-# Import fixtures from the testing module
+from deadrop import Deaddrop
+
+# Import utility functions (not fixtures)
 from deadrop.testing import (
     make_test_setup,
     send_test_messages,
 )
-from deadrop import Deaddrop
+
+# Register the fixtures from deadrop.testing
+pytest_plugins = ["deadrop.testing"]
 
 
 class TestDeaddropFixture:

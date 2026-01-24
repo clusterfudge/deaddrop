@@ -94,6 +94,89 @@ Set human-readable URLs for namespaces:
 deadrop ns set-slug {ns} project-alpha
 ```
 
+## Python Library
+
+Deaddrop provides a unified Python API that works with local, remote, and in-memory backends.
+
+### Basic Usage
+
+```python
+from deadrop import Deaddrop
+
+# Auto-discover backend (local .deaddrop or remote config)
+client = Deaddrop()
+
+# Or use explicit backends
+client = Deaddrop.local()              # Local .deaddrop directory
+client = Deaddrop.remote(url="...")    # Remote server
+client = Deaddrop.in_memory()          # Ephemeral (testing)
+client = Deaddrop.create_local()       # Create new .deaddrop
+```
+
+### Full Workflow
+
+```python
+from deadrop import Deaddrop
+
+# Create or open local deaddrop
+client = Deaddrop.create_local()
+
+# Create namespace and identities
+ns = client.create_namespace(display_name="My Project")
+alice = client.create_identity(ns["ns"], display_name="Alice")
+bob = client.create_identity(ns["ns"], display_name="Bob")
+
+# Send message
+client.send_message(
+    ns=ns["ns"],
+    from_secret=alice["secret"],
+    to_id=bob["id"],
+    body="Hello Bob!"
+)
+
+# Read inbox
+messages = client.get_inbox(
+    ns=ns["ns"],
+    identity_id=bob["id"],
+    secret=bob["secret"]
+)
+
+for msg in messages:
+    print(f"From: {msg['from']}, Body: {msg['body']}")
+```
+
+### Testing
+
+```python
+import pytest
+from deadrop import Deaddrop
+
+# Use in-memory backend for fast tests
+@pytest.fixture
+def client():
+    return Deaddrop.in_memory()
+
+def test_agent_messaging(client):
+    setup = client.quick_setup("Test", ["Alice", "Bob"])
+    
+    client.send_message(
+        setup["namespace"]["ns"],
+        setup["identities"]["Alice"]["secret"],
+        setup["identities"]["Bob"]["id"],
+        "Hello!"
+    )
+    
+    messages = client.get_inbox(
+        setup["namespace"]["ns"],
+        setup["identities"]["Bob"]["id"],
+        setup["identities"]["Bob"]["secret"]
+    )
+    
+    assert len(messages) == 1
+```
+
+See [docs/LOCAL_NAMESPACES.md](docs/LOCAL_NAMESPACES.md) and [docs/TESTING.md](docs/TESTING.md) for detailed guides.
+
 ## Quick Start
 
 ### 1. Start the Server
