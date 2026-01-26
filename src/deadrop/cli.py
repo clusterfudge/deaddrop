@@ -947,6 +947,33 @@ def parse_duration(duration: str) -> int:
         return int(duration)
 
 
+def _is_local_namespace(ns: str, ns_cfg: NamespaceConfig) -> tuple[bool, Path | None]:
+    """Check if a namespace is local (in a .deaddrop directory).
+
+    Returns (is_local, deaddrop_path).
+    """
+    # Check if any mailbox has local_path metadata
+    for mb in ns_cfg.mailboxes.values():
+        if mb.metadata and mb.metadata.get("local_path"):
+            return True, Path(mb.metadata["local_path"])
+
+    # Check if namespace exists in a local .deaddrop directory
+    local_deaddrop = find_deaddrop_dir()
+    if local_deaddrop:
+        from .client import Deaddrop
+
+        try:
+            client = Deaddrop.local(path=local_deaddrop)
+            namespace = client.get_namespace(ns)
+            client.close()
+            if namespace:
+                return True, local_deaddrop
+        except Exception:
+            pass
+
+    return False, None
+
+
 @invite_app.command
 def create(
     ns: str,
@@ -954,16 +981,24 @@ def create(
     *,
     expires_in: str = "24h",
     name: str | None = None,
+    local: bool = False,
+    path: str | None = None,
 ):
     """Create a shareable invite link for a mailbox.
 
-    The invite allows someone to claim access to the specified identity
-    through the web interface. The link is single-use.
+    The invite allows someone to claim access to the specified identity.
+    The link is single-use.
+
+    For remote namespaces, creates an invite via the server API.
+    For local namespaces (or with --local), creates a deadrop:// URL.
 
     --expires-in: How long until the invite expires (e.g., '24h', '7d', '1h')
     --name: Optional display name for the invite
+    --local: Force creation of a local invite (deadrop:// URL)
+    --path: Path to .deaddrop directory (for local invites)
     """
     from datetime import timedelta
+    from urllib.parse import urlencode
 
     from .crypto import create_invite_secrets
 
@@ -977,49 +1012,86 @@ def create(
 
     mb = ns_cfg.mailboxes[identity_id]
 
-    # Parse expiration
-    try:
-        hours = parse_duration(expires_in)
-    except ValueError:
-        print(f"Error: Invalid duration format: {expires_in}", file=sys.stderr)
-        sys.exit(1)
+    # Determine if this is a local or remote namespace
+    if local or path:
+        is_local = True
+        if path:
+            deaddrop_path = Path(path)
+        else:
+            _, deaddrop_path = _is_local_namespace(ns, ns_cfg)
+            if not deaddrop_path:
+                deaddrop_path = find_deaddrop_dir()
+    else:
+        is_local, deaddrop_path = _is_local_namespace(ns, ns_cfg)
 
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
-
-    # Create the cryptographic secrets (key stays local, encrypted_secret goes to server)
+    # Create the cryptographic secrets
     secrets = create_invite_secrets(mb.secret)
 
-    # Register invite on server via API
-    url = f"{cfg.url}/{ns}/invites"
-    headers = {"X-Namespace-Secret": ns_cfg.secret}
+    if is_local:
+        # Create local invite (deadrop:// URL)
+        if not deaddrop_path or not deaddrop_path.exists():
+            print("Error: No local .deaddrop directory found.", file=sys.stderr)
+            print("Use --path to specify the location.", file=sys.stderr)
+            sys.exit(1)
 
-    response = httpx.post(
-        url,
-        headers=headers,
-        json={
-            "identity_id": identity_id,
-            "invite_id": secrets.invite_id,  # Client provides this (used as AAD)
-            "encrypted_secret": secrets.encrypted_secret_hex,
-            "display_name": name or mb.display_name,
-            "expires_at": expires_at,
-        },
-        timeout=30.0,
-    )
+        params = {
+            "path": str(deaddrop_path.absolute()),
+            "ns": ns,
+            "id": identity_id,
+            "secret_enc": secrets.encrypted_secret_hex,
+            "invite_id": secrets.invite_id,
+        }
 
-    if response.status_code >= 400:
-        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
-        sys.exit(1)
+        invite_url = f"deadrop://local/invite?{urlencode(params)}#{secrets.key_base64}"
 
-    # Generate the invite URL (key stays in fragment, never sent to server)
-    # Use secrets.invite_id since it was used as AAD in encryption
-    invite_url = f"{cfg.url}/join/{secrets.invite_id}#{secrets.key_base64}"
+        print("Local invite created!")
+        print(f"  For: {mb.display_name or identity_id}")
+        print(f"  Path: {deaddrop_path}")
+        print()
+        print("Share this link:")
+        print(invite_url)
+        print()
+        print("Recipients can claim with:")
+        print(f"  deadrop invite claim '{invite_url}'")
 
-    print("Invite created!")
-    print(f"  For: {mb.display_name or identity_id}")
-    print(f"  Expires: {expires_in}")
-    print()
-    print("Share this link (single-use):")
-    print(invite_url)
+    else:
+        # Create remote invite (register on server)
+        try:
+            hours = parse_duration(expires_in)
+        except ValueError:
+            print(f"Error: Invalid duration format: {expires_in}", file=sys.stderr)
+            sys.exit(1)
+
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+        url = f"{cfg.url}/{ns}/invites"
+        headers = {"X-Namespace-Secret": ns_cfg.secret}
+
+        response = httpx.post(
+            url,
+            headers=headers,
+            json={
+                "identity_id": identity_id,
+                "invite_id": secrets.invite_id,
+                "encrypted_secret": secrets.encrypted_secret_hex,
+                "display_name": name or mb.display_name,
+                "expires_at": expires_at,
+            },
+            timeout=30.0,
+        )
+
+        if response.status_code >= 400:
+            print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+        invite_url = f"{cfg.url}/join/{secrets.invite_id}#{secrets.key_base64}"
+
+        print("Invite created!")
+        print(f"  For: {mb.display_name or identity_id}")
+        print(f"  Expires: {expires_in}")
+        print()
+        print("Share this link (single-use):")
+        print(invite_url)
 
 
 @invite_app.command
@@ -1062,113 +1134,7 @@ def list_invites(ns: str, *, include_claimed: bool = False):
         print(f"  {inv['invite_id'][:12]}...  {name}{status}")
 
 
-@invite_app.command
-def create_local(ns: str, identity_id: str, *, path: str | None = None):
-    """Create a shareable invite link for a local mailbox.
 
-    Creates a deadrop:// URL that can be shared with others to give them
-    access to a mailbox in a local .deaddrop directory.
-
-    The invite link contains encrypted credentials - the decryption key
-    is in the URL fragment and never stored anywhere.
-
-    --path: Path to .deaddrop directory (default: auto-discover)
-    """
-    from .crypto import create_invite_secrets
-
-    # Find the local .deaddrop
-    if path:
-        deaddrop_path = Path(path)
-    else:
-        deaddrop_path = find_deaddrop_dir()
-
-    if not deaddrop_path or not deaddrop_path.exists():
-        print("Error: No local .deaddrop directory found.", file=sys.stderr)
-        print("Use --path to specify the location, or create one with:", file=sys.stderr)
-        print("  deadrop ns create --local", file=sys.stderr)
-        sys.exit(1)
-
-    # Load the local backend
-    from .client import Deaddrop
-
-    client = Deaddrop.local(path=deaddrop_path)
-
-    # Get the identity from local storage
-    identity = client.get_identity(ns, identity_id)
-    if not identity:
-        print(f"Error: Identity {identity_id} not found in namespace {ns}", file=sys.stderr)
-        client.close()
-        sys.exit(1)
-
-    # We need the secret - check if it's stored in local config
-    from .backends import LocalBackend
-
-    backend = client._backend
-    if not isinstance(backend, LocalBackend):
-        print("Error: Not a local backend", file=sys.stderr)
-        client.close()
-        sys.exit(1)
-
-    # Get identity secret from local config
-    local_config = backend.config
-    ns_data = local_config.namespaces.get(ns)
-
-    # The secret is derived - we need to look it up differently
-    # For local backends, we need to query the database
-    from . import db
-
-    # Get connection from backend and query for the secret
-    # Note: In a real implementation, we'd need to store/retrieve secrets differently
-    # For now, we'll require the user to have the secret or we can't create an invite
-
-    print(
-        "Note: Local invite generation requires the identity secret to be available.",
-        file=sys.stderr,
-    )
-    print(
-        "For local namespaces, use 'deadrop identity export' to share credentials directly.",
-        file=sys.stderr,
-    )
-
-    # Alternative: Create invite from namespace config if available
-    ns_cfg = NamespaceConfig.load(ns)
-    if ns_cfg and identity_id in ns_cfg.mailboxes:
-        mb = ns_cfg.mailboxes[identity_id]
-        mailbox_secret = mb.secret
-    else:
-        print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
-        print("Add it first with 'deadrop identity create' or import credentials.", file=sys.stderr)
-        client.close()
-        sys.exit(1)
-
-    # Create the cryptographic secrets
-    secrets = create_invite_secrets(mailbox_secret)
-
-    # Build the local invite URL
-    from urllib.parse import urlencode
-
-    params = {
-        "path": str(deaddrop_path.absolute()),
-        "ns": ns,
-        "id": identity_id,
-        "secret_enc": secrets.encrypted_secret_hex,
-        "invite_id": secrets.invite_id,
-    }
-
-    invite_url = f"deadrop://local/invite?{urlencode(params)}#{secrets.key_base64}"
-
-    client.close()
-
-    print("Local invite created!")
-    print(f"  Namespace: {ns}")
-    print(f"  Identity: {identity_id}")
-    print(f"  Path: {deaddrop_path}")
-    print()
-    print("Share this link:")
-    print(invite_url)
-    print()
-    print("Recipients can claim with:")
-    print(f"  deadrop invite claim '{invite_url}'")
 
 
 @invite_app.command
