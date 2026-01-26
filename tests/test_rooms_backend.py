@@ -3,7 +3,7 @@
 import pytest
 
 from deadrop import Deaddrop
-from deadrop.backends import InMemoryBackend, LocalBackend
+from deadrop.backends import InMemoryBackend
 
 
 class TestInMemoryBackendRooms:
@@ -99,7 +99,9 @@ class TestInMemoryBackendRooms:
         """Remove a member from a room."""
         b = setup["backend"]
         room = b.create_room(setup["ns"], setup["alice"]["secret"])
-        b.add_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"])
+        b.add_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"]
+        )
 
         # Remove Bob
         result = b.remove_room_member(
@@ -115,7 +117,9 @@ class TestInMemoryBackendRooms:
         """Member can leave a room."""
         b = setup["backend"]
         room = b.create_room(setup["ns"], setup["alice"]["secret"])
-        b.add_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"])
+        b.add_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"]
+        )
 
         # Bob leaves
         result = b.remove_room_member(
@@ -127,7 +131,9 @@ class TestInMemoryBackendRooms:
         """List members of a room."""
         b = setup["backend"]
         room = b.create_room(setup["ns"], setup["alice"]["secret"])
-        b.add_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"])
+        b.add_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"]
+        )
 
         members = b.list_room_members(setup["ns"], room["room_id"], setup["alice"]["secret"])
         assert len(members) == 2
@@ -190,7 +196,9 @@ class TestInMemoryBackendRooms:
         """Get unread message count."""
         b = setup["backend"]
         room = b.create_room(setup["ns"], setup["alice"]["secret"])
-        b.add_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"])
+        b.add_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"]
+        )
 
         # Send messages
         msg1 = b.send_room_message(setup["ns"], room["room_id"], setup["alice"]["secret"], "Msg 1")
@@ -251,7 +259,9 @@ class TestDeaddropClientRooms:
         """Send and get room messages via client."""
         c = setup["client"]
         room = c.create_room(setup["ns"], setup["alice"]["secret"])
-        c.add_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"])
+        c.add_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"]
+        )
 
         # Alice sends
         c.send_room_message(setup["ns"], room["room_id"], setup["alice"]["secret"], "Hello Bob!")
@@ -270,14 +280,18 @@ class TestDeaddropClientRooms:
         """Test per-user unread tracking."""
         c = setup["client"]
         room = c.create_room(setup["ns"], setup["alice"]["secret"])
-        c.add_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"])
+        c.add_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"]
+        )
 
         # Send messages
         msg1 = c.send_room_message(setup["ns"], room["room_id"], setup["alice"]["secret"], "Msg 1")
         msg2 = c.send_room_message(setup["ns"], room["room_id"], setup["alice"]["secret"], "Msg 2")
 
         # Both have unread messages
-        alice_unread = c.get_room_unread_count(setup["ns"], room["room_id"], setup["alice"]["secret"])
+        alice_unread = c.get_room_unread_count(
+            setup["ns"], room["room_id"], setup["alice"]["secret"]
+        )
         bob_unread = c.get_room_unread_count(setup["ns"], room["room_id"], setup["bob"]["secret"])
 
         assert alice_unread == 2
@@ -291,7 +305,9 @@ class TestDeaddropClientRooms:
         # Bob reads first
         c.update_room_read_cursor(setup["ns"], room["room_id"], setup["bob"]["secret"], msg1["mid"])
 
-        alice_unread = c.get_room_unread_count(setup["ns"], room["room_id"], setup["alice"]["secret"])
+        alice_unread = c.get_room_unread_count(
+            setup["ns"], room["room_id"], setup["alice"]["secret"]
+        )
         bob_unread = c.get_room_unread_count(setup["ns"], room["room_id"], setup["bob"]["secret"])
 
         assert alice_unread == 0
@@ -309,14 +325,18 @@ class TestDeaddropClientRooms:
         assert len(members) == 1
 
         # Alice adds Bob
-        c.add_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"])
+        c.add_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["alice"]["secret"]
+        )
 
         # Both are members
         members = c.list_room_members(setup["ns"], room["room_id"], setup["alice"]["secret"])
         assert len(members) == 2
 
         # Bob leaves
-        c.remove_room_member(setup["ns"], room["room_id"], setup["bob"]["id"], setup["bob"]["secret"])
+        c.remove_room_member(
+            setup["ns"], room["room_id"], setup["bob"]["id"], setup["bob"]["secret"]
+        )
 
         # Only Alice remains
         members = c.list_room_members(setup["ns"], room["room_id"], setup["alice"]["secret"])

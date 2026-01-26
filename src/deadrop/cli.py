@@ -150,6 +150,7 @@ def _claim_local_invite(invite_url: str, key_override: str | None = None):
 
     # Decode the invite code: ns:identity_id:encrypted_secret:invite_id
     try:
+        assert invite_code is not None
         invite_data = base64.urlsafe_b64decode(invite_code).decode()
         ns, identity_id, encrypted_secret, invite_id = invite_data.split(":")
     except Exception:
@@ -171,7 +172,7 @@ def _claim_local_invite(invite_url: str, key_override: str | None = None):
         print(f"Error: Failed to decrypt credentials: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Claiming local invite...")
+    print("Claiming local invite...")
     print(f"  Path: {deaddrop_path}")
     print(f"  Namespace: {ns}")
     print(f"  Identity: {identity_id}")
@@ -235,6 +236,7 @@ def _claim_remote_invite(invite_url: str, key_override: str | None = None):
         print("Error: Could not parse invite ID from URL", file=sys.stderr)
         sys.exit(1)
 
+    assert match is not None  # for type checker - we exit above if None
     invite_id = match.group(1)
 
     # Get key from fragment, override, or prompt
@@ -1222,7 +1224,6 @@ def create(
     --name: Optional display name for the invite
     """
     from datetime import timedelta
-    from urllib.parse import urlencode
 
     from .crypto import create_invite_secrets
 
@@ -1266,7 +1267,7 @@ def create(
         print(invite_url)
         print()
         print("Claim with:")
-        print(f"  deadrop claim '<url>'")
+        print("  deadrop claim '<url>'")
         print()
         print("Note: Quote the URL to preserve the # fragment in your shell.")
 
@@ -1348,9 +1349,6 @@ def list_invites(ns: str, *, include_claimed: bool = False):
 
         name = inv.get("display_name") or inv["identity_id"][:8]
         print(f"  {inv['invite_id'][:12]}...  {name}{status}")
-
-
-
 
 
 @invite_app.command
@@ -1468,6 +1466,7 @@ def add(
         )
     else:
         # Validate local path exists
+        assert local is not None  # we checked above that either remote or local is set
         local_path = Path(local)
         if not local_path.exists():
             print(f"Warning: Path does not exist yet: {local}", file=sys.stderr)
@@ -1486,7 +1485,7 @@ def add(
 
     print(f"Source '{name}' added.")
     if set_default:
-        print(f"Set as default source.")
+        print("Set as default source.")
 
 
 @source_app.command

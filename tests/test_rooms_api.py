@@ -3,7 +3,6 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from deadrop import db
 from deadrop.api import app
 
 
