@@ -1017,20 +1017,20 @@ def create(
     secrets = create_invite_secrets(mb.secret)
 
     if deaddrop_path:
-        # Create local invite (deadrop:// URL)
+        # Create local invite (file:// URL)
         if not deaddrop_path.exists():
             print(f"Error: Local .deaddrop not found at {deaddrop_path}", file=sys.stderr)
             sys.exit(1)
 
-        params = {
-            "path": str(deaddrop_path.absolute()),
-            "ns": ns,
-            "id": identity_id,
-            "secret_enc": secrets.encrypted_secret_hex,
-            "invite_id": secrets.invite_id,
-        }
+        # Encode ns, id, and encrypted secret into a single invite code
+        import base64
 
-        invite_url = f"deadrop://local/invite?{urlencode(params)}#{secrets.key_base64}"
+        invite_data = f"{ns}:{identity_id}:{secrets.encrypted_secret_hex}:{secrets.invite_id}"
+        invite_code = base64.urlsafe_b64encode(invite_data.encode()).decode()
+
+        # file:// URL with path and invite code
+        abs_path = str(deaddrop_path.absolute())
+        invite_url = f"file://{abs_path}?invite={invite_code}#{secrets.key_base64}"
 
         print("Local invite created!")
         print(f"  For: {mb.display_name or identity_id}")
@@ -1171,9 +1171,9 @@ def revoke(ns: str, invite_id: str):
 
 
 def _claim_local_invite(invite_url: str):
-    """Claim a local deadrop:// invite URL."""
+    """Claim a local file:// invite URL."""
     import base64
-    from urllib.parse import parse_qs, urlparse
+    from urllib.parse import parse_qs, unquote, urlparse
 
     from .crypto import decrypt_invite_secret
 
@@ -1181,24 +1181,27 @@ def _claim_local_invite(invite_url: str):
     query_params = parse_qs(parsed.query)
     fragment = parsed.fragment
 
-    # Extract parameters
-    path = query_params.get("path", [None])[0]
-    ns = query_params.get("ns", [None])[0]
-    identity_id = query_params.get("id", [None])[0]
-    encrypted_secret = query_params.get("secret_enc", [None])[0]
-    invite_id = query_params.get("invite_id", [None])[0]
+    # Extract path from file:// URL
+    # urlparse puts the path in .path for file:// URLs
+    deaddrop_path = Path(unquote(parsed.path))
 
-    if not all([path, ns, identity_id, encrypted_secret, fragment]):
+    # Extract and decode the invite code
+    invite_code = query_params.get("invite", [None])[0]
+    if not invite_code or not fragment:
         print("Error: Invalid local invite URL format", file=sys.stderr)
-        print(
-            "Expected: deadrop://local/invite?path=...&ns=...&id=...&secret_enc=...&invite_id=...#key",
-            file=sys.stderr,
-        )
+        print("Expected: file:///path/to/.deaddrop?invite=<code>#<key>", file=sys.stderr)
         sys.exit(1)
 
-    deaddrop_path = Path(path)
+    # Decode the invite code: ns:identity_id:encrypted_secret:invite_id
+    try:
+        invite_data = base64.urlsafe_b64decode(invite_code).decode()
+        ns, identity_id, encrypted_secret, invite_id = invite_data.split(":")
+    except Exception:
+        print("Error: Invalid invite code", file=sys.stderr)
+        sys.exit(1)
+
     if not deaddrop_path.exists():
-        print(f"Error: Local deaddrop not found at {path}", file=sys.stderr)
+        print(f"Error: Local deaddrop not found at {deaddrop_path}", file=sys.stderr)
         sys.exit(1)
 
     # Decrypt the secret using the fragment key
@@ -1213,24 +1216,24 @@ def _claim_local_invite(invite_url: str):
         sys.exit(1)
 
     print(f"Claiming local invite...")
-    print(f"  Path: {path}")
+    print(f"  Path: {deaddrop_path}")
     print(f"  Namespace: {ns}")
     print(f"  Identity: {identity_id}")
 
-    # Save to local config
+    # Save to local config with local_path in namespace metadata
     ns_cfg = NamespaceConfig.load(ns)
     if ns_cfg is None:
         ns_cfg = NamespaceConfig(
             ns=ns,
             secret="",  # We don't have namespace-level access
+            metadata={"local_path": str(deaddrop_path)},
             created_at=datetime.now(timezone.utc).isoformat(),
         )
 
-    # Add the mailbox with a note about the local path
+    # Add the mailbox
     ns_cfg.add_mailbox(
         id=identity_id,
         secret=mailbox_secret,
-        metadata={"local_path": str(deaddrop_path)},
     )
     ns_cfg.save()
 
@@ -1361,16 +1364,15 @@ def claim(invite_url: str):
 
     Remote (HTTPS):
         https://deaddrop.example.com/join/abc123#base64key
-        /join/abc123#base64key
 
-    Local (deadrop://):
-        deadrop://local/invite?path=/path/.deaddrop&ns=xxx&id=xxx&secret_enc=xxx&invite_id=xxx#key
+    Local (file://):
+        file:///path/to/.deaddrop?invite=<code>#<key>
 
     The credentials will be saved to your local config and you can
     then use the CLI to send/receive messages.
     """
     # Dispatch to appropriate handler based on URL scheme
-    if invite_url.startswith("deadrop://"):
+    if invite_url.startswith("file://"):
         _claim_local_invite(invite_url)
     else:
         _claim_remote_invite(invite_url)
