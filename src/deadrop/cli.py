@@ -201,9 +201,20 @@ def ns_create(
         )
         client.close()
 
+        # Save namespace config with local_path so we can find it later
+        ns_config = NamespaceConfig(
+            ns=ns["ns"],
+            secret=ns["secret"],
+            display_name=display_name,
+            metadata={"local_path": str(deaddrop_path.absolute())},
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        ns_config.save()
+
         print("Local namespace created!")
         print(f"  ID: {ns['ns']}")
         print(f"  Location: {deaddrop_path}")
+        print(f"  Config saved to: {ns_config.get_path()}")
         if ns.get("slug"):
             print(f"  Slug: {ns['slug']}")
         return
@@ -947,31 +958,21 @@ def parse_duration(duration: str) -> int:
         return int(duration)
 
 
-def _is_local_namespace(ns: str, ns_cfg: NamespaceConfig) -> tuple[bool, Path | None]:
-    """Check if a namespace is local (in a .deaddrop directory).
+def _get_local_namespace_path(ns_cfg: NamespaceConfig) -> Path | None:
+    """Get the local .deaddrop path for a namespace, if it's local.
 
-    Returns (is_local, deaddrop_path).
+    Returns the path if local, None if remote.
     """
-    # Check if any mailbox has local_path metadata
+    # Check namespace metadata for local_path
+    if ns_cfg.metadata and ns_cfg.metadata.get("local_path"):
+        return Path(ns_cfg.metadata["local_path"])
+
+    # Check if any mailbox has local_path metadata (legacy)
     for mb in ns_cfg.mailboxes.values():
         if mb.metadata and mb.metadata.get("local_path"):
-            return True, Path(mb.metadata["local_path"])
+            return Path(mb.metadata["local_path"])
 
-    # Check if namespace exists in a local .deaddrop directory
-    local_deaddrop = find_deaddrop_dir()
-    if local_deaddrop:
-        from .client import Deaddrop
-
-        try:
-            client = Deaddrop.local(path=local_deaddrop)
-            namespace = client.get_namespace(ns)
-            client.close()
-            if namespace:
-                return True, local_deaddrop
-        except Exception:
-            pass
-
-    return False, None
+    return None
 
 
 @invite_app.command
@@ -981,21 +982,18 @@ def create(
     *,
     expires_in: str = "24h",
     name: str | None = None,
-    local: bool = False,
-    path: str | None = None,
 ):
     """Create a shareable invite link for a mailbox.
 
     The invite allows someone to claim access to the specified identity.
     The link is single-use.
 
-    For remote namespaces, creates an invite via the server API.
-    For local namespaces (or with --local), creates a deadrop:// URL.
+    Automatically detects whether this is a local or remote namespace:
+    - Local namespaces: Creates a deadrop:// URL with the path embedded
+    - Remote namespaces: Registers the invite on the server
 
     --expires-in: How long until the invite expires (e.g., '24h', '7d', '1h')
     --name: Optional display name for the invite
-    --local: Force creation of a local invite (deadrop:// URL)
-    --path: Path to .deaddrop directory (for local invites)
     """
     from datetime import timedelta
     from urllib.parse import urlencode
@@ -1012,26 +1010,16 @@ def create(
 
     mb = ns_cfg.mailboxes[identity_id]
 
-    # Determine if this is a local or remote namespace
-    if local or path:
-        is_local = True
-        if path:
-            deaddrop_path = Path(path)
-        else:
-            _, deaddrop_path = _is_local_namespace(ns, ns_cfg)
-            if not deaddrop_path:
-                deaddrop_path = find_deaddrop_dir()
-    else:
-        is_local, deaddrop_path = _is_local_namespace(ns, ns_cfg)
+    # Check if this is a local namespace (has local_path in metadata)
+    deaddrop_path = _get_local_namespace_path(ns_cfg)
 
     # Create the cryptographic secrets
     secrets = create_invite_secrets(mb.secret)
 
-    if is_local:
+    if deaddrop_path:
         # Create local invite (deadrop:// URL)
-        if not deaddrop_path or not deaddrop_path.exists():
-            print("Error: No local .deaddrop directory found.", file=sys.stderr)
-            print("Use --path to specify the location.", file=sys.stderr)
+        if not deaddrop_path.exists():
+            print(f"Error: Local .deaddrop not found at {deaddrop_path}", file=sys.stderr)
             sys.exit(1)
 
         params = {
