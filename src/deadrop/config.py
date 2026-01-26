@@ -86,6 +86,7 @@ class Source:
         from .client import Deaddrop
 
         if self.type == "remote":
+            assert self.url is not None
             return Deaddrop.remote(url=self.url, bearer_token=self.bearer_token)
         else:
             return Deaddrop.local(path=self.path)

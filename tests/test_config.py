@@ -313,8 +313,10 @@ class TestGlobalConfigSources:
 
         loaded = GlobalConfig.load()
         assert len(loaded.sources) == 2
-        assert loaded.get_source("work") is not None
-        assert loaded.get_source("work").url == "https://work.io"
-        assert loaded.get_source("dev") is not None
-        assert loaded.get_source("dev").path == "/dev/.deaddrop"
+        work = loaded.get_source("work")
+        assert work is not None
+        assert work.url == "https://work.io"
+        dev = loaded.get_source("dev")
+        assert dev is not None
+        assert dev.path == "/dev/.deaddrop"
         assert loaded.default_source == "work"

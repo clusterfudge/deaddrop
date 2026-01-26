@@ -1084,7 +1084,7 @@ def add_room_member(
         raise HTTPException(404, "Room not found in this namespace")
 
     try:
-        member = db.add_room_member(room_id, request.identity_id)
+        db.add_room_member(room_id, request.identity_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
