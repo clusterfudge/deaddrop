@@ -22,20 +22,24 @@ def reset_database():
     to clear all tables, since close_db() doesn't destroy the shared cache.
     """
     # Get connection and drop all tables first (in case migration tests
-    # left partial schemas)
+    # left partial schemas). Drop order matters with foreign keys enabled.
     conn = db.get_connection()
+    # Temporarily disable foreign keys to allow dropping in any order
+    conn.execute("PRAGMA foreign_keys=OFF")
     conn.executescript("""
+        DROP TABLE IF EXISTS room_messages;
+        DROP TABLE IF EXISTS room_members;
+        DROP TABLE IF EXISTS rooms;
         DROP TABLE IF EXISTS archive_batches;
         DROP TABLE IF EXISTS invites;
         DROP TABLE IF EXISTS messages;
         DROP TABLE IF EXISTS identities;
         DROP TABLE IF EXISTS namespaces;
         DROP TABLE IF EXISTS schema_version;
-        DROP TABLE IF EXISTS rooms;
-        DROP TABLE IF EXISTS room_members;
-        DROP TABLE IF EXISTS room_messages;
     """)
     conn.commit()
+    # Re-enable foreign keys
+    conn.execute("PRAGMA foreign_keys=ON")
 
     # Now initialize fresh schema
     db.init_db_with_conn(conn)

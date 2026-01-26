@@ -89,6 +89,8 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
             # Enable WAL mode for better concurrent read/write performance
             conn.execute("PRAGMA journal_mode=WAL")
+        # Enable foreign key enforcement
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -118,12 +120,16 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
             )
             # Set busy timeout to wait for locks instead of failing immediately
             _local.conn.execute("PRAGMA busy_timeout=5000")
+            # Enable foreign key enforcement
+            _local.conn.execute("PRAGMA foreign_keys=ON")
         else:
             _local.conn = sqlite3.connect(db_path_env, check_same_thread=False)
             # Enable WAL mode for better concurrent read/write performance
             _local.conn.execute("PRAGMA journal_mode=WAL")
             # Set busy timeout to wait for locks instead of failing immediately
             _local.conn.execute("PRAGMA busy_timeout=5000")
+            # Enable foreign key enforcement
+            _local.conn.execute("PRAGMA foreign_keys=ON")
 
         _local.conn.row_factory = sqlite3.Row
 
@@ -1411,3 +1417,578 @@ def get_archive_batches(
         cursor = conn.execute("SELECT * FROM archive_batches ORDER BY created_at")
 
     return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+# --- Room Operations ---
+
+
+def create_room(
+    ns: str,
+    created_by: str,
+    display_name: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Create a new room in a namespace.
+
+    The creator is automatically added as the first member.
+
+    Args:
+        ns: Namespace ID
+        created_by: Identity ID of the creator
+        display_name: Optional display name for the room
+        conn: Optional database connection
+
+    Returns:
+        Room info dict with room_id, ns, display_name, created_by, created_at
+    """
+    conn = _get_conn(conn)
+
+    # Verify creator exists in namespace
+    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, created_by))
+    if not cursor.fetchone():
+        raise ValueError(f"Creator {created_by} not found in namespace {ns}")
+
+    room_id = str(make_uuid7())
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Create the room
+    conn.execute(
+        """INSERT INTO rooms (room_id, ns, display_name, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (room_id, ns, display_name, created_by, now),
+    )
+
+    # Add creator as first member
+    conn.execute(
+        """INSERT INTO room_members (room_id, identity_id, ns, joined_at)
+           VALUES (?, ?, ?, ?)""",
+        (room_id, created_by, ns, now),
+    )
+
+    conn.commit()
+
+    return {
+        "room_id": room_id,
+        "ns": ns,
+        "display_name": display_name,
+        "created_by": created_by,
+        "created_at": now,
+    }
+
+
+def get_room(
+    room_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Get room by ID.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        Room info dict or None if not found
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT room_id, ns, display_name, created_by, created_at
+           FROM rooms WHERE room_id = ?""",
+        (room_id,),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+    return row
+
+
+def list_rooms(
+    ns: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """List all rooms in a namespace.
+
+    Args:
+        ns: Namespace ID
+        conn: Optional database connection
+
+    Returns:
+        List of room info dicts
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT room_id, ns, display_name, created_by, created_at
+           FROM rooms WHERE ns = ? ORDER BY created_at""",
+        (ns,),
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def list_rooms_for_identity(
+    ns: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """List rooms that an identity is a member of.
+
+    Args:
+        ns: Namespace ID
+        identity_id: Identity ID
+        conn: Optional database connection
+
+    Returns:
+        List of room info dicts with member info
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT r.room_id, r.ns, r.display_name, r.created_by, r.created_at,
+                  m.joined_at, m.last_read_mid
+           FROM rooms r
+           JOIN room_members m ON r.room_id = m.room_id
+           WHERE r.ns = ? AND m.identity_id = ?
+           ORDER BY r.created_at""",
+        (ns, identity_id),
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def delete_room(
+    room_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Delete a room and all its messages/members.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        True if deleted, False if not found
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute("DELETE FROM rooms WHERE room_id = ?", (room_id,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def is_room_member(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Check if an identity is a member of a room.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity ID
+        conn: Optional database connection
+
+    Returns:
+        True if member, False otherwise
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        "SELECT 1 FROM room_members WHERE room_id = ? AND identity_id = ?",
+        (room_id, identity_id),
+    )
+    return cursor.fetchone() is not None
+
+
+def add_room_member(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Add a member to a room.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity ID to add
+        conn: Optional database connection
+
+    Returns:
+        Member info dict
+
+    Raises:
+        ValueError: If room not found or identity not in same namespace
+    """
+    conn = _get_conn(conn)
+
+    # Get room info to verify it exists and get namespace
+    room = get_room(room_id, conn=conn)
+    if not room:
+        raise ValueError(f"Room {room_id} not found")
+
+    ns = room["ns"]
+
+    # Verify identity exists in same namespace
+    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, identity_id))
+    if not cursor.fetchone():
+        raise ValueError(f"Identity {identity_id} not found in namespace {ns}")
+
+    # Check if already a member
+    if is_room_member(room_id, identity_id, conn=conn):
+        # Return existing membership
+        cursor = conn.execute(
+            "SELECT room_id, identity_id, ns, joined_at, last_read_mid FROM room_members WHERE room_id = ? AND identity_id = ?",
+            (room_id, identity_id),
+        )
+        return _row_to_dict(cursor.description, cursor.fetchone())  # type: ignore
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """INSERT INTO room_members (room_id, identity_id, ns, joined_at)
+           VALUES (?, ?, ?, ?)""",
+        (room_id, identity_id, ns, now),
+    )
+    conn.commit()
+
+    return {
+        "room_id": room_id,
+        "identity_id": identity_id,
+        "ns": ns,
+        "joined_at": now,
+        "last_read_mid": None,
+    }
+
+
+def remove_room_member(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Remove a member from a room.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity ID to remove
+        conn: Optional database connection
+
+    Returns:
+        True if removed, False if not a member
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        "DELETE FROM room_members WHERE room_id = ? AND identity_id = ?",
+        (room_id, identity_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def list_room_members(
+    room_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """List all members of a room.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        List of member info dicts with identity metadata
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT m.room_id, m.identity_id, m.ns, m.joined_at, m.last_read_mid,
+                  i.metadata
+           FROM room_members m
+           JOIN identities i ON m.ns = i.ns AND m.identity_id = i.id
+           WHERE m.room_id = ?
+           ORDER BY m.joined_at""",
+        (room_id,),
+    )
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
+
+    # Parse metadata JSON
+    for row in rows:
+        row["metadata"] = json.loads(row.get("metadata") or "{}")
+
+    return rows
+
+
+def send_room_message(
+    room_id: str,
+    from_id: str,
+    body: str,
+    content_type: str = "text/plain",
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Send a message to a room.
+
+    Args:
+        room_id: Room ID
+        from_id: Sender identity ID (must be a member)
+        body: Message body
+        content_type: Content type (default: text/plain)
+        conn: Optional database connection
+
+    Returns:
+        Message info dict
+
+    Raises:
+        ValueError: If room not found or sender not a member
+    """
+    conn = _get_conn(conn)
+
+    # Verify room exists
+    room = get_room(room_id, conn=conn)
+    if not room:
+        raise ValueError(f"Room {room_id} not found")
+
+    # Verify sender is a member
+    if not is_room_member(room_id, from_id, conn=conn):
+        raise ValueError(f"Identity {from_id} is not a member of room {room_id}")
+
+    mid = str(make_uuid7())
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """INSERT INTO room_messages (mid, room_id, from_id, body, content_type, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (mid, room_id, from_id, body, content_type, now),
+    )
+    conn.commit()
+
+    return {
+        "mid": mid,
+        "room_id": room_id,
+        "from": from_id,
+        "body": body,
+        "content_type": content_type,
+        "created_at": now,
+    }
+
+
+def has_new_room_messages(
+    room_id: str,
+    after_mid: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Check if there are new messages in a room.
+
+    Lightweight check using COUNT - efficient for polling.
+
+    Args:
+        room_id: Room ID
+        after_mid: Only count messages after this message ID
+        conn: Optional database connection
+
+    Returns:
+        True if there are new messages
+    """
+    conn = _get_conn(conn)
+
+    query = "SELECT COUNT(*) FROM room_messages WHERE room_id = ?"
+    params: list[Any] = [room_id]
+
+    if after_mid:
+        query += " AND mid > ?"
+        params.append(after_mid)
+
+    cursor = conn.execute(query, tuple(params))
+    count = cursor.fetchone()[0]
+    return count > 0
+
+
+def get_room_messages(
+    room_id: str,
+    after_mid: str | None = None,
+    limit: int = 100,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """Get messages from a room.
+
+    Args:
+        room_id: Room ID
+        after_mid: Only get messages after this message ID (for pagination/polling)
+        limit: Maximum number of messages to return
+        conn: Optional database connection
+
+    Returns:
+        List of message dicts ordered by creation time
+    """
+    conn = _get_conn(conn)
+
+    query = """
+        SELECT mid, room_id, from_id, body, content_type, created_at
+        FROM room_messages
+        WHERE room_id = ?
+    """
+    params: list[Any] = [room_id]
+
+    if after_mid:
+        query += " AND mid > ?"
+        params.append(after_mid)
+
+    query += " ORDER BY mid LIMIT ?"
+    params.append(limit)
+
+    cursor = conn.execute(query, tuple(params))
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
+
+    return [
+        {
+            "mid": row["mid"],
+            "room_id": row["room_id"],
+            "from": row["from_id"],
+            "body": row["body"],
+            "content_type": row.get("content_type") or "text/plain",
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def get_room_message(
+    room_id: str,
+    mid: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Get a single room message.
+
+    Args:
+        room_id: Room ID
+        mid: Message ID
+        conn: Optional database connection
+
+    Returns:
+        Message dict or None if not found
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT mid, room_id, from_id, body, content_type, created_at
+           FROM room_messages WHERE room_id = ? AND mid = ?""",
+        (room_id, mid),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if row:
+        return {
+            "mid": row["mid"],
+            "room_id": row["room_id"],
+            "from": row["from_id"],
+            "body": row["body"],
+            "content_type": row.get("content_type") or "text/plain",
+            "created_at": row["created_at"],
+        }
+    return None
+
+
+def update_room_read_cursor(
+    room_id: str,
+    identity_id: str,
+    last_read_mid: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Update the read cursor for a member in a room.
+
+    Only updates if the new cursor is ahead of the current one.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity ID
+        last_read_mid: Message ID of the last read message
+        conn: Optional database connection
+
+    Returns:
+        True if updated, False if member not found
+    """
+    conn = _get_conn(conn)
+
+    # Only update if cursor moves forward (UUID7 is lexicographically sortable)
+    cursor = conn.execute(
+        """UPDATE room_members 
+           SET last_read_mid = ?
+           WHERE room_id = ? AND identity_id = ?
+           AND (last_read_mid IS NULL OR last_read_mid < ?)""",
+        (last_read_mid, room_id, identity_id, last_read_mid),
+    )
+    conn.commit()
+
+    # Return True if we actually updated (not just if member exists)
+    # If the cursor didn't move, rowcount will be 0
+    if cursor.rowcount > 0:
+        return True
+
+    # Check if member exists (they might already have a later cursor)
+    cursor = conn.execute(
+        "SELECT 1 FROM room_members WHERE room_id = ? AND identity_id = ?",
+        (room_id, identity_id),
+    )
+    return cursor.fetchone() is not None
+
+
+def get_room_unread_count(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Get the count of unread messages for a member in a room.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity ID
+        conn: Optional database connection
+
+    Returns:
+        Number of unread messages (0 if not a member)
+    """
+    conn = _get_conn(conn)
+
+    # Get member's last read cursor
+    cursor = conn.execute(
+        "SELECT last_read_mid FROM room_members WHERE room_id = ? AND identity_id = ?",
+        (room_id, identity_id),
+    )
+    row = cursor.fetchone()
+
+    if not row:
+        return 0  # Not a member
+
+    last_read_mid = row[0]
+
+    # Count messages after the cursor
+    if last_read_mid:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM room_messages WHERE room_id = ? AND mid > ?",
+            (room_id, last_read_mid),
+        )
+    else:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM room_messages WHERE room_id = ?",
+            (room_id,),
+        )
+
+    return cursor.fetchone()[0]
+
+
+def get_room_member_info(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Get membership info for an identity in a room.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity ID
+        conn: Optional database connection
+
+    Returns:
+        Member info dict or None if not a member
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT m.room_id, m.identity_id, m.ns, m.joined_at, m.last_read_mid,
+                  i.metadata
+           FROM room_members m
+           JOIN identities i ON m.ns = i.ns AND m.identity_id = i.id
+           WHERE m.room_id = ? AND m.identity_id = ?""",
+        (room_id, identity_id),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if row:
+        row["metadata"] = json.loads(row.get("metadata") or "{}")
+
+    return row
