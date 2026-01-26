@@ -380,6 +380,297 @@ class Deaddrop:
         """Get archived messages."""
         return self._backend.get_archived_messages(ns, identity_id, secret)
 
+    # --- Room Operations ---
+
+    def create_room(
+        self,
+        ns: str,
+        creator_secret: str,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new room in a namespace.
+
+        The creator automatically becomes the first member.
+
+        Args:
+            ns: Namespace ID.
+            creator_secret: Creator's inbox secret.
+            display_name: Optional display name for the room.
+
+        Returns:
+            dict with: room_id, ns, display_name, created_by, created_at
+        """
+        return self._backend.create_room(ns, creator_secret, display_name)
+
+    def list_rooms(
+        self,
+        ns: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        """List rooms the caller is a member of.
+
+        Args:
+            ns: Namespace ID.
+            secret: Caller's inbox secret.
+
+        Returns:
+            List of room dicts with membership info.
+        """
+        return self._backend.list_rooms(ns, secret)
+
+    def get_room(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> dict[str, Any] | None:
+        """Get room details. Requires membership.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret.
+
+        Returns:
+            Room dict or None if not found/not a member.
+        """
+        return self._backend.get_room(ns, room_id, secret)
+
+    def delete_room(
+        self,
+        ns: str,
+        room_id: str,
+        ns_secret: str,
+    ) -> bool:
+        """Delete a room. Requires namespace owner.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            ns_secret: Namespace secret.
+
+        Returns:
+            True if deleted.
+        """
+        return self._backend.delete_room(ns, room_id, ns_secret)
+
+    def add_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> dict[str, Any]:
+        """Add a member to a room.
+
+        Any room member can add other identities from the same namespace.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            identity_id: Identity to add.
+            secret: Caller's inbox secret (must be a member).
+
+        Returns:
+            Member info dict.
+        """
+        return self._backend.add_room_member(ns, room_id, identity_id, secret)
+
+    def remove_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> bool:
+        """Remove a member from a room (or leave).
+
+        Members can remove themselves or be removed by other members.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            identity_id: Identity to remove.
+            secret: Caller's inbox secret.
+
+        Returns:
+            True if removed.
+        """
+        return self._backend.remove_room_member(ns, room_id, identity_id, secret)
+
+    def list_room_members(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        """List members of a room.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret (must be a member).
+
+        Returns:
+            List of member info dicts.
+        """
+        return self._backend.list_room_members(ns, room_id, secret)
+
+    def send_room_message(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        body: str,
+        content_type: str = "text/plain",
+    ) -> dict[str, Any]:
+        """Send a message to a room.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Sender's inbox secret (must be a member).
+            body: Message body.
+            content_type: MIME type.
+
+        Returns:
+            Message dict.
+        """
+        return self._backend.send_room_message(ns, room_id, secret, body, content_type)
+
+    def get_room_messages(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        after_mid: str | None = None,
+        limit: int = 100,
+        wait: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Get messages from a room.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret (must be a member).
+            after_mid: Only get messages after this ID.
+            limit: Maximum messages to return.
+            wait: Long-poll timeout in seconds (0-60).
+
+        Returns:
+            List of message dicts.
+        """
+        return self._backend.get_room_messages(
+            ns, room_id, secret, after_mid=after_mid, limit=limit, wait=wait
+        )
+
+    def update_room_read_cursor(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        last_read_mid: str,
+    ) -> bool:
+        """Update read cursor for the caller.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret.
+            last_read_mid: Message ID of last read message.
+
+        Returns:
+            True if updated.
+        """
+        return self._backend.update_room_read_cursor(ns, room_id, secret, last_read_mid)
+
+    def get_room_unread_count(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> int:
+        """Get unread message count for the caller.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret.
+
+        Returns:
+            Number of unread messages.
+        """
+        return self._backend.get_room_unread_count(ns, room_id, secret)
+
+    def wait_for_room_messages(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        timeout: int = 30,
+        after_mid: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Wait for new room messages with long-polling.
+
+        Convenience wrapper around get_room_messages with wait parameter.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret.
+            timeout: How long to wait for messages (1-60 seconds).
+            after_mid: Only return messages after this ID.
+
+        Returns:
+            List of messages (may be empty if timeout reached).
+        """
+        return self.get_room_messages(
+            ns=ns,
+            room_id=room_id,
+            secret=secret,
+            after_mid=after_mid,
+            wait=max(1, min(timeout, 60)),
+        )
+
+    def listen_room(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        timeout: int = 30,
+    ):
+        """Generator that yields room messages as they arrive.
+
+        Uses long-polling to efficiently wait for new messages.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret.
+            timeout: Long-poll timeout per iteration (1-60 seconds).
+
+        Yields:
+            Messages as they arrive.
+
+        Example:
+            for message in client.listen_room(ns, room_id, secret):
+                print(f"From {message['from_id']}: {message['body']}")
+        """
+        last_mid: str | None = None
+
+        while True:
+            messages = self.wait_for_room_messages(
+                ns=ns,
+                room_id=room_id,
+                secret=secret,
+                timeout=timeout,
+                after_mid=last_mid,
+            )
+
+            for msg in messages:
+                last_mid = msg.get("mid")
+                yield msg
+
     # --- Convenience Methods ---
 
     def quick_setup(

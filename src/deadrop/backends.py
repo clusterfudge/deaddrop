@@ -218,6 +218,237 @@ class Backend(ABC):
         """Get archived messages."""
         ...
 
+    # --- Room Operations ---
+
+    @abstractmethod
+    def create_room(
+        self,
+        ns: str,
+        creator_secret: str,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new room in a namespace.
+
+        The creator becomes the first member automatically.
+
+        Args:
+            ns: Namespace ID
+            creator_secret: Creator's inbox secret
+            display_name: Optional display name for the room
+
+        Returns:
+            dict with keys: room_id, ns, display_name, created_by, created_at
+        """
+        ...
+
+    @abstractmethod
+    def list_rooms(
+        self,
+        ns: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        """List rooms the caller is a member of.
+
+        Args:
+            ns: Namespace ID
+            secret: Caller's inbox secret
+
+        Returns:
+            List of room dicts with membership info
+        """
+        ...
+
+    @abstractmethod
+    def get_room(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> dict[str, Any] | None:
+        """Get room details. Requires membership.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            secret: Caller's inbox secret (must be a member)
+
+        Returns:
+            Room dict or None if not found/not a member
+        """
+        ...
+
+    @abstractmethod
+    def delete_room(
+        self,
+        ns: str,
+        room_id: str,
+        ns_secret: str,
+    ) -> bool:
+        """Delete a room. Requires namespace owner.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            ns_secret: Namespace secret
+
+        Returns:
+            True if deleted, False if not found
+        """
+        ...
+
+    @abstractmethod
+    def add_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> dict[str, Any]:
+        """Add a member to a room.
+
+        Any room member can add other identities from the same namespace.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            identity_id: Identity to add
+            secret: Caller's inbox secret (must be a member)
+
+        Returns:
+            Member info dict
+        """
+        ...
+
+    @abstractmethod
+    def remove_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> bool:
+        """Remove a member from a room.
+
+        Members can remove themselves or be removed by other members.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            identity_id: Identity to remove
+            secret: Caller's inbox secret
+
+        Returns:
+            True if removed, False if not found
+        """
+        ...
+
+    @abstractmethod
+    def list_room_members(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        """List members of a room.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            secret: Caller's inbox secret (must be a member)
+
+        Returns:
+            List of member info dicts
+        """
+        ...
+
+    @abstractmethod
+    def send_room_message(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        body: str,
+        content_type: str = "text/plain",
+    ) -> dict[str, Any]:
+        """Send a message to a room.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            secret: Sender's inbox secret (must be a member)
+            body: Message body
+            content_type: MIME type
+
+        Returns:
+            Message dict
+        """
+        ...
+
+    @abstractmethod
+    def get_room_messages(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        after_mid: str | None = None,
+        limit: int = 100,
+        wait: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Get messages from a room.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            secret: Caller's inbox secret (must be a member)
+            after_mid: Only get messages after this ID
+            limit: Maximum messages to return
+            wait: Long-poll timeout in seconds
+
+        Returns:
+            List of message dicts
+        """
+        ...
+
+    @abstractmethod
+    def update_room_read_cursor(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        last_read_mid: str,
+    ) -> bool:
+        """Update read cursor for the caller.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            secret: Caller's inbox secret (must be a member)
+            last_read_mid: Message ID of last read message
+
+        Returns:
+            True if updated
+        """
+        ...
+
+    @abstractmethod
+    def get_room_unread_count(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> int:
+        """Get unread message count for the caller.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            secret: Caller's inbox secret (must be a member)
+
+        Returns:
+            Number of unread messages
+        """
+        ...
+
     # --- Utility Methods ---
 
     def verify_identity_secret(self, ns: str, identity_id: str, secret: str) -> bool:
@@ -546,6 +777,190 @@ class LocalBackend(Backend):
             raise PermissionError("Invalid inbox secret")
         return db.get_archived_messages(ns, identity_id, conn=self._conn)
 
+    # --- Room Operations ---
+
+    def create_room(
+        self,
+        ns: str,
+        creator_secret: str,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        # Verify creator is in namespace
+        created_by = db.verify_identity_in_namespace(ns, creator_secret, conn=self._conn)
+        if not created_by:
+            raise PermissionError("Invalid creator secret")
+
+        return db.create_room(ns, created_by, display_name=display_name, conn=self._conn)
+
+    def list_rooms(
+        self,
+        ns: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        identity_id = db.verify_identity_in_namespace(ns, secret, conn=self._conn)
+        if not identity_id:
+            raise PermissionError("Invalid inbox secret")
+
+        return db.list_rooms_for_identity(ns, identity_id, conn=self._conn)
+
+    def get_room(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> dict[str, Any] | None:
+        identity_id = derive_id(secret)
+        if not db.is_room_member(room_id, identity_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        room = db.get_room(room_id, conn=self._conn)
+        if room and room.get("ns") != ns:
+            return None
+        return room
+
+    def delete_room(
+        self,
+        ns: str,
+        room_id: str,
+        ns_secret: str,
+    ) -> bool:
+        if not db.verify_namespace_secret(ns, ns_secret, conn=self._conn):
+            raise PermissionError("Invalid namespace secret")
+
+        room = db.get_room(room_id, conn=self._conn)
+        if not room or room.get("ns") != ns:
+            return False
+
+        return db.delete_room(room_id, conn=self._conn)
+
+    def add_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> dict[str, Any]:
+        caller_id = derive_id(secret)
+        if not db.is_room_member(room_id, caller_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        room = db.get_room(room_id, conn=self._conn)
+        if not room or room.get("ns") != ns:
+            raise ValueError("Room not found in this namespace")
+
+        member = db.add_room_member(room_id, identity_id, conn=self._conn)
+        # Get full member info
+        member_info = db.get_room_member_info(room_id, identity_id, conn=self._conn)
+        return member_info or member
+
+    def remove_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> bool:
+        caller_id = derive_id(secret)
+
+        # Can remove self or must be a member to remove others
+        if caller_id != identity_id:
+            if not db.is_room_member(room_id, caller_id, conn=self._conn):
+                raise PermissionError("Not authorized to remove members")
+
+        return db.remove_room_member(room_id, identity_id, conn=self._conn)
+
+    def list_room_members(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        identity_id = derive_id(secret)
+        if not db.is_room_member(room_id, identity_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        room = db.get_room(room_id, conn=self._conn)
+        if not room or room.get("ns") != ns:
+            raise ValueError("Room not found in this namespace")
+
+        return db.list_room_members(room_id, conn=self._conn)
+
+    def send_room_message(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        body: str,
+        content_type: str = "text/plain",
+    ) -> dict[str, Any]:
+        from_id = derive_id(secret)
+        if not db.is_room_member(room_id, from_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        room = db.get_room(room_id, conn=self._conn)
+        if not room or room.get("ns") != ns:
+            raise ValueError("Room not found in this namespace")
+
+        return db.send_room_message(room_id, from_id, body, content_type, conn=self._conn)
+
+    def get_room_messages(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        after_mid: str | None = None,
+        limit: int = 100,
+        wait: int = 0,
+    ) -> list[dict[str, Any]]:
+        import time
+
+        identity_id = derive_id(secret)
+        if not db.is_room_member(room_id, identity_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        room = db.get_room(room_id, conn=self._conn)
+        if not room or room.get("ns") != ns:
+            raise ValueError("Room not found in this namespace")
+
+        # Long-polling
+        if wait > 0:
+            poll_interval = 0.5
+            elapsed = 0.0
+            max_wait = min(wait, 60)
+
+            while elapsed < max_wait:
+                if db.has_new_room_messages(room_id, after_mid=after_mid, conn=self._conn):
+                    break
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+        return db.get_room_messages(room_id, after_mid=after_mid, limit=limit, conn=self._conn)
+
+    def update_room_read_cursor(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        last_read_mid: str,
+    ) -> bool:
+        identity_id = derive_id(secret)
+        if not db.is_room_member(room_id, identity_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        return db.update_room_read_cursor(room_id, identity_id, last_read_mid, conn=self._conn)
+
+    def get_room_unread_count(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> int:
+        identity_id = derive_id(secret)
+        if not db.is_room_member(room_id, identity_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        return db.get_room_unread_count(room_id, identity_id, conn=self._conn)
+
     # --- Local-specific Methods ---
 
     def get_namespace_secret(self, ns: str) -> str | None:
@@ -861,6 +1276,189 @@ class RemoteBackend(Backend):
             headers=self._inbox_headers(secret),
         )
         return result.get("messages", [])
+
+    # --- Room Operations ---
+
+    def create_room(
+        self,
+        ns: str,
+        creator_secret: str,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        json_data: dict[str, Any] = {}
+        if display_name:
+            json_data["display_name"] = display_name
+
+        return self._request(
+            "POST",
+            f"/{ns}/rooms",
+            json=json_data if json_data else None,
+            headers=self._inbox_headers(creator_secret),
+        )
+
+    def list_rooms(
+        self,
+        ns: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        return self._request(
+            "GET",
+            f"/{ns}/rooms",
+            headers=self._inbox_headers(secret),
+        )
+
+    def get_room(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> dict[str, Any] | None:
+        try:
+            return self._request(
+                "GET",
+                f"/{ns}/rooms/{room_id}",
+                headers=self._inbox_headers(secret),
+            )
+        except RuntimeError as e:
+            if "404" in str(e) or "403" in str(e):
+                return None
+            raise
+
+    def delete_room(
+        self,
+        ns: str,
+        room_id: str,
+        ns_secret: str,
+    ) -> bool:
+        try:
+            self._request(
+                "DELETE",
+                f"/{ns}/rooms/{room_id}",
+                headers=self._ns_headers(ns_secret),
+            )
+            return True
+        except RuntimeError:
+            return False
+
+    def add_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/{ns}/rooms/{room_id}/members",
+            json={"identity_id": identity_id},
+            headers=self._inbox_headers(secret),
+        )
+
+    def remove_room_member(
+        self,
+        ns: str,
+        room_id: str,
+        identity_id: str,
+        secret: str,
+    ) -> bool:
+        try:
+            self._request(
+                "DELETE",
+                f"/{ns}/rooms/{room_id}/members/{identity_id}",
+                headers=self._inbox_headers(secret),
+            )
+            return True
+        except RuntimeError:
+            return False
+
+    def list_room_members(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> list[dict[str, Any]]:
+        return self._request(
+            "GET",
+            f"/{ns}/rooms/{room_id}/members",
+            headers=self._inbox_headers(secret),
+        )
+
+    def send_room_message(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        body: str,
+        content_type: str = "text/plain",
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/{ns}/rooms/{room_id}/messages",
+            json={"body": body, "content_type": content_type},
+            headers=self._inbox_headers(secret),
+        )
+
+    def get_room_messages(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        after_mid: str | None = None,
+        limit: int = 100,
+        wait: int = 0,
+    ) -> list[dict[str, Any]]:
+        params = []
+        if after_mid:
+            params.append(f"after={after_mid}")
+        if limit != 100:
+            params.append(f"limit={limit}")
+        if wait > 0:
+            params.append(f"wait={min(wait, 60)}")
+
+        path = f"/{ns}/rooms/{room_id}/messages"
+        if params:
+            path += "?" + "&".join(params)
+
+        timeout = max(30.0, wait + 5) if wait > 0 else 30.0
+
+        result = self._request(
+            "GET",
+            path,
+            headers=self._inbox_headers(secret),
+            timeout=timeout,
+        )
+        return result.get("messages", [])
+
+    def update_room_read_cursor(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        last_read_mid: str,
+    ) -> bool:
+        try:
+            self._request(
+                "POST",
+                f"/{ns}/rooms/{room_id}/read",
+                json={"last_read_mid": last_read_mid},
+                headers=self._inbox_headers(secret),
+            )
+            return True
+        except RuntimeError:
+            return False
+
+    def get_room_unread_count(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+    ) -> int:
+        result = self._request(
+            "GET",
+            f"/{ns}/rooms/{room_id}/unread",
+            headers=self._inbox_headers(secret),
+        )
+        return result.get("unread_count", 0)
 
 
 class InMemoryBackend(LocalBackend):
