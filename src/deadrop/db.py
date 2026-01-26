@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -44,7 +45,18 @@ DEFAULT_TTL_HOURS = 24
 # Current schema version (increment when adding migrations)
 SCHEMA_VERSION = 1
 
-# Global connection singleton (for backward compatibility)
+# Thread-local storage for per-thread connections
+# This ensures each thread gets its own SQLite connection, avoiding
+# concurrency issues with async/threaded code (FastAPI runs sync DB ops in thread pool)
+_local = threading.local()
+
+# Global config for connection parameters (shared across threads)
+_db_config: dict[str, Any] = {
+    "path": None,  # Will be set from env or explicit path
+    "is_libsql": False,
+}
+
+# Legacy global connection (only used for explicit single-connection scenarios)
 _conn: sqlite3.Connection | None = None
 _is_libsql: bool = False
 
@@ -55,42 +67,67 @@ _is_libsql: bool = False
 def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Get or create database connection.
 
+    Uses thread-local storage to give each thread its own connection,
+    which is essential for safe concurrent access in async/threaded environments.
+
     Args:
-        db_path: Optional explicit database path. If None, uses global singleton.
-                 Special value ":memory:" creates an in-memory database.
+        db_path: Optional explicit database path. If None, uses thread-local connection
+                 based on environment config. Special value ":memory:" creates an
+                 in-memory database (note: each thread will get a SEPARATE in-memory DB).
 
     Returns:
         SQLite connection with row_factory set to sqlite3.Row.
     """
-    global _conn, _is_libsql
+    global _conn, _is_libsql, _db_config
 
-    # If explicit path provided, create a new connection (not singleton)
+    # If explicit path provided, create a new connection (not thread-local)
+    # This is used by scoped_connection() for explicit connection management
     if db_path is not None:
         if str(db_path) == ":memory:":
             conn = sqlite3.connect(":memory:", check_same_thread=False)
         else:
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            # Enable WAL mode for better concurrent read/write performance
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
 
-    # Global singleton behavior (backward compatible)
-    if _conn is None:
-        db_url = os.environ.get("TURSO_URL", "")
-
-        if db_url.startswith("libsql://"):
-            # Turso connection (optional dependency)
+    # Check for Turso/libsql (uses single global connection, not thread-local)
+    db_url = os.environ.get("TURSO_URL", "")
+    if db_url.startswith("libsql://"):
+        if _conn is None:
             import libsql_experimental as libsql  # type: ignore[import-not-found]
 
             _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
             _is_libsql = True
-        else:
-            # Local SQLite
-            db_path_env = os.environ.get("DEADROP_DB", "deadrop.db")
-            _conn = sqlite3.connect(db_path_env, check_same_thread=False)
-            _conn.row_factory = sqlite3.Row
-            _is_libsql = False
+        return _conn
 
-    return _conn
+    # Thread-local connection for SQLite
+    # Each thread gets its own connection to avoid concurrency issues
+    if not hasattr(_local, "conn") or _local.conn is None:
+        db_path_env = os.environ.get("DEADROP_DB", ":memory:")
+
+        if db_path_env == ":memory:":
+            # For in-memory databases, use shared cache so all threads see
+            # the same data. The database name includes the process ID to
+            # ensure tests don't interfere with each other across processes.
+            _local.conn = sqlite3.connect(
+                f"file:memdb_{os.getpid()}?mode=memory&cache=shared",
+                uri=True,
+                check_same_thread=False,
+            )
+            # Set busy timeout to wait for locks instead of failing immediately
+            _local.conn.execute("PRAGMA busy_timeout=5000")
+        else:
+            _local.conn = sqlite3.connect(db_path_env, check_same_thread=False)
+            # Enable WAL mode for better concurrent read/write performance
+            _local.conn.execute("PRAGMA journal_mode=WAL")
+            # Set busy timeout to wait for locks instead of failing immediately
+            _local.conn.execute("PRAGMA busy_timeout=5000")
+
+        _local.conn.row_factory = sqlite3.Row
+
+    return _local.conn
 
 
 @contextmanager
@@ -119,12 +156,33 @@ def scoped_connection(db_path: str | Path) -> Iterator[sqlite3.Connection]:
 
 
 def close_db():
-    """Close the global database connection."""
+    """Close database connections.
+
+    Closes both the thread-local connection (if any) and the global connection
+    (used for libsql/Turso).
+    """
     global _conn, _is_libsql
+
+    # Close thread-local connection
+    if hasattr(_local, "conn") and _local.conn is not None:
+        _local.conn.close()
+        _local.conn = None
+
+    # Close global connection (libsql)
     if _conn:
         _conn.close()
         _conn = None
         _is_libsql = False
+
+
+def close_thread_connection():
+    """Close the connection for the current thread only.
+
+    Useful for cleanup in long-running threads or when done with a batch of operations.
+    """
+    if hasattr(_local, "conn") and _local.conn is not None:
+        _local.conn.close()
+        _local.conn = None
 
 
 def _get_conn(conn: sqlite3.Connection | None) -> sqlite3.Connection:

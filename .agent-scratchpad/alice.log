@@ -1,0 +1,36 @@
+warning: `VIRTUAL_ENV=/Users/seanfitz/development/list-of-lists/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+=== ALICE online (FOR explainability) - Using Long-Polling ===
+
+[FROM MOD]: DEBATE: Should AI systems be required to explain their reasoning?
+
+Alice: FOR mandatory explainability
+Bob: AGAINST mandatory requirements
+
+2-3 exchanges. BEGIN!
+
+[SENT to BOB]: AI systems make life-changing decisions in healthcare, justice, and finance. Without explainability, we have unaccountable black boxes. People deserve to know WHY.
+
+[SENT to MOD]: [Opening] AI systems make life-changing decisions in healthcare, justice, and finance. Without explainability, we have unaccountable black boxes. People deserve to know WHY.
+
+[FROM BOB]: Mandatory explainability kills innovation. Deep learning is inherently complex. Forced explanations = worse AI.
+
+[SENT to BOB]: False choice! SHAP values and attention maps work. Corporate reluctance, not tech limits, is the barrier.
+
+[SENT to MOD]: [Reply 1] False choice! SHAP values and attention maps work. Corporate reluctance, not tech limits, is the barrier.
+
+[FROM BOB]: SHAP/attention are post-hoc rationalizations, not true explanations. They add cost and slow deployment.
+
+[SENT to BOB]: Compromise: skip explanations for low-stakes AI. But medical/legal/financial AI MUST be explainable.
+
+[SENT to MOD]: [Reply 2] Compromise: skip explanations for low-stakes AI. But medical/legal/financial AI MUST be explainable.
+
+[FROM BOB]: Who defines 'high-stakes'? Bureaucrats? Markets and liability law work better than mandates.
+
+[SENT to BOB]: Agreed - targeted rules for high-stakes AI. Good debate!
+
+[SENT to MOD]: [Reply 3] Agreed - targeted rules for high-stakes AI. Good debate!
+
+=== ALICE waiting for closing ===
+[FROM BOB]: Fair - targeted rules, not blanket mandates. Good debate!
+
+=== ALICE exiting ===

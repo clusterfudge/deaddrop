@@ -1143,3 +1143,103 @@ class TestLongPolling:
         assert response.status_code == 200
         assert len(response.json()["messages"]) == 0
         assert elapsed < 0.5  # Should be very fast
+
+
+class TestConcurrency:
+    """Test concurrent request handling."""
+
+    def test_concurrent_long_polling_requests(self, admin_headers, tmp_path):
+        """Test that multiple concurrent long-poll requests don't cause errors.
+
+        This reproduces the sqlite3.InterfaceError bug where shared connections
+        across async coroutines caused 'bad parameter or other API misuse'.
+
+        Uses a file-based database to properly test WAL mode and thread-local connections.
+        """
+        import concurrent.futures
+        import os
+        from fastapi.testclient import TestClient
+        from deadrop import db
+        from deadrop.api import app
+
+        # Use temp file database for this test (WAL mode works better)
+        db_path = tmp_path / "test_concurrent.db"
+        os.environ["DEADROP_DB"] = str(db_path)
+
+        # Close any existing connections and reinitialize
+        db.close_db()
+        db.init_db()
+
+        # Create a fresh test client
+        client = TestClient(app)
+
+        # Create namespace and identities
+        response = client.post("/admin/namespaces", headers=admin_headers)
+        ns_data = response.json()
+        ns = ns_data["ns"]
+        ns_secret = ns_data["secret"]
+
+        # Create multiple identities
+        identities = []
+        for i in range(5):
+            response = client.post(
+                f"/{ns}/identities",
+                headers={"X-Namespace-Secret": ns_secret},
+            )
+            identities.append(response.json())
+
+        errors = []
+        results = []
+
+        def poll_inbox(identity):
+            """Poll inbox with wait parameter."""
+            try:
+                response = client.get(
+                    f"/{ns}/inbox/{identity['id']}?wait=1",
+                    headers={"X-Inbox-Secret": identity["secret"]},
+                )
+                results.append(response.status_code)
+                if response.status_code >= 500:
+                    errors.append(f"Server error: {response.status_code} - {response.text}")
+            except Exception as e:
+                errors.append(str(e))
+
+        def send_message(from_identity, to_identity):
+            """Send a message."""
+            try:
+                response = client.post(
+                    f"/{ns}/send",
+                    json={"to": to_identity["id"], "body": "Test message"},
+                    headers={"X-Inbox-Secret": from_identity["secret"]},
+                )
+                results.append(response.status_code)
+                if response.status_code >= 500:
+                    errors.append(f"Server error: {response.status_code} - {response.text}")
+            except Exception as e:
+                errors.append(str(e))
+
+        # Run concurrent requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = []
+
+            # Start long-polling on all identities
+            for identity in identities:
+                futures.append(executor.submit(poll_inbox, identity))
+
+            # Also send messages concurrently
+            for i in range(len(identities) - 1):
+                futures.append(executor.submit(send_message, identities[i], identities[i + 1]))
+
+            # Wait for all to complete
+            concurrent.futures.wait(futures)
+
+        # Cleanup - restore original DB path
+        db.close_db()
+        os.environ["DEADROP_DB"] = ":memory:"
+        db.init_db()  # Reinitialize with in-memory for subsequent tests
+        db.reset_db()
+
+        # Should have no 500 errors
+        assert len(errors) == 0, f"Concurrent requests caused errors: {errors}"
+        # All results should be successful (200)
+        assert all(r == 200 for r in results), f"Some requests failed: {results}"
