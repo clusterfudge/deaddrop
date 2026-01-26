@@ -614,9 +614,12 @@ class RemoteBackend(Backend):
         return response.json()
 
     def _admin_headers(self) -> dict[str, str]:
-        """Get headers for admin operations."""
+        """Get headers for admin operations.
+
+        Returns empty dict if no bearer token (for no-auth servers).
+        """
         if not self._bearer_token:
-            raise PermissionError("Bearer token required for admin operations")
+            return {}
         return {"Authorization": f"Bearer {self._bearer_token}"}
 
     def _ns_headers(self, ns_secret: str) -> dict[str, str]:
