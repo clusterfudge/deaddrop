@@ -569,11 +569,12 @@ def send_message(
 
 
 @app.get("/{ns}/inbox/{identity_id}")
-def get_inbox(
+async def get_inbox(
     ns: str,
     identity_id: str,
     unread: Annotated[bool, Query()] = False,
     after: Annotated[str | None, Query()] = None,
+    wait: Annotated[int, Query(ge=0, le=60)] = 0,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages for own inbox.
@@ -583,10 +584,27 @@ def get_inbox(
     Query parameters:
     - unread: Only return unread messages
     - after: Only return messages after this message ID (cursor for pagination)
+    - wait: Long-poll timeout in seconds (0-60). If no messages, wait up to this
+            many seconds for new messages before returning empty response.
     """
+    import asyncio
+
     # Only mailbox owner can read their inbox
     require_inbox_secret(ns, identity_id, x_inbox_secret)
 
+    # Long-polling: wait for messages if none exist and wait > 0
+    if wait > 0:
+        poll_interval = 0.5  # Check every 500ms
+        elapsed = 0.0
+
+        while elapsed < wait:
+            # Check if messages exist (lightweight query)
+            if db.has_new_messages(ns, identity_id, after_mid=after, unread_only=unread):
+                break
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+    # Fetch and return messages
     messages = db.get_messages(
         ns=ns,
         identity_id=identity_id,
@@ -858,6 +876,364 @@ def claim_invite(invite_id: str, request: Request):
         identity_display_name=invite.get("identity_display_name"),
         display_name=invite.get("display_name"),
     )
+
+
+# --- Room API Models ---
+
+
+class CreateRoomRequest(BaseModel):
+    display_name: str | None = None
+
+
+class RoomInfo(BaseModel):
+    room_id: str
+    ns: str
+    display_name: str | None
+    created_by: str
+    created_at: str
+
+
+class RoomWithMemberInfo(BaseModel):
+    room_id: str
+    ns: str
+    display_name: str | None
+    created_by: str
+    created_at: str
+    joined_at: str
+    last_read_mid: str | None
+
+
+class AddRoomMemberRequest(BaseModel):
+    identity_id: str
+
+
+class RoomMemberInfo(BaseModel):
+    room_id: str
+    identity_id: str
+    ns: str
+    joined_at: str
+    last_read_mid: str | None
+    metadata: dict[str, Any]
+
+
+class SendRoomMessageRequest(BaseModel):
+    body: str
+    content_type: str = "text/plain"
+
+
+class RoomMessageInfo(BaseModel):
+    mid: str
+    room_id: str
+    from_id: str  # The sender's identity ID
+    body: str
+    content_type: str
+    created_at: str
+
+    @classmethod
+    def from_db(cls, data: dict) -> "RoomMessageInfo":
+        """Create from db result which uses 'from' key."""
+        return cls(
+            mid=data["mid"],
+            room_id=data["room_id"],
+            from_id=data["from"],
+            body=data["body"],
+            content_type=data.get("content_type", "text/plain"),
+            created_at=data["created_at"],
+        )
+
+
+class UpdateReadCursorRequest(BaseModel):
+    last_read_mid: str
+
+
+# --- Room Helper Functions ---
+
+
+def require_room_member(room_id: str, x_inbox_secret: str | None) -> tuple[dict, str]:
+    """Verify caller is a member of the room. Returns (room, identity_id)."""
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    room = db.get_room(room_id)
+    if not room:
+        raise HTTPException(404, "Room not found")
+
+    # Derive identity from secret
+    identity_id = derive_id(x_inbox_secret)
+
+    # Verify identity is a member
+    if not db.is_room_member(room_id, identity_id):
+        raise HTTPException(403, "Not a member of this room")
+
+    # Verify identity exists in namespace
+    if not db.verify_identity_secret(room["ns"], identity_id, x_inbox_secret):
+        raise HTTPException(403, "Invalid inbox secret")
+
+    return room, identity_id
+
+
+# --- Room Endpoints ---
+
+
+@app.post("/{ns}/rooms", response_model=RoomInfo)
+def create_room(
+    ns: str,
+    request: CreateRoomRequest | None = None,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Create a new room in a namespace.
+
+    The caller becomes the first member of the room.
+    Requires inbox secret of an identity in the namespace.
+    """
+    require_active_namespace(ns)
+
+    # Verify caller is in namespace
+    created_by = require_inbox_secret_any(ns, x_inbox_secret)
+
+    display_name = request.display_name if request else None
+
+    try:
+        room = db.create_room(ns, created_by, display_name=display_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return RoomInfo(**room)
+
+
+@app.get("/{ns}/rooms", response_model=list[RoomWithMemberInfo])
+def list_my_rooms(
+    ns: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """List rooms that the caller is a member of.
+
+    Returns rooms with membership info (joined_at, last_read_mid).
+    """
+    identity_id = require_inbox_secret_any(ns, x_inbox_secret)
+
+    rooms = db.list_rooms_for_identity(ns, identity_id)
+    return [RoomWithMemberInfo(**r) for r in rooms]
+
+
+@app.get("/{ns}/rooms/{room_id}", response_model=RoomInfo)
+def get_room(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get room details. Requires membership."""
+    room, _ = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    return RoomInfo(**room)
+
+
+@app.delete("/{ns}/rooms/{room_id}")
+def delete_room_endpoint(
+    ns: str,
+    room_id: str,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+):
+    """Delete a room and all its messages/members.
+
+    Requires namespace secret (only namespace owner can delete rooms).
+    """
+    require_namespace_secret(ns, x_namespace_secret)
+
+    room = db.get_room(room_id)
+    if not room or room["ns"] != ns:
+        raise HTTPException(404, "Room not found")
+
+    db.delete_room(room_id)
+    return {"ok": True}
+
+
+@app.get("/{ns}/rooms/{room_id}/members", response_model=list[RoomMemberInfo])
+def list_room_members(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """List members of a room. Requires membership."""
+    room, _ = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    members = db.list_room_members(room_id)
+    return [RoomMemberInfo(**m) for m in members]
+
+
+@app.post("/{ns}/rooms/{room_id}/members", response_model=RoomMemberInfo)
+def add_room_member(
+    ns: str,
+    room_id: str,
+    request: AddRoomMemberRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Add a member to a room.
+
+    Any room member can invite other identities from the same namespace.
+    """
+    room, _ = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    try:
+        member = db.add_room_member(room_id, request.identity_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # Get full member info with metadata
+    member_info = db.get_room_member_info(room_id, request.identity_id)
+    if not member_info:
+        raise HTTPException(500, "Failed to get member info")
+
+    return RoomMemberInfo(**member_info)
+
+
+@app.delete("/{ns}/rooms/{room_id}/members/{identity_id}")
+def remove_room_member(
+    ns: str,
+    room_id: str,
+    identity_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Remove a member from a room.
+
+    Members can remove themselves. Namespace owner can remove anyone.
+    """
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    room = db.get_room(room_id)
+    if not room or room["ns"] != ns:
+        raise HTTPException(404, "Room not found")
+
+    caller_id = derive_id(x_inbox_secret)
+
+    # Verify caller is either the member being removed or a room member
+    if caller_id != identity_id:
+        # Must be a member to remove others
+        if not db.is_room_member(room_id, caller_id):
+            raise HTTPException(403, "Not authorized to remove members")
+
+    if not db.remove_room_member(room_id, identity_id):
+        raise HTTPException(404, "Member not found")
+
+    return {"ok": True}
+
+
+@app.get("/{ns}/rooms/{room_id}/messages")
+async def get_room_messages(
+    ns: str,
+    room_id: str,
+    after: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    wait: Annotated[int, Query(ge=0, le=60)] = 0,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get messages from a room.
+
+    Query parameters:
+    - after: Only return messages after this message ID (for pagination/polling)
+    - limit: Maximum number of messages to return (default: 100, max: 1000)
+    - wait: Long-poll timeout in seconds (0-60). If no messages, wait up to this
+            many seconds for new messages before returning empty response.
+    """
+    import asyncio
+
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    # Long-polling: wait for messages if none exist and wait > 0
+    if wait > 0:
+        poll_interval = 0.5
+        elapsed = 0.0
+
+        while elapsed < wait:
+            if db.has_new_room_messages(room_id, after_mid=after):
+                break
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+    messages = db.get_room_messages(room_id, after_mid=after, limit=limit)
+
+    return {
+        "messages": [RoomMessageInfo.from_db(m).model_dump() for m in messages],
+        "room_id": room_id,
+    }
+
+
+@app.post("/{ns}/rooms/{room_id}/messages", response_model=RoomMessageInfo)
+def send_room_message(
+    ns: str,
+    room_id: str,
+    request: SendRoomMessageRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Send a message to a room. Requires membership."""
+    room, from_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    try:
+        message = db.send_room_message(
+            room_id=room_id,
+            from_id=from_id,
+            body=request.body,
+            content_type=request.content_type,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return RoomMessageInfo.from_db(message)
+
+
+@app.post("/{ns}/rooms/{room_id}/read")
+def update_read_cursor(
+    ns: str,
+    room_id: str,
+    request: UpdateReadCursorRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Update the read cursor for the calling user.
+
+    The cursor tracks the last message the user has read.
+    """
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    result = db.update_room_read_cursor(room_id, identity_id, request.last_read_mid)
+    if not result:
+        raise HTTPException(400, "Failed to update read cursor")
+
+    return {"ok": True, "last_read_mid": request.last_read_mid}
+
+
+@app.get("/{ns}/rooms/{room_id}/unread")
+def get_unread_count(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get the count of unread messages for the calling user."""
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    count = db.get_room_unread_count(room_id, identity_id)
+    return {"unread_count": count, "room_id": room_id}
 
 
 # --- Web App Routes ---

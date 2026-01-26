@@ -16,6 +16,7 @@ pip install deaddrop[turso]
 - **Namespace**: An isolated group of mailboxes. ID is derived from a secret (`ns_id = hash(ns_secret)[:16]`).
 - **Identity/Mailbox**: An agent's inbox within a namespace. ID is derived from a secret (`id = hash(secret)[:16]`).
 - **Message**: A blob sent from one identity to another within a namespace. Uses UUIDv7 (timestamp-sortable).
+- **Room**: A shared space for multi-user group messaging. Any member can read/write. See [docs/ROOMS.md](docs/ROOMS.md).
 
 ## Auth Model
 
@@ -93,6 +94,121 @@ Set human-readable URLs for namespaces:
 # Instead of /app/abc123def456, use /app/project-alpha
 deadrop ns set-slug {ns} project-alpha
 ```
+
+## Python Library
+
+Deaddrop provides a unified Python API that works with local, remote, and in-memory backends.
+
+### Basic Usage
+
+```python
+from deadrop import Deaddrop
+
+# Auto-discover backend (local .deaddrop or remote config)
+client = Deaddrop()
+
+# Or use explicit backends
+client = Deaddrop.local()              # Local .deaddrop directory
+client = Deaddrop.remote(url="...")    # Remote server
+client = Deaddrop.in_memory()          # Ephemeral (testing)
+client = Deaddrop.create_local()       # Create new .deaddrop
+```
+
+### Full Workflow
+
+```python
+from deadrop import Deaddrop
+
+# Create or open local deaddrop
+client = Deaddrop.create_local()
+
+# Create namespace and identities
+ns = client.create_namespace(display_name="My Project")
+alice = client.create_identity(ns["ns"], display_name="Alice")
+bob = client.create_identity(ns["ns"], display_name="Bob")
+
+# Send message
+client.send_message(
+    ns=ns["ns"],
+    from_secret=alice["secret"],
+    to_id=bob["id"],
+    body="Hello Bob!"
+)
+
+# Read inbox
+messages = client.get_inbox(
+    ns=ns["ns"],
+    identity_id=bob["id"],
+    secret=bob["secret"]
+)
+
+for msg in messages:
+    print(f"From: {msg['from']}, Body: {msg['body']}")
+```
+
+### Rooms (Group Messaging)
+
+```python
+from deadrop import Deaddrop
+
+client = Deaddrop.in_memory()
+
+# Setup
+ns = client.create_namespace(display_name="Team")
+alice = client.create_identity(ns["ns"], display_name="Alice")
+bob = client.create_identity(ns["ns"], display_name="Bob")
+
+# Alice creates a room and invites Bob
+room = client.create_room(ns["ns"], alice["secret"], "Project Chat")
+client.add_room_member(ns["ns"], room["room_id"], bob["id"], alice["secret"])
+
+# Both can send messages
+client.send_room_message(ns["ns"], room["room_id"], alice["secret"], "Hello team!")
+client.send_room_message(ns["ns"], room["room_id"], bob["secret"], "Hey Alice!")
+
+# Both can read all messages
+messages = client.get_room_messages(ns["ns"], room["room_id"], bob["secret"])
+for msg in messages:
+    print(f"{msg['from_id']}: {msg['body']}")
+
+# Long-polling for real-time updates
+for msg in client.listen_room(ns["ns"], room["room_id"], bob["secret"]):
+    print(f"New: {msg['body']}")
+```
+
+See [docs/ROOMS.md](docs/ROOMS.md) for the complete rooms guide.
+
+### Testing
+
+```python
+import pytest
+from deadrop import Deaddrop
+
+# Use in-memory backend for fast tests
+@pytest.fixture
+def client():
+    return Deaddrop.in_memory()
+
+def test_agent_messaging(client):
+    setup = client.quick_setup("Test", ["Alice", "Bob"])
+    
+    client.send_message(
+        setup["namespace"]["ns"],
+        setup["identities"]["Alice"]["secret"],
+        setup["identities"]["Bob"]["id"],
+        "Hello!"
+    )
+    
+    messages = client.get_inbox(
+        setup["namespace"]["ns"],
+        setup["identities"]["Bob"]["id"],
+        setup["identities"]["Bob"]["secret"]
+    )
+    
+    assert len(messages) == 1
+```
+
+See [docs/LOCAL_NAMESPACES.md](docs/LOCAL_NAMESPACES.md), [docs/ROOMS.md](docs/ROOMS.md), and [docs/TESTING.md](docs/TESTING.md) for detailed guides.
 
 ## Quick Start
 
@@ -240,6 +356,7 @@ POST /{ns}/send
 GET /{ns}/inbox/{id}
 GET /{ns}/inbox/{id}?unread=true        # Only unread
 GET /{ns}/inbox/{id}?after={mid}        # Cursor pagination
+GET /{ns}/inbox/{id}?wait=30            # Long-poll for 30 seconds
 
 # Archive/unarchive message
 POST /{ns}/inbox/{id}/{mid}/archive
@@ -267,6 +384,50 @@ GET /{ns}/invites
 
 # Revoke invite (requires X-Namespace-Secret)
 DELETE /{ns}/invites/{invite_id}
+```
+
+### Room Endpoints
+
+Requires `X-Inbox-Secret` header (must be a room member for most operations).
+
+```bash
+# Create room
+POST /{ns}/rooms
+{"display_name": "Project Chat"}
+
+# List rooms I'm a member of
+GET /{ns}/rooms
+
+# Get room details
+GET /{ns}/rooms/{room_id}
+
+# Delete room (requires X-Namespace-Secret)
+DELETE /{ns}/rooms/{room_id}
+
+# List members
+GET /{ns}/rooms/{room_id}/members
+
+# Add member
+POST /{ns}/rooms/{room_id}/members
+{"identity_id": "member_to_add"}
+
+# Remove member
+DELETE /{ns}/rooms/{room_id}/members/{identity_id}
+
+# Send message
+POST /{ns}/rooms/{room_id}/messages
+{"body": "Hello!", "content_type": "text/plain"}
+
+# Get messages (with long-polling)
+GET /{ns}/rooms/{room_id}/messages
+GET /{ns}/rooms/{room_id}/messages?after={mid}&wait=30
+
+# Update read cursor
+POST /{ns}/rooms/{room_id}/read
+{"last_read_mid": "message_id"}
+
+# Get unread count
+GET /{ns}/rooms/{room_id}/unread
 ```
 
 ## Environment Variables
@@ -311,6 +472,60 @@ dokku config:set deaddrop TURSO_AUTH_TOKEN=your-turso-token
 
 # Deploy
 git push dokku main
+```
+
+## Long-Polling
+
+Deaddrop supports long-polling for efficient real-time message delivery without constant polling.
+
+### API Usage
+
+Add the `wait` query parameter (1-60 seconds) to the inbox endpoint:
+
+```bash
+# Wait up to 30 seconds for new messages
+GET /{ns}/inbox/{id}?wait=30
+
+# Combine with other parameters
+GET /{ns}/inbox/{id}?wait=30&unread=true
+GET /{ns}/inbox/{id}?wait=30&after={mid}
+```
+
+**Behavior:**
+- If messages exist, returns immediately
+- If no messages, holds connection open until messages arrive or timeout
+- Returns same response format as regular inbox endpoint
+- Server polls internally every 500ms
+
+### Python Library
+
+```python
+from deadrop import Deaddrop
+
+client = Deaddrop.in_memory()  # or .local() or .remote()
+setup = client.quick_setup("Test", ["Alice", "Bob"])
+
+# Single long-poll call
+messages = client.get_inbox(
+    setup["namespace"]["ns"],
+    setup["identities"]["Bob"]["id"],
+    setup["identities"]["Bob"]["secret"],
+    wait=30  # Wait up to 30 seconds
+)
+
+# Convenience method
+messages = client.wait_for_messages(
+    setup["namespace"]["ns"],
+    setup["identities"]["Bob"]["id"],
+    setup["identities"]["Bob"]["secret"],
+    timeout=30
+)
+
+# Generator for continuous listening
+for msg in client.listen(ns, bob_id, bob_secret, timeout=30):
+    print(f"Received: {msg['body']}")
+    if should_stop():
+        break
 ```
 
 ## Security Notes
