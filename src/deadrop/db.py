@@ -43,7 +43,7 @@ from .auth import derive_id, generate_secret, hash_secret
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -268,9 +268,60 @@ def _migrate_001_add_content_type(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
+    """Migration 002: Add rooms tables for group communication."""
+    # Create rooms table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rooms (
+            room_id TEXT PRIMARY KEY,
+            ns TEXT NOT NULL REFERENCES namespaces(ns) ON DELETE CASCADE,
+            display_name TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Create room_members table with per-user read tracking
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS room_members (
+            room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+            identity_id TEXT NOT NULL,
+            ns TEXT NOT NULL,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_read_mid TEXT,
+            PRIMARY KEY (room_id, identity_id),
+            FOREIGN KEY (ns, identity_id) REFERENCES identities(ns, id) ON DELETE CASCADE
+        )
+    """)
+
+    # Create room_messages table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS room_messages (
+            mid TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+            from_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            content_type TEXT DEFAULT 'text/plain',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Create indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rooms_ns ON rooms(ns)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_members_identity ON room_members(ns, identity_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at)"
+    )
+
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
+    (2, "Add rooms tables for group communication", _migrate_002_add_rooms),
 ]
 
 
@@ -366,6 +417,40 @@ SCHEMA_SQL = """
         max_created_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    
+    -- Rooms for group communication
+    CREATE TABLE IF NOT EXISTS rooms (
+        room_id TEXT PRIMARY KEY,
+        ns TEXT NOT NULL REFERENCES namespaces(ns) ON DELETE CASCADE,
+        display_name TEXT,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_rooms_ns ON rooms(ns);
+    
+    CREATE TABLE IF NOT EXISTS room_members (
+        room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+        identity_id TEXT NOT NULL,
+        ns TEXT NOT NULL,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_read_mid TEXT,
+        PRIMARY KEY (room_id, identity_id),
+        FOREIGN KEY (ns, identity_id) REFERENCES identities(ns, id) ON DELETE CASCADE
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_room_members_identity ON room_members(ns, identity_id);
+    
+    CREATE TABLE IF NOT EXISTS room_messages (
+        mid TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+        from_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        content_type TEXT DEFAULT 'text/plain',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at);
 """
 
 
@@ -390,6 +475,9 @@ def reset_db(conn: sqlite3.Connection | None = None):
     """Reset database (for testing)."""
     conn = _get_conn(conn)
     conn.executescript("""
+        DROP TABLE IF EXISTS room_messages;
+        DROP TABLE IF EXISTS room_members;
+        DROP TABLE IF EXISTS rooms;
         DROP TABLE IF EXISTS archive_batches;
         DROP TABLE IF EXISTS invites;
         DROP TABLE IF EXISTS messages;

@@ -27,7 +27,7 @@ class TestSchemaVersionTracking:
         db.record_migration(conn, 1, "Test migration 1")
 
         version = db.get_schema_version(conn)
-        assert version == 1
+        assert version == 1  # We recorded version 1
 
     def test_multiple_migrations_return_max_version(self):
         """get_schema_version returns the highest version number."""
@@ -180,17 +180,20 @@ class TestRunMigrations:
 
         # Should have applied migration 1
         assert 1 in applied
-        assert db.get_schema_version(conn) == 1
+        assert db.get_schema_version(conn) == db.SCHEMA_VERSION
         assert db._column_exists(conn, "messages", "content_type") is True
 
     def test_run_migrations_skips_already_applied(self):
         """run_migrations skips migrations that have already been applied."""
         conn = db.get_connection()
 
-        # Reset and mark migration 1 as already applied
+        # Reset and mark ALL migrations as already applied
         conn.executescript("""
             DROP TABLE IF EXISTS schema_version;
             DROP TABLE IF EXISTS messages;
+            DROP TABLE IF EXISTS rooms;
+            DROP TABLE IF EXISTS room_members;
+            DROP TABLE IF EXISTS room_messages;
             CREATE TABLE messages (
                 mid TEXT PRIMARY KEY,
                 ns TEXT NOT NULL,
@@ -203,13 +206,15 @@ class TestRunMigrations:
         conn.commit()
 
         db._ensure_schema_version_table(conn)
-        db.record_migration(conn, 1, "Already applied")
+        # Mark all migrations as applied
+        for version, description, _ in db.MIGRATIONS:
+            db.record_migration(conn, version, description)
 
         # Run migrations - should apply nothing
         applied = db.run_migrations(conn)
 
         assert applied == []
-        assert db.get_schema_version(conn) == 1
+        assert db.get_schema_version(conn) == db.SCHEMA_VERSION
 
     def test_run_migrations_idempotent(self):
         """Running run_migrations multiple times is safe."""
@@ -236,7 +241,7 @@ class TestRunMigrations:
         # First run applies migration, second run does nothing
         assert 1 in applied1
         assert applied2 == []
-        assert db.get_schema_version(conn) == 1
+        assert db.get_schema_version(conn) == db.SCHEMA_VERSION
 
 
 class TestInitDbWithMigrations:
