@@ -1028,9 +1028,10 @@ def create(
         invite_data = f"{ns}:{identity_id}:{secrets.encrypted_secret_hex}:{secrets.invite_id}"
         invite_code = base64.urlsafe_b64encode(invite_data.encode()).decode()
 
-        # file:// URL with path and invite code
+        # file:// URL with path, invite code, and key in query string
+        # (no fragment - avoids shell comment issues with #)
         abs_path = str(deaddrop_path.absolute())
-        invite_url = f"file://{abs_path}?invite={invite_code}#{secrets.key_base64}"
+        invite_url = f"file://{abs_path}?invite={invite_code}&key={secrets.key_base64}"
 
         print("Local invite created!")
         print(f"  For: {mb.display_name or identity_id}")
@@ -1040,7 +1041,7 @@ def create(
         print(invite_url)
         print()
         print("Recipients can claim with:")
-        print(f"  deadrop invite claim '{invite_url}'")
+        print(f"  deadrop invite claim {invite_url}")
 
     else:
         # Create remote invite (register on server)
@@ -1179,17 +1180,17 @@ def _claim_local_invite(invite_url: str):
 
     parsed = urlparse(invite_url)
     query_params = parse_qs(parsed.query)
-    fragment = parsed.fragment
 
     # Extract path from file:// URL
-    # urlparse puts the path in .path for file:// URLs
     deaddrop_path = Path(unquote(parsed.path))
 
-    # Extract and decode the invite code
+    # Extract invite code and key from query string
     invite_code = query_params.get("invite", [None])[0]
-    if not invite_code or not fragment:
+    key_base64 = query_params.get("key", [None])[0]
+
+    if not invite_code or not key_base64:
         print("Error: Invalid local invite URL format", file=sys.stderr)
-        print("Expected: file:///path/to/.deaddrop?invite=<code>#<key>", file=sys.stderr)
+        print("Expected: file:///path/to/.deaddrop?invite=<code>&key=<key>", file=sys.stderr)
         sys.exit(1)
 
     # Decode the invite code: ns:identity_id:encrypted_secret:invite_id
@@ -1204,11 +1205,11 @@ def _claim_local_invite(invite_url: str):
         print(f"Error: Local deaddrop not found at {deaddrop_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Decrypt the secret using the fragment key
+    # Decrypt the secret
     try:
         mailbox_secret = decrypt_invite_secret(
             encrypted_secret_hex=encrypted_secret,
-            key_base64=fragment,
+            key_base64=key_base64,
             invite_id=invite_id,
         )
     except Exception as e:
@@ -1366,7 +1367,7 @@ def claim(invite_url: str):
         https://deaddrop.example.com/join/abc123#base64key
 
     Local (file://):
-        file:///path/to/.deaddrop?invite=<code>#<key>
+        file:///path/to/.deaddrop?invite=<code>&key=<key>
 
     The credentials will be saved to your local config and you can
     then use the CLI to send/receive messages.
