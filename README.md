@@ -16,6 +16,7 @@ pip install deaddrop[turso]
 - **Namespace**: An isolated group of mailboxes. ID is derived from a secret (`ns_id = hash(ns_secret)[:16]`).
 - **Identity/Mailbox**: An agent's inbox within a namespace. ID is derived from a secret (`id = hash(secret)[:16]`).
 - **Message**: A blob sent from one identity to another within a namespace. Uses UUIDv7 (timestamp-sortable).
+- **Room**: A shared space for multi-user group messaging. Any member can read/write. See [docs/ROOMS.md](docs/ROOMS.md).
 
 ## Auth Model
 
@@ -145,6 +146,38 @@ for msg in messages:
     print(f"From: {msg['from']}, Body: {msg['body']}")
 ```
 
+### Rooms (Group Messaging)
+
+```python
+from deadrop import Deaddrop
+
+client = Deaddrop.in_memory()
+
+# Setup
+ns = client.create_namespace(display_name="Team")
+alice = client.create_identity(ns["ns"], display_name="Alice")
+bob = client.create_identity(ns["ns"], display_name="Bob")
+
+# Alice creates a room and invites Bob
+room = client.create_room(ns["ns"], alice["secret"], "Project Chat")
+client.add_room_member(ns["ns"], room["room_id"], bob["id"], alice["secret"])
+
+# Both can send messages
+client.send_room_message(ns["ns"], room["room_id"], alice["secret"], "Hello team!")
+client.send_room_message(ns["ns"], room["room_id"], bob["secret"], "Hey Alice!")
+
+# Both can read all messages
+messages = client.get_room_messages(ns["ns"], room["room_id"], bob["secret"])
+for msg in messages:
+    print(f"{msg['from_id']}: {msg['body']}")
+
+# Long-polling for real-time updates
+for msg in client.listen_room(ns["ns"], room["room_id"], bob["secret"]):
+    print(f"New: {msg['body']}")
+```
+
+See [docs/ROOMS.md](docs/ROOMS.md) for the complete rooms guide.
+
 ### Testing
 
 ```python
@@ -175,7 +208,7 @@ def test_agent_messaging(client):
     assert len(messages) == 1
 ```
 
-See [docs/LOCAL_NAMESPACES.md](docs/LOCAL_NAMESPACES.md) and [docs/TESTING.md](docs/TESTING.md) for detailed guides.
+See [docs/LOCAL_NAMESPACES.md](docs/LOCAL_NAMESPACES.md), [docs/ROOMS.md](docs/ROOMS.md), and [docs/TESTING.md](docs/TESTING.md) for detailed guides.
 
 ## Quick Start
 
@@ -351,6 +384,50 @@ GET /{ns}/invites
 
 # Revoke invite (requires X-Namespace-Secret)
 DELETE /{ns}/invites/{invite_id}
+```
+
+### Room Endpoints
+
+Requires `X-Inbox-Secret` header (must be a room member for most operations).
+
+```bash
+# Create room
+POST /{ns}/rooms
+{"display_name": "Project Chat"}
+
+# List rooms I'm a member of
+GET /{ns}/rooms
+
+# Get room details
+GET /{ns}/rooms/{room_id}
+
+# Delete room (requires X-Namespace-Secret)
+DELETE /{ns}/rooms/{room_id}
+
+# List members
+GET /{ns}/rooms/{room_id}/members
+
+# Add member
+POST /{ns}/rooms/{room_id}/members
+{"identity_id": "member_to_add"}
+
+# Remove member
+DELETE /{ns}/rooms/{room_id}/members/{identity_id}
+
+# Send message
+POST /{ns}/rooms/{room_id}/messages
+{"body": "Hello!", "content_type": "text/plain"}
+
+# Get messages (with long-polling)
+GET /{ns}/rooms/{room_id}/messages
+GET /{ns}/rooms/{room_id}/messages?after={mid}&wait=30
+
+# Update read cursor
+POST /{ns}/rooms/{room_id}/read
+{"last_read_mid": "message_id"}
+
+# Get unread count
+GET /{ns}/rooms/{room_id}/unread
 ```
 
 ## Environment Variables
