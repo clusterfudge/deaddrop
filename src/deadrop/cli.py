@@ -109,6 +109,226 @@ def print_json(data):
     print(json.dumps(data, indent=2, default=str))
 
 
+# --- Claim Helpers (needed early for top-level command) ---
+
+
+def _claim_local_invite(invite_url: str, key_override: str | None = None):
+    """Claim a local file:// invite URL."""
+    import base64
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    from .crypto import decrypt_invite_secret
+
+    parsed = urlparse(invite_url)
+    query_params = parse_qs(parsed.query)
+    fragment = parsed.fragment
+
+    # Extract path from file:// URL
+    deaddrop_path = Path(unquote(parsed.path))
+
+    # Extract invite code
+    invite_code = query_params.get("invite", [None])[0]
+    if not invite_code:
+        print("Error: Invalid local invite URL format", file=sys.stderr)
+        print("Expected: file:///path/to/.deaddrop?invite=<code>#<key>", file=sys.stderr)
+        sys.exit(1)
+
+    # Get key from fragment, override, or prompt
+    key_base64 = key_override or fragment
+    if not key_base64:
+        print("The invite URL appears to be missing the key fragment (after #).")
+        print("This can happen if the URL wasn't quoted in the shell.")
+        print()
+        key_base64 = input("Paste the full invite URL again, or just the key: ").strip()
+        # If they pasted the full URL, extract the fragment
+        if key_base64.startswith("file://") and "#" in key_base64:
+            key_base64 = key_base64.split("#", 1)[1]
+
+    if not key_base64:
+        print("Error: No key provided", file=sys.stderr)
+        sys.exit(1)
+
+    # Decode the invite code: ns:identity_id:encrypted_secret:invite_id
+    try:
+        invite_data = base64.urlsafe_b64decode(invite_code).decode()
+        ns, identity_id, encrypted_secret, invite_id = invite_data.split(":")
+    except Exception:
+        print("Error: Invalid invite code", file=sys.stderr)
+        sys.exit(1)
+
+    if not deaddrop_path.exists():
+        print(f"Error: Local deaddrop not found at {deaddrop_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Decrypt the secret
+    try:
+        mailbox_secret = decrypt_invite_secret(
+            encrypted_secret_hex=encrypted_secret,
+            key_base64=key_base64,
+            invite_id=invite_id,
+        )
+    except Exception as e:
+        print(f"Error: Failed to decrypt credentials: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Claiming local invite...")
+    print(f"  Path: {deaddrop_path}")
+    print(f"  Namespace: {ns}")
+    print(f"  Identity: {identity_id}")
+
+    # Save to local config with local_path in namespace metadata
+    ns_cfg = NamespaceConfig.load(ns)
+    if ns_cfg is None:
+        ns_cfg = NamespaceConfig(
+            ns=ns,
+            secret="",  # We don't have namespace-level access
+            metadata={"local_path": str(deaddrop_path)},
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    # Add the mailbox
+    ns_cfg.add_mailbox(
+        id=identity_id,
+        secret=mailbox_secret,
+    )
+    ns_cfg.save()
+
+    print()
+    print("✓ Local invite claimed successfully!")
+    print(f"  Credentials saved to: {ns_cfg.get_path()}")
+    print()
+    print("You can now use the CLI to interact with this mailbox:")
+    print(f"  deadrop message inbox {ns}")
+
+
+def _claim_remote_invite(invite_url: str, key_override: str | None = None):
+    """Claim a remote HTTP/HTTPS invite URL."""
+    import re
+    from urllib.parse import urlparse
+
+    from .crypto import decrypt_invite_secret
+
+    cfg = get_config()
+
+    # Parse the invite URL
+    if invite_url.startswith("http://") or invite_url.startswith("https://"):
+        parsed = urlparse(invite_url)
+        path = parsed.path
+        fragment = parsed.fragment
+        server_url = f"{parsed.scheme}://{parsed.netloc}"
+    elif invite_url.startswith("/"):
+        # Just a path like /join/abc123#key
+        if "#" in invite_url:
+            path, fragment = invite_url.split("#", 1)
+        else:
+            path = invite_url
+            fragment = ""
+        server_url = cfg.url
+    else:
+        print("Error: Invalid invite URL format", file=sys.stderr)
+        print("Expected: https://server/join/{id}#key", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract invite_id from path
+    match = re.match(r"/join/([a-f0-9]+)", path)
+    if not match:
+        print("Error: Could not parse invite ID from URL", file=sys.stderr)
+        sys.exit(1)
+
+    invite_id = match.group(1)
+
+    # Get key from fragment, override, or prompt
+    key_base64 = key_override or fragment
+    if not key_base64:
+        print("The invite URL appears to be missing the key fragment (after #).")
+        print("This can happen if the URL wasn't quoted in the shell.")
+        print()
+        key_base64 = input("Paste the full invite URL again, or just the key: ").strip()
+        # If they pasted the full URL, extract the fragment
+        if "#" in key_base64:
+            key_base64 = key_base64.split("#", 1)[1]
+
+    if not key_base64:
+        print("Error: No key provided", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Claiming invite from {server_url}...")
+
+    # Get invite info first
+    info_response = httpx.get(f"{server_url}/api/invites/{invite_id}/info", timeout=30.0)
+    if info_response.status_code == 404:
+        print("Error: Invite not found", file=sys.stderr)
+        sys.exit(1)
+    elif info_response.status_code == 410:
+        print("Error: Invite has already been claimed or expired", file=sys.stderr)
+        sys.exit(1)
+    elif info_response.status_code >= 400:
+        print(f"Error: {info_response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    info = info_response.json()
+    print(f"  Namespace: {info.get('namespace_display_name') or info['ns']}")
+    print(f"  Identity: {info.get('identity_display_name') or info['identity_id']}")
+
+    # Claim the invite
+    claim_response = httpx.post(f"{server_url}/api/invites/{invite_id}/claim", timeout=30.0)
+    if claim_response.status_code == 410:
+        print("Error: Invite has already been claimed or expired", file=sys.stderr)
+        sys.exit(1)
+    elif claim_response.status_code >= 400:
+        print(f"Error: {claim_response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    claim_data = claim_response.json()
+
+    # Decrypt the secret
+    try:
+        mailbox_secret = decrypt_invite_secret(
+            encrypted_secret_hex=claim_data["encrypted_secret"],
+            key_base64=key_base64,
+            invite_id=invite_id,
+        )
+    except Exception as e:
+        print(f"Error: Failed to decrypt credentials: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Save to local config
+    ns = claim_data["ns"]
+    identity_id = claim_data["identity_id"]
+
+    ns_cfg = NamespaceConfig.load(ns)
+    if ns_cfg is None:
+        ns_cfg = NamespaceConfig(
+            ns=ns,
+            secret="",
+            display_name=claim_data.get("namespace_display_name"),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    ns_cfg.add_mailbox(
+        id=identity_id,
+        secret=mailbox_secret,
+        display_name=claim_data.get("identity_display_name") or claim_data.get("display_name"),
+    )
+    ns_cfg.save()
+
+    print()
+    print("✓ Invite claimed successfully!")
+    print(f"  Credentials saved to: {ns_cfg.get_path()}")
+    print()
+    print("You can now use the CLI to interact with this mailbox:")
+    print(f"  deadrop message inbox {ns}")
+    print(f'  deadrop message send {ns} <recipient_id> "Hello!"')
+
+
+def _do_claim(invite_url: str):
+    """Claim an invite URL (dispatches to local or remote handler)."""
+    if invite_url.startswith("file://"):
+        _claim_local_invite(invite_url)
+    else:
+        _claim_remote_invite(invite_url)
+
+
 # --- Init Command ---
 
 
@@ -137,13 +357,19 @@ def config():
     print(f"Server URL: {cfg.url}")
     print(f"Bearer token: {'(set)' if cfg.bearer_token else '(not set)'}")
 
-    namespaces = NamespaceConfig.list_all()
-    print(f"\nLocal namespaces: {len(namespaces)}")
-    for ns in namespaces:
-        ns_cfg = NamespaceConfig.load(ns)
-        if ns_cfg:
-            name = ns_cfg.display_name or "(unnamed)"
-            print(f"  {ns}: {name} ({len(ns_cfg.mailboxes)} mailboxes)")
+
+@app.command
+def claim(invite_url: str):
+    """Claim an invite link and save credentials locally.
+
+    Examples:
+        deadrop claim 'https://deaddrop.example.com/join/abc123#key'
+        deadrop claim 'file:///path/to/.deaddrop?invite=code#key'
+
+    Tip: Quote the URL to preserve the # fragment in your shell.
+    If the fragment is stripped, you'll be prompted to re-enter it.
+    """
+    _do_claim(invite_url)
 
 
 # --- Namespace Commands ---
@@ -1028,10 +1254,9 @@ def create(
         invite_data = f"{ns}:{identity_id}:{secrets.encrypted_secret_hex}:{secrets.invite_id}"
         invite_code = base64.urlsafe_b64encode(invite_data.encode()).decode()
 
-        # file:// URL with path, invite code, and key in query string
-        # (no fragment - avoids shell comment issues with #)
+        # file:// URL with fragment for key (consistent with remote format)
         abs_path = str(deaddrop_path.absolute())
-        invite_url = f"file://{abs_path}?invite={invite_code}&key={secrets.key_base64}"
+        invite_url = f"file://{abs_path}?invite={invite_code}#{secrets.key_base64}"
 
         print("Local invite created!")
         print(f"  For: {mb.display_name or identity_id}")
@@ -1040,8 +1265,10 @@ def create(
         print("Share this link:")
         print(invite_url)
         print()
-        print("Recipients can claim with:")
-        print(f"  deadrop invite claim {invite_url}")
+        print("Claim with:")
+        print(f"  deadrop claim '<url>'")
+        print()
+        print("Note: Quote the URL to preserve the # fragment in your shell.")
 
     else:
         # Create remote invite (register on server)
@@ -1169,214 +1396,6 @@ def revoke(ns: str, invite_id: str):
         sys.exit(1)
 
     print(f"Invite {full_id[:12]}... revoked.")
-
-
-def _claim_local_invite(invite_url: str):
-    """Claim a local file:// invite URL."""
-    import base64
-    from urllib.parse import parse_qs, unquote, urlparse
-
-    from .crypto import decrypt_invite_secret
-
-    parsed = urlparse(invite_url)
-    query_params = parse_qs(parsed.query)
-
-    # Extract path from file:// URL
-    deaddrop_path = Path(unquote(parsed.path))
-
-    # Extract invite code and key from query string
-    invite_code = query_params.get("invite", [None])[0]
-    key_base64 = query_params.get("key", [None])[0]
-
-    if not invite_code or not key_base64:
-        print("Error: Invalid local invite URL format", file=sys.stderr)
-        print("Expected: file:///path/to/.deaddrop?invite=<code>&key=<key>", file=sys.stderr)
-        sys.exit(1)
-
-    # Decode the invite code: ns:identity_id:encrypted_secret:invite_id
-    try:
-        invite_data = base64.urlsafe_b64decode(invite_code).decode()
-        ns, identity_id, encrypted_secret, invite_id = invite_data.split(":")
-    except Exception:
-        print("Error: Invalid invite code", file=sys.stderr)
-        sys.exit(1)
-
-    if not deaddrop_path.exists():
-        print(f"Error: Local deaddrop not found at {deaddrop_path}", file=sys.stderr)
-        sys.exit(1)
-
-    # Decrypt the secret
-    try:
-        mailbox_secret = decrypt_invite_secret(
-            encrypted_secret_hex=encrypted_secret,
-            key_base64=key_base64,
-            invite_id=invite_id,
-        )
-    except Exception as e:
-        print(f"Error: Failed to decrypt credentials: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Claiming local invite...")
-    print(f"  Path: {deaddrop_path}")
-    print(f"  Namespace: {ns}")
-    print(f"  Identity: {identity_id}")
-
-    # Save to local config with local_path in namespace metadata
-    ns_cfg = NamespaceConfig.load(ns)
-    if ns_cfg is None:
-        ns_cfg = NamespaceConfig(
-            ns=ns,
-            secret="",  # We don't have namespace-level access
-            metadata={"local_path": str(deaddrop_path)},
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-
-    # Add the mailbox
-    ns_cfg.add_mailbox(
-        id=identity_id,
-        secret=mailbox_secret,
-    )
-    ns_cfg.save()
-
-    print()
-    print("✓ Local invite claimed successfully!")
-    print(f"  Credentials saved to: {ns_cfg.get_path()}")
-    print()
-    print("You can now use the CLI to interact with this mailbox:")
-    print(f"  deadrop message inbox {ns}")
-
-
-def _claim_remote_invite(invite_url: str):
-    """Claim a remote HTTP/HTTPS invite URL."""
-    import re
-    from urllib.parse import urlparse
-
-    from .crypto import decrypt_invite_secret
-
-    cfg = get_config()
-
-    # Parse the invite URL
-    if invite_url.startswith("http://") or invite_url.startswith("https://"):
-        parsed = urlparse(invite_url)
-        path = parsed.path
-        fragment = parsed.fragment
-        server_url = f"{parsed.scheme}://{parsed.netloc}"
-    elif invite_url.startswith("/"):
-        # Just a path like /join/abc123#key
-        if "#" in invite_url:
-            path, fragment = invite_url.split("#", 1)
-        else:
-            print("Error: Invite URL must include the key fragment (#...)", file=sys.stderr)
-            sys.exit(1)
-        server_url = cfg.url
-    else:
-        print("Error: Invalid invite URL format", file=sys.stderr)
-        print("Expected: https://server/join/{id}#key or /join/{id}#key", file=sys.stderr)
-        sys.exit(1)
-
-    # Extract invite_id from path
-    match = re.match(r"/join/([a-f0-9]+)", path)
-    if not match:
-        print("Error: Could not parse invite ID from URL", file=sys.stderr)
-        sys.exit(1)
-
-    assert match is not None
-    invite_id = match.group(1)
-    key_base64 = fragment
-
-    if not key_base64:
-        print("Error: Invite URL must include the key fragment (#...)", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Claiming invite from {server_url}...")
-
-    # Get invite info first
-    info_response = httpx.get(f"{server_url}/api/invites/{invite_id}/info", timeout=30.0)
-    if info_response.status_code == 404:
-        print("Error: Invite not found", file=sys.stderr)
-        sys.exit(1)
-    elif info_response.status_code == 410:
-        print("Error: Invite has already been claimed or expired", file=sys.stderr)
-        sys.exit(1)
-    elif info_response.status_code >= 400:
-        print(f"Error: {info_response.text}", file=sys.stderr)
-        sys.exit(1)
-
-    info = info_response.json()
-    print(f"  Namespace: {info.get('namespace_display_name') or info['ns']}")
-    print(f"  Identity: {info.get('identity_display_name') or info['identity_id']}")
-
-    # Claim the invite
-    claim_response = httpx.post(f"{server_url}/api/invites/{invite_id}/claim", timeout=30.0)
-    if claim_response.status_code == 410:
-        print("Error: Invite has already been claimed or expired", file=sys.stderr)
-        sys.exit(1)
-    elif claim_response.status_code >= 400:
-        print(f"Error: {claim_response.text}", file=sys.stderr)
-        sys.exit(1)
-
-    claim_data = claim_response.json()
-
-    # Decrypt the secret
-    try:
-        mailbox_secret = decrypt_invite_secret(
-            encrypted_secret_hex=claim_data["encrypted_secret"],
-            key_base64=key_base64,
-            invite_id=invite_id,
-        )
-    except Exception as e:
-        print(f"Error: Failed to decrypt credentials: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Save to local config
-    ns = claim_data["ns"]
-    identity_id = claim_data["identity_id"]
-
-    ns_cfg = NamespaceConfig.load(ns)
-    if ns_cfg is None:
-        ns_cfg = NamespaceConfig(
-            ns=ns,
-            secret="",
-            display_name=claim_data.get("namespace_display_name"),
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-
-    ns_cfg.add_mailbox(
-        id=identity_id,
-        secret=mailbox_secret,
-        display_name=claim_data.get("identity_display_name") or claim_data.get("display_name"),
-    )
-    ns_cfg.save()
-
-    print()
-    print("✓ Invite claimed successfully!")
-    print(f"  Credentials saved to: {ns_cfg.get_path()}")
-    print()
-    print("You can now use the CLI to interact with this mailbox:")
-    print(f"  deadrop message inbox {ns}")
-    print(f'  deadrop message send {ns} <recipient_id> "Hello!"')
-
-
-@invite_app.command
-def claim(invite_url: str):
-    """Claim an invite link and save the credentials locally.
-
-    Accepts invite URLs in two formats:
-
-    Remote (HTTPS):
-        https://deaddrop.example.com/join/abc123#base64key
-
-    Local (file://):
-        file:///path/to/.deaddrop?invite=<code>&key=<key>
-
-    The credentials will be saved to your local config and you can
-    then use the CLI to send/receive messages.
-    """
-    # Dispatch to appropriate handler based on URL scheme
-    if invite_url.startswith("file://"):
-        _claim_local_invite(invite_url)
-    else:
-        _claim_remote_invite(invite_url)
 
 
 # --- Source Management Commands ---
