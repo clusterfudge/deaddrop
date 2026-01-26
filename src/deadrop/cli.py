@@ -26,6 +26,7 @@ import httpx
 from .config import (
     GlobalConfig,
     NamespaceConfig,
+    Source,
     get_config_dir,
     init_wizard,
 )
@@ -41,8 +42,8 @@ identity_app = cyclopts.App(name="identity", help="Identity (mailbox) management
 message_app = cyclopts.App(name="message", help="Message operations (for testing)")
 jobs_app = cyclopts.App(name="jobs", help="Scheduled job operations")
 archive_app = cyclopts.App(name="archive", help="Archive and rehydration operations")
-
 invite_app = cyclopts.App(name="invite", help="Invite management for web users")
+source_app = cyclopts.App(name="source", help="Multi-source configuration management")
 
 app.command(ns_app)
 app.command(identity_app)
@@ -50,6 +51,7 @@ app.command(message_app)
 app.command(jobs_app)
 app.command(archive_app)
 app.command(invite_app)
+app.command(source_app)
 
 
 def get_config() -> GlobalConfig:
@@ -1418,6 +1420,142 @@ def claim(invite_url: str):
         _claim_local_invite(invite_url)
     else:
         _claim_remote_invite(invite_url)
+
+
+# --- Source Management Commands ---
+
+
+@source_app.command
+def source_list():
+    """List configured sources.
+
+    Shows all remote servers and local .deaddrop paths that are configured.
+    """
+    cfg = get_config()
+
+    if not cfg.sources:
+        print("No sources configured.")
+        print()
+        print("Add a remote source:")
+        print("  deadrop source add myserver --remote https://deaddrop.example.com")
+        print()
+        print("Add a local source:")
+        print("  deadrop source add local-dev --local /path/to/.deaddrop")
+        return
+
+    print("Configured sources:")
+    for source in cfg.sources:
+        default_marker = " (default)" if source.name == cfg.default_source else ""
+        if source.type == "remote":
+            print(f"  {source.name}: remote @ {source.url}{default_marker}")
+        else:
+            print(f"  {source.name}: local @ {source.path}{default_marker}")
+
+
+@source_app.command
+def add(
+    name: str,
+    *,
+    remote: str | None = None,
+    local: str | None = None,
+    bearer_token: str | None = None,
+    set_default: bool = False,
+):
+    """Add a new source.
+
+    Examples:
+        deadrop source add work --remote https://work.deaddrop.io
+        deadrop source add local-dev --local /path/to/.deaddrop
+        deadrop source add prod --remote https://prod.io --bearer-token xxx --set-default
+
+    --remote: URL for remote server
+    --local: Path to local .deaddrop directory
+    --bearer-token: Bearer token for admin auth (remote only)
+    --set-default: Make this the default source
+    """
+    if remote and local:
+        print("Error: Specify either --remote or --local, not both.", file=sys.stderr)
+        sys.exit(1)
+
+    if not remote and not local:
+        print("Error: Must specify --remote <url> or --local <path>.", file=sys.stderr)
+        sys.exit(1)
+
+    cfg = get_config()
+
+    if remote:
+        source = Source(
+            name=name,
+            type="remote",
+            url=remote,
+            bearer_token=bearer_token,
+        )
+    else:
+        # Validate local path exists
+        local_path = Path(local)
+        if not local_path.exists():
+            print(f"Warning: Path does not exist yet: {local}", file=sys.stderr)
+        source = Source(
+            name=name,
+            type="local",
+            path=str(local_path.absolute()),
+        )
+
+    cfg.add_source(source)
+
+    if set_default:
+        cfg.default_source = name
+
+    cfg.save()
+
+    print(f"Source '{name}' added.")
+    if set_default:
+        print(f"Set as default source.")
+
+
+@source_app.command
+def remove(name: str):
+    """Remove a source by name."""
+    cfg = get_config()
+
+    if not cfg.remove_source(name):
+        print(f"Error: Source '{name}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    cfg.save()
+    print(f"Source '{name}' removed.")
+
+
+@source_app.command
+def default(name: str | None = None):
+    """Set or show the default source.
+
+    Without arguments, shows the current default.
+    With a name argument, sets that source as default.
+    """
+    cfg = get_config()
+
+    if name is None:
+        if cfg.default_source:
+            source = cfg.get_source(cfg.default_source)
+            if source:
+                loc = source.url if source.type == "remote" else source.path
+                print(f"Default source: {cfg.default_source} ({source.type} @ {loc})")
+            else:
+                print(f"Default source: {cfg.default_source} (not found in sources)")
+        else:
+            print("No default source set.")
+            print("Set one with: deadrop source default <name>")
+        return
+
+    if not cfg.get_source(name):
+        print(f"Error: Source '{name}' not found.", file=sys.stderr)
+        print("Add it first with: deadrop source add", file=sys.stderr)
+        sys.exit(1)
+
+    cfg.default_source = name
+    cfg.save()
+    print(f"Default source set to '{name}'.")
 
 
 # --- Server Command ---

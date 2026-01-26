@@ -1,15 +1,20 @@
 """Configuration management for deadrop CLI.
 
 Manages configuration files in ~/.config/deadrop/:
-- config.yaml: Global config (URL, bearer token)
+- config.yaml: Global config (URL, bearer token, sources)
 - namespaces/{ns_hash}.yaml: Per-namespace config with mailbox credentials
+
+Multi-source support:
+- Sources define remote servers and local .deaddrop paths
+- Each source has a name, type (remote/local), and connection info
+- Commands accept --source to specify which source to use
 """
 
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -42,23 +47,75 @@ DEFAULT_SERVER_URL = "https://deaddrop.dokku.heare.io"
 
 
 @dataclass
+class Source:
+    """A deaddrop source (remote server or local directory)."""
+
+    name: str
+    type: Literal["remote", "local"]
+    url: str | None = None  # For remote sources
+    path: str | None = None  # For local sources
+    bearer_token: str | None = None  # For remote sources
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for YAML serialization."""
+        data: dict[str, Any] = {
+            "name": self.name,
+            "type": self.type,
+        }
+        if self.type == "remote":
+            data["url"] = self.url
+            if self.bearer_token:
+                data["bearer_token"] = self.bearer_token
+        else:
+            data["path"] = self.path
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Source":
+        """Create from dictionary."""
+        return cls(
+            name=data["name"],
+            type=data["type"],
+            url=data.get("url"),
+            path=data.get("path"),
+            bearer_token=data.get("bearer_token"),
+        )
+
+    def get_client(self):
+        """Get a Deaddrop client for this source."""
+        from .client import Deaddrop
+
+        if self.type == "remote":
+            return Deaddrop.remote(url=self.url, bearer_token=self.bearer_token)
+        else:
+            return Deaddrop.local(path=self.path)
+
+
+@dataclass
 class GlobalConfig:
     """Global CLI configuration."""
 
     url: str = DEFAULT_SERVER_URL
     bearer_token: str | None = None
+    sources: list[Source] = field(default_factory=list)
+    default_source: str | None = None
 
     def save(self) -> None:
         """Save config to file."""
         ensure_config_dir()
         path = get_global_config_path()
 
-        data = {"url": self.url}
+        data: dict[str, Any] = {"url": self.url}
         if self.bearer_token:
             data["bearer_token"] = self.bearer_token
 
+        if self.sources:
+            data["sources"] = [s.to_dict() for s in self.sources]
+        if self.default_source:
+            data["default_source"] = self.default_source
+
         with open(path, "w") as f:
-            yaml.safe_dump(data, f, default_flow_style=False)
+            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
 
     @classmethod
     def load(cls) -> "GlobalConfig":
@@ -71,15 +128,47 @@ class GlobalConfig:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
 
+        sources = []
+        for s_data in data.get("sources", []):
+            sources.append(Source.from_dict(s_data))
+
         return cls(
             url=data.get("url", DEFAULT_SERVER_URL),
             bearer_token=data.get("bearer_token"),
+            sources=sources,
+            default_source=data.get("default_source"),
         )
 
     @classmethod
     def exists(cls) -> bool:
         """Check if config file exists."""
         return get_global_config_path().exists()
+
+    def get_source(self, name: str) -> Source | None:
+        """Get a source by name."""
+        for source in self.sources:
+            if source.name == name:
+                return source
+        return None
+
+    def add_source(self, source: Source) -> None:
+        """Add a source, replacing if name exists."""
+        self.sources = [s for s in self.sources if s.name != source.name]
+        self.sources.append(source)
+
+    def remove_source(self, name: str) -> bool:
+        """Remove a source by name. Returns True if found."""
+        original_len = len(self.sources)
+        self.sources = [s for s in self.sources if s.name != name]
+        if self.default_source == name:
+            self.default_source = None
+        return len(self.sources) < original_len
+
+    def get_default_source(self) -> Source | None:
+        """Get the default source, if set and exists."""
+        if not self.default_source:
+            return None
+        return self.get_source(self.default_source)
 
 
 @dataclass
