@@ -1061,6 +1061,115 @@ def list_invites(ns: str, *, include_claimed: bool = False):
 
 
 @invite_app.command
+def create_local(ns: str, identity_id: str, *, path: str | None = None):
+    """Create a shareable invite link for a local mailbox.
+
+    Creates a deadrop:// URL that can be shared with others to give them
+    access to a mailbox in a local .deaddrop directory.
+
+    The invite link contains encrypted credentials - the decryption key
+    is in the URL fragment and never stored anywhere.
+
+    --path: Path to .deaddrop directory (default: auto-discover)
+    """
+    from .crypto import create_invite_secrets
+
+    # Find the local .deaddrop
+    if path:
+        deaddrop_path = Path(path)
+    else:
+        deaddrop_path = find_deaddrop_dir()
+
+    if not deaddrop_path or not deaddrop_path.exists():
+        print("Error: No local .deaddrop directory found.", file=sys.stderr)
+        print("Use --path to specify the location, or create one with:", file=sys.stderr)
+        print("  deadrop ns create --local", file=sys.stderr)
+        sys.exit(1)
+
+    # Load the local backend
+    from .client import Deaddrop
+
+    client = Deaddrop.local(path=deaddrop_path)
+
+    # Get the identity from local storage
+    identity = client.get_identity(ns, identity_id)
+    if not identity:
+        print(f"Error: Identity {identity_id} not found in namespace {ns}", file=sys.stderr)
+        client.close()
+        sys.exit(1)
+
+    # We need the secret - check if it's stored in local config
+    from .backends import LocalBackend
+
+    backend = client._backend
+    if not isinstance(backend, LocalBackend):
+        print("Error: Not a local backend", file=sys.stderr)
+        client.close()
+        sys.exit(1)
+
+    # Get identity secret from local config
+    local_config = backend.config
+    ns_data = local_config.namespaces.get(ns)
+
+    # The secret is derived - we need to look it up differently
+    # For local backends, we need to query the database
+    from . import db
+
+    # Get connection from backend and query for the secret
+    # Note: In a real implementation, we'd need to store/retrieve secrets differently
+    # For now, we'll require the user to have the secret or we can't create an invite
+
+    print(
+        "Note: Local invite generation requires the identity secret to be available.",
+        file=sys.stderr,
+    )
+    print(
+        "For local namespaces, use 'deadrop identity export' to share credentials directly.",
+        file=sys.stderr,
+    )
+
+    # Alternative: Create invite from namespace config if available
+    ns_cfg = NamespaceConfig.load(ns)
+    if ns_cfg and identity_id in ns_cfg.mailboxes:
+        mb = ns_cfg.mailboxes[identity_id]
+        mailbox_secret = mb.secret
+    else:
+        print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+        print("Add it first with 'deadrop identity create' or import credentials.", file=sys.stderr)
+        client.close()
+        sys.exit(1)
+
+    # Create the cryptographic secrets
+    secrets = create_invite_secrets(mailbox_secret)
+
+    # Build the local invite URL
+    from urllib.parse import urlencode
+
+    params = {
+        "path": str(deaddrop_path.absolute()),
+        "ns": ns,
+        "id": identity_id,
+        "secret_enc": secrets.encrypted_secret_hex,
+        "invite_id": secrets.invite_id,
+    }
+
+    invite_url = f"deadrop://local/invite?{urlencode(params)}#{secrets.key_base64}"
+
+    client.close()
+
+    print("Local invite created!")
+    print(f"  Namespace: {ns}")
+    print(f"  Identity: {identity_id}")
+    print(f"  Path: {deaddrop_path}")
+    print()
+    print("Share this link:")
+    print(invite_url)
+    print()
+    print("Recipients can claim with:")
+    print(f"  deadrop invite claim '{invite_url}'")
+
+
+@invite_app.command
 def revoke(ns: str, invite_id: str):
     """Revoke (delete) an invite.
 
@@ -1105,19 +1214,80 @@ def revoke(ns: str, invite_id: str):
     print(f"Invite {full_id[:12]}... revoked.")
 
 
-@invite_app.command
-def claim(invite_url: str):
-    """Claim an invite link and save the credentials locally.
+def _claim_local_invite(invite_url: str):
+    """Claim a local deadrop:// invite URL."""
+    import base64
+    from urllib.parse import parse_qs, urlparse
 
-    Accepts a full invite URL like:
-    https://deaddrop.example.com/join/abc123#base64key
+    from .crypto import decrypt_invite_secret
 
-    Or just the path with fragment:
-    /join/abc123#base64key
+    parsed = urlparse(invite_url)
+    query_params = parse_qs(parsed.query)
+    fragment = parsed.fragment
 
-    The credentials will be saved to your local config and you can
-    then use the CLI to send/receive messages.
-    """
+    # Extract parameters
+    path = query_params.get("path", [None])[0]
+    ns = query_params.get("ns", [None])[0]
+    identity_id = query_params.get("id", [None])[0]
+    encrypted_secret = query_params.get("secret_enc", [None])[0]
+    invite_id = query_params.get("invite_id", [None])[0]
+
+    if not all([path, ns, identity_id, encrypted_secret, fragment]):
+        print("Error: Invalid local invite URL format", file=sys.stderr)
+        print(
+            "Expected: deadrop://local/invite?path=...&ns=...&id=...&secret_enc=...&invite_id=...#key",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    deaddrop_path = Path(path)
+    if not deaddrop_path.exists():
+        print(f"Error: Local deaddrop not found at {path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Decrypt the secret using the fragment key
+    try:
+        mailbox_secret = decrypt_invite_secret(
+            encrypted_secret_hex=encrypted_secret,
+            key_base64=fragment,
+            invite_id=invite_id,
+        )
+    except Exception as e:
+        print(f"Error: Failed to decrypt credentials: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Claiming local invite...")
+    print(f"  Path: {path}")
+    print(f"  Namespace: {ns}")
+    print(f"  Identity: {identity_id}")
+
+    # Save to local config
+    ns_cfg = NamespaceConfig.load(ns)
+    if ns_cfg is None:
+        ns_cfg = NamespaceConfig(
+            ns=ns,
+            secret="",  # We don't have namespace-level access
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    # Add the mailbox with a note about the local path
+    ns_cfg.add_mailbox(
+        id=identity_id,
+        secret=mailbox_secret,
+        metadata={"local_path": str(deaddrop_path)},
+    )
+    ns_cfg.save()
+
+    print()
+    print("✓ Local invite claimed successfully!")
+    print(f"  Credentials saved to: {ns_cfg.get_path()}")
+    print()
+    print("You can now use the CLI to interact with this mailbox:")
+    print(f"  deadrop message inbox {ns}")
+
+
+def _claim_remote_invite(invite_url: str):
+    """Claim a remote HTTP/HTTPS invite URL."""
     import re
     from urllib.parse import urlparse
 
@@ -1126,12 +1296,10 @@ def claim(invite_url: str):
     cfg = get_config()
 
     # Parse the invite URL
-    # Handle full URLs or just paths
     if invite_url.startswith("http://") or invite_url.startswith("https://"):
         parsed = urlparse(invite_url)
         path = parsed.path
         fragment = parsed.fragment
-        # Use the URL's host as the server if different from config
         server_url = f"{parsed.scheme}://{parsed.netloc}"
     elif invite_url.startswith("/"):
         # Just a path like /join/abc123#key
@@ -1152,7 +1320,7 @@ def claim(invite_url: str):
         print("Error: Could not parse invite ID from URL", file=sys.stderr)
         sys.exit(1)
 
-    assert match is not None  # For type checker - we exit above if None
+    assert match is not None
     invite_id = match.group(1)
     key_base64 = fragment
 
@@ -1204,18 +1372,15 @@ def claim(invite_url: str):
     ns = claim_data["ns"]
     identity_id = claim_data["identity_id"]
 
-    # Check if we have a namespace config, create one if not
     ns_cfg = NamespaceConfig.load(ns)
     if ns_cfg is None:
-        # Create a minimal namespace config (we don't have the namespace secret)
         ns_cfg = NamespaceConfig(
             ns=ns,
-            secret="",  # We don't have namespace-level access
+            secret="",
             display_name=claim_data.get("namespace_display_name"),
             created_at=datetime.now(timezone.utc).isoformat(),
         )
 
-    # Add the mailbox
     ns_cfg.add_mailbox(
         id=identity_id,
         secret=mailbox_secret,
@@ -1230,6 +1395,29 @@ def claim(invite_url: str):
     print("You can now use the CLI to interact with this mailbox:")
     print(f"  deadrop message inbox {ns}")
     print(f'  deadrop message send {ns} <recipient_id> "Hello!"')
+
+
+@invite_app.command
+def claim(invite_url: str):
+    """Claim an invite link and save the credentials locally.
+
+    Accepts invite URLs in two formats:
+
+    Remote (HTTPS):
+        https://deaddrop.example.com/join/abc123#base64key
+        /join/abc123#base64key
+
+    Local (deadrop://):
+        deadrop://local/invite?path=/path/.deaddrop&ns=xxx&id=xxx&secret_enc=xxx&invite_id=xxx#key
+
+    The credentials will be saved to your local config and you can
+    then use the CLI to send/receive messages.
+    """
+    # Dispatch to appropriate handler based on URL scheme
+    if invite_url.startswith("deadrop://"):
+        _claim_local_invite(invite_url)
+    else:
+        _claim_remote_invite(invite_url)
 
 
 # --- Server Command ---
