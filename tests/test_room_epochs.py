@@ -816,3 +816,162 @@ class TestPubkeyEnforcementOnMembership:
         # Room should still be at epoch 0
         room_info = db.get_room_with_encryption(room["room_id"])
         assert room_info["current_epoch_number"] == 0
+
+
+# =============================================================================
+# Encrypted Message Tests
+# =============================================================================
+
+
+class TestEncryptedMessages:
+    """Tests for sending and retrieving encrypted messages."""
+
+    def test_send_plaintext_message(self):
+        """Send a plaintext message (backward compatible)."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+
+        msg = db.send_room_message(room["room_id"], alice["id"], "Hello!")
+
+        assert msg["body"] == "Hello!"
+        assert "encrypted" not in msg
+
+    def test_send_encrypted_message(self):
+        """Send an encrypted message."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        msg = db.send_room_message(
+            room_id=room["room_id"],
+            from_id=alice["id"],
+            body="encrypted_ciphertext_here",
+            epoch_number=0,
+            encrypted=True,
+            encryption_meta='{"algorithm": "xsalsa20-poly1305+ed25519"}',
+            signature="base64_signature_here",
+        )
+
+        assert msg["encrypted"] is True
+        assert msg["epoch_number"] == 0
+        assert msg["encryption_meta"] == '{"algorithm": "xsalsa20-poly1305+ed25519"}'
+        assert msg["signature"] == "base64_signature_here"
+
+    def test_send_encrypted_message_epoch_mismatch(self):
+        """Sending with wrong epoch raises EpochMismatchError."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Rotate to epoch 1
+        db.rotate_room_epoch(room["room_id"], "manual")
+
+        # Try to send with epoch 0 (stale)
+        with pytest.raises(db.EpochMismatchError) as exc_info:
+            db.send_room_message(
+                room_id=room["room_id"],
+                from_id=alice["id"],
+                body="ciphertext",
+                epoch_number=0,  # Wrong! Current is 1
+                encrypted=True,
+            )
+
+        assert exc_info.value.expected_epoch == 1
+        assert exc_info.value.provided_epoch == 0
+        assert exc_info.value.room_id == room["room_id"]
+
+    def test_get_encrypted_messages(self):
+        """Retrieved messages include encryption fields."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Send encrypted message
+        db.send_room_message(
+            room_id=room["room_id"],
+            from_id=alice["id"],
+            body="ciphertext1",
+            epoch_number=0,
+            encrypted=True,
+            encryption_meta='{"nonce": "abc"}',
+            signature="sig1",
+        )
+
+        # Send plaintext message (unencrypted room would do this)
+        db.send_room_message(room["room_id"], alice["id"], "plaintext")
+
+        messages = db.get_room_messages(room["room_id"])
+
+        assert len(messages) == 2
+
+        # First message is encrypted
+        assert messages[0]["encrypted"] is True
+        assert messages[0]["epoch_number"] == 0
+        assert messages[0]["encryption_meta"] == '{"nonce": "abc"}'
+        assert messages[0]["signature"] == "sig1"
+
+        # Second message is not encrypted
+        assert "encrypted" not in messages[1]
+
+    def test_get_single_encrypted_message(self):
+        """get_room_message returns encryption fields."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        sent = db.send_room_message(
+            room_id=room["room_id"],
+            from_id=alice["id"],
+            body="ciphertext",
+            epoch_number=0,
+            encrypted=True,
+            signature="my_sig",
+        )
+
+        fetched = db.get_room_message(room["room_id"], sent["mid"])
+
+        assert fetched["encrypted"] is True
+        assert fetched["epoch_number"] == 0
+        assert fetched["signature"] == "my_sig"
+
+    def test_validate_message_epoch_success(self):
+        """validate_message_epoch succeeds for correct epoch."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        result = db.validate_message_epoch(room["room_id"], 0)
+        assert result is True
+
+    def test_validate_message_epoch_mismatch(self):
+        """validate_message_epoch raises for wrong epoch."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Rotate to epoch 1
+        db.rotate_room_epoch(room["room_id"], "manual")
+
+        with pytest.raises(db.EpochMismatchError) as exc_info:
+            db.validate_message_epoch(room["room_id"], 0)
+
+        assert exc_info.value.expected_epoch == 1
+        assert exc_info.value.provided_epoch == 0
+
+    def test_validate_message_epoch_room_not_found(self):
+        """validate_message_epoch raises for nonexistent room."""
+        with pytest.raises(ValueError, match="not found"):
+            db.validate_message_epoch("nonexistent-room", 0)

@@ -42,6 +42,32 @@ from .auth import derive_id, generate_secret, hash_secret
 # Default TTL in hours when messages are read
 DEFAULT_TTL_HOURS = 24
 
+
+# =============================================================================
+# Custom Exceptions
+# =============================================================================
+
+
+class EpochMismatchError(ValueError):
+    """Raised when message epoch doesn't match room's current epoch.
+
+    This error provides information for clients to fetch the correct epoch key
+    and retry their request.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        expected_epoch: int,
+        provided_epoch: int,
+        room_id: str,
+    ):
+        super().__init__(message)
+        self.expected_epoch = expected_epoch
+        self.provided_epoch = provided_epoch
+        self.room_id = room_id
+
+
 # Current schema version (increment when adding migrations)
 # v1: Base schema
 # v2: Add rooms tables for group communication
@@ -2032,15 +2058,26 @@ def send_room_message(
     from_id: str,
     body: str,
     content_type: str = "text/plain",
+    epoch_number: int | None = None,
+    encrypted: bool = False,
+    encryption_meta: str | None = None,
+    signature: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> dict:
     """Send a message to a room.
 
+    For encrypted rooms, the message body should already be encrypted by the client.
+    The server validates that epoch_number matches the current epoch.
+
     Args:
         room_id: Room ID
         from_id: Sender identity ID (must be a member)
-        body: Message body
+        body: Message body (encrypted ciphertext for encrypted rooms)
         content_type: Content type (default: text/plain)
+        epoch_number: Epoch number the message was encrypted with (for encrypted rooms)
+        encrypted: Whether the message is encrypted
+        encryption_meta: JSON string with encryption metadata (algorithm, nonce, etc.)
+        signature: Base64-encoded signature
         conn: Optional database connection
 
     Returns:
@@ -2048,11 +2085,12 @@ def send_room_message(
 
     Raises:
         ValueError: If room not found or sender not a member
+        EpochMismatchError: If epoch_number doesn't match current room epoch
     """
     conn = _get_conn(conn)
 
-    # Verify room exists
-    room = get_room(room_id, conn=conn)
+    # Get room with encryption status
+    room = get_room_with_encryption(room_id, conn=conn)
     if not room:
         raise ValueError(f"Room {room_id} not found")
 
@@ -2060,17 +2098,40 @@ def send_room_message(
     if not is_room_member(room_id, from_id, conn=conn):
         raise ValueError(f"Identity {from_id} is not a member of room {room_id}")
 
+    # Validate epoch for encrypted messages
+    if encrypted and epoch_number is not None:
+        current_epoch = room["current_epoch_number"]
+        if epoch_number != current_epoch:
+            raise EpochMismatchError(
+                f"Epoch mismatch: message epoch {epoch_number}, current epoch {current_epoch}",
+                expected_epoch=current_epoch,
+                provided_epoch=epoch_number,
+                room_id=room_id,
+            )
+
     mid = str(make_uuid7())
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
-        """INSERT INTO room_messages (mid, room_id, from_id, body, content_type, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (mid, room_id, from_id, body, content_type, now),
+        """INSERT INTO room_messages 
+           (mid, room_id, from_id, body, content_type, created_at, epoch_number, encrypted, encryption_meta, signature)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            mid,
+            room_id,
+            from_id,
+            body,
+            content_type,
+            now,
+            epoch_number,
+            encrypted,
+            encryption_meta,
+            signature,
+        ),
     )
     conn.commit()
 
-    return {
+    result = {
         "mid": mid,
         "room_id": room_id,
         "from": from_id,
@@ -2078,6 +2139,16 @@ def send_room_message(
         "content_type": content_type,
         "created_at": now,
     }
+
+    if encrypted:
+        result["encrypted"] = True
+        result["epoch_number"] = epoch_number
+        if encryption_meta:
+            result["encryption_meta"] = encryption_meta
+        if signature:
+            result["signature"] = signature
+
+    return result
 
 
 def has_new_room_messages(
@@ -2126,12 +2197,14 @@ def get_room_messages(
         conn: Optional database connection
 
     Returns:
-        List of message dicts ordered by creation time
+        List of message dicts ordered by creation time.
+        For encrypted messages, includes epoch_number, encrypted, encryption_meta, signature.
     """
     conn = _get_conn(conn)
 
     query = """
-        SELECT mid, room_id, from_id, body, content_type, created_at
+        SELECT mid, room_id, from_id, body, content_type, created_at,
+               epoch_number, encrypted, encryption_meta, signature
         FROM room_messages
         WHERE room_id = ?
     """
@@ -2147,8 +2220,9 @@ def get_room_messages(
     cursor = conn.execute(query, tuple(params))
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
-    return [
-        {
+    messages = []
+    for row in rows:
+        msg = {
             "mid": row["mid"],
             "room_id": row["room_id"],
             "from": row["from_id"],
@@ -2156,8 +2230,17 @@ def get_room_messages(
             "content_type": row.get("content_type") or "text/plain",
             "created_at": row["created_at"],
         }
-        for row in rows
-    ]
+        # Include encryption fields if message is encrypted
+        if row.get("encrypted"):
+            msg["encrypted"] = True
+            msg["epoch_number"] = row.get("epoch_number")
+            if row.get("encryption_meta"):
+                msg["encryption_meta"] = row["encryption_meta"]
+            if row.get("signature"):
+                msg["signature"] = row["signature"]
+        messages.append(msg)
+
+    return messages
 
 
 def get_room_message(
@@ -2173,18 +2256,20 @@ def get_room_message(
         conn: Optional database connection
 
     Returns:
-        Message dict or None if not found
+        Message dict or None if not found.
+        For encrypted messages, includes epoch_number, encrypted, encryption_meta, signature.
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
-        """SELECT mid, room_id, from_id, body, content_type, created_at
+        """SELECT mid, room_id, from_id, body, content_type, created_at,
+                  epoch_number, encrypted, encryption_meta, signature
            FROM room_messages WHERE room_id = ? AND mid = ?""",
         (room_id, mid),
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if row:
-        return {
+        msg = {
             "mid": row["mid"],
             "room_id": row["room_id"],
             "from": row["from_id"],
@@ -2192,6 +2277,15 @@ def get_room_message(
             "content_type": row.get("content_type") or "text/plain",
             "created_at": row["created_at"],
         }
+        # Include encryption fields if message is encrypted
+        if row.get("encrypted"):
+            msg["encrypted"] = True
+            msg["epoch_number"] = row.get("epoch_number")
+            if row.get("encryption_meta"):
+                msg["encryption_meta"] = row["encryption_meta"]
+            if row.get("signature"):
+                msg["signature"] = row["signature"]
+        return msg
     return None
 
 
@@ -2958,3 +3052,40 @@ def initialize_room_encryption(
         "member_keys": member_keys,
         "membership_hash": membership_hash,
     }
+
+
+def validate_message_epoch(
+    room_id: str,
+    epoch_number: int,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Validate that the given epoch matches the room's current epoch.
+
+    Args:
+        room_id: Room ID
+        epoch_number: Epoch number to validate
+        conn: Optional database connection
+
+    Returns:
+        True if epoch matches
+
+    Raises:
+        ValueError: If room not found
+        EpochMismatchError: If epoch doesn't match current room epoch
+    """
+    conn = _get_conn(conn)
+
+    room = get_room_with_encryption(room_id, conn=conn)
+    if not room:
+        raise ValueError(f"Room {room_id} not found")
+
+    current_epoch = room["current_epoch_number"]
+    if epoch_number != current_epoch:
+        raise EpochMismatchError(
+            f"Epoch mismatch: expected {current_epoch}, got {epoch_number}",
+            expected_epoch=current_epoch,
+            provided_epoch=epoch_number,
+            room_id=room_id,
+        )
+
+    return True
