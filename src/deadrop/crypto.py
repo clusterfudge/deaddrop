@@ -450,6 +450,9 @@ def encrypt_room_message(
     sender_signing_key: bytes,
     room_id: str,
     epoch_number: int,
+    sender_id: str | None = None,
+    timestamp: str | None = None,
+    message_id: str | None = None,
 ) -> EncryptedRoomMessage:
     """
     Encrypt a message for a room using the epoch's symmetric key.
@@ -457,6 +460,7 @@ def encrypt_room_message(
     The message is signed before encryption (sign-then-encrypt) so that:
     1. Only room members with the epoch key can decrypt
     2. After decryption, the signature proves the sender's identity
+    3. Replay protection via timestamp and message_id binding
 
     Args:
         plaintext: Message to encrypt
@@ -464,12 +468,24 @@ def encrypt_room_message(
         sender_signing_key: 32-byte Ed25519 private key of sender
         room_id: Room identifier (included in signed data)
         epoch_number: Epoch number (included in signed data)
+        sender_id: Sender's identity ID (included in signed data for authentication)
+        timestamp: ISO timestamp (included in signed data for replay protection)
+        message_id: Unique message ID (included in signed data for replay protection)
 
     Returns:
         EncryptedRoomMessage with ciphertext, nonce, and signature
     """
-    # Create the data to sign (binds message to room and epoch)
-    sign_data = f"{room_id}:{epoch_number}:{plaintext}"
+    # Create the data to sign (binds message to room, epoch, sender, and time)
+    # Include sender_id, timestamp, and message_id if provided for replay protection
+    sign_parts = [room_id, str(epoch_number)]
+    if sender_id:
+        sign_parts.append(sender_id)
+    if timestamp:
+        sign_parts.append(timestamp)
+    if message_id:
+        sign_parts.append(message_id)
+    sign_parts.append(plaintext)
+    sign_data = ":".join(sign_parts)
     signature = sign_message(sign_data, sender_signing_key)
 
     # Combine plaintext with signature for encryption
@@ -496,6 +512,9 @@ def decrypt_room_message(
     sender_signing_pubkey: bytes,
     room_id: str,
     epoch_number: int,
+    sender_id: str | None = None,
+    timestamp: str | None = None,
+    message_id: str | None = None,
 ) -> str:
     """
     Decrypt a room message and verify the sender's signature.
@@ -506,6 +525,9 @@ def decrypt_room_message(
         sender_signing_pubkey: 32-byte Ed25519 public key of claimed sender
         room_id: Room identifier (for signature verification)
         epoch_number: Epoch number (for signature verification)
+        sender_id: Sender's identity ID (for signature verification)
+        timestamp: ISO timestamp (for signature verification)
+        message_id: Unique message ID (for signature verification)
 
     Returns:
         Decrypted plaintext string
@@ -525,8 +547,16 @@ def decrypt_room_message(
 
     plaintext = plaintext_bytes.decode("utf-8")
 
-    # Verify signature
-    sign_data = f"{room_id}:{epoch_number}:{plaintext}"
+    # Verify signature (must match what was signed during encryption)
+    sign_parts = [room_id, str(epoch_number)]
+    if sender_id:
+        sign_parts.append(sender_id)
+    if timestamp:
+        sign_parts.append(timestamp)
+    if message_id:
+        sign_parts.append(message_id)
+    sign_parts.append(plaintext)
+    sign_data = ":".join(sign_parts)
     if not verify_signature(sign_data, signature, sender_signing_pubkey):
         raise ValueError("Invalid signature - message may be forged or corrupted")
 

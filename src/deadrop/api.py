@@ -1124,6 +1124,7 @@ class EpochKeyResponse(BaseModel):
 
     epoch: EpochInfo
     encrypted_epoch_key: str | None  # Base64 NaCl box ciphertext, None if caller not in epoch
+    distributor_public_key: str | None = None  # Server's public key used to encrypt epoch keys
 
 
 class RoomMessageEncryptedRequest(BaseModel):
@@ -1551,9 +1552,13 @@ def get_current_epoch(
     key_record = db.get_epoch_key_for_identity(room_id, epoch["epoch_number"], identity_id)
     encrypted_key = key_record["encrypted_epoch_key"] if key_record else None
 
+    # Get server's public key for decryption
+    distributor_public_key = room_info.get("server_public_key") if room_info else None
+
     return EpochKeyResponse(
         epoch=EpochInfo(**epoch),
         encrypted_epoch_key=encrypted_key,
+        distributor_public_key=distributor_public_key,
     )
 
 
@@ -1587,9 +1592,13 @@ def get_epoch_by_number(
     key_record = db.get_epoch_key_for_identity(room_id, epoch_number, identity_id)
     encrypted_key = key_record["encrypted_epoch_key"] if key_record else None
 
+    # Get server's public key for decryption
+    distributor_public_key = room_info.get("server_public_key") if room_info else None
+
     return EpochKeyResponse(
         epoch=EpochInfo(**epoch),
         encrypted_epoch_key=encrypted_key,
+        distributor_public_key=distributor_public_key,
     )
 
 
@@ -1636,6 +1645,7 @@ def rotate_room_epoch(
     return EpochKeyResponse(
         epoch=EpochInfo(**result["epoch"]),
         encrypted_epoch_key=encrypted_key,
+        distributor_public_key=result.get("server_public_key"),
     )
 
 
