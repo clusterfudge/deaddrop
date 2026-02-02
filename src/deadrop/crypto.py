@@ -615,3 +615,176 @@ def decrypt_epoch_key(
     box = Box(member_key, distributor_key)
 
     return bytes(box.decrypt(encrypted_epoch_key))
+
+
+# =============================================================================
+# True E2E Room Encryption (Client-side key management)
+# =============================================================================
+
+
+def rotate_base_secret(
+    current_secret: bytes,
+    room_id: str,
+    removed_member_id: str,
+    rotation_number: int,
+) -> bytes:
+    """
+    Derive a new base secret after a member is removed.
+
+    This is a deterministic ratchet - all remaining members who know
+    the current secret can independently derive the new secret.
+    The removed member cannot derive the new secret because they
+    don't know which member triggered the rotation.
+
+    Args:
+        current_secret: Current 32-byte base secret
+        room_id: Room identifier
+        removed_member_id: ID of the member being removed
+        rotation_number: Sequential number of this rotation (for uniqueness)
+
+    Returns:
+        New 32-byte base secret
+    """
+    info = f"deaddrop-secret-rotate:{room_id}:{removed_member_id}:{rotation_number}".encode("utf-8")
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=info,
+    )
+
+    return hkdf.derive(current_secret)
+
+
+def encrypt_base_secret_for_member(
+    base_secret: bytes,
+    member_public_key: bytes,
+    sender_private_key: bytes,
+    room_id: str,
+) -> bytes:
+    """
+    Encrypt a room's base secret for delivery to a member (via invite or rotation).
+
+    Uses NaCl box so only the intended member can decrypt.
+    The room_id is included in the encryption context for domain separation.
+
+    Args:
+        base_secret: 32-byte base secret to encrypt
+        member_public_key: 32-byte X25519 public key of the member
+        sender_private_key: 32-byte private key of the sender (inviter)
+        room_id: Room identifier (for context binding)
+
+    Returns:
+        Encrypted secret (nonce + ciphertext)
+    """
+    # Prepend room_id to secret for domain separation
+    # This ensures the same secret encrypted for different rooms produces different ciphertext
+    context = f"room:{room_id}:".encode("utf-8")
+    payload = context + base_secret
+
+    sender_key = PrivateKey(sender_private_key)
+    recipient_key = PublicKey(member_public_key)
+    box = Box(sender_key, recipient_key)
+
+    encrypted = box.encrypt(payload)
+    return bytes(encrypted)
+
+
+def decrypt_base_secret_from_invite(
+    encrypted_secret: bytes,
+    sender_public_key: bytes,
+    recipient_private_key: bytes,
+    room_id: str,
+) -> bytes:
+    """
+    Decrypt a room's base secret received via invite or rotation.
+
+    Args:
+        encrypted_secret: Encrypted secret (nonce + ciphertext)
+        sender_public_key: 32-byte X25519 public key of sender (inviter)
+        recipient_private_key: 32-byte private key of recipient
+        room_id: Room identifier (for context verification)
+
+    Returns:
+        32-byte base secret
+
+    Raises:
+        nacl.exceptions.CryptoError: If decryption fails
+        ValueError: If room_id context doesn't match
+    """
+    recipient_key = PrivateKey(recipient_private_key)
+    sender_key = PublicKey(sender_public_key)
+    box = Box(recipient_key, sender_key)
+
+    payload = bytes(box.decrypt(encrypted_secret))
+
+    # Verify and strip context
+    expected_context = f"room:{room_id}:".encode("utf-8")
+    if not payload.startswith(expected_context):
+        raise ValueError("Room ID mismatch - encrypted secret is for a different room")
+
+    return payload[len(expected_context) :]
+
+
+@dataclass
+class RoomInviteSecrets:
+    """Container for encrypted room invite secrets (true E2E model)."""
+
+    encrypted_base_secret: bytes  # Box-encrypted base secret for invitee
+    inviter_public_key: bytes  # Inviter's public key (for decryption)
+    secret_version: int  # Which version of base_secret this is (increments on rotation)
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for storage/transmission."""
+        return {
+            "encrypted_base_secret": bytes_to_base64url(self.encrypted_base_secret),
+            "inviter_public_key": bytes_to_base64url(self.inviter_public_key),
+            "secret_version": self.secret_version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RoomInviteSecrets":
+        """Reconstruct from dictionary."""
+        return cls(
+            encrypted_base_secret=base64url_to_bytes(data["encrypted_base_secret"]),
+            inviter_public_key=base64url_to_bytes(data["inviter_public_key"]),
+            secret_version=data["secret_version"],
+        )
+
+
+def create_room_invite_secrets(
+    base_secret: bytes,
+    secret_version: int,
+    invitee_public_key: bytes,
+    inviter_keypair: KeyPair,
+    room_id: str,
+) -> RoomInviteSecrets:
+    """
+    Create encrypted secrets for inviting a member to an encrypted room.
+
+    The server stores only the encrypted secret - it cannot decrypt
+    without the invitee's private key.
+
+    Args:
+        base_secret: Current room base secret (32 bytes)
+        secret_version: Version number of this secret (0 for initial, increments on rotation)
+        invitee_public_key: 32-byte public key of the person being invited
+        inviter_keypair: KeyPair of the person sending the invite
+        room_id: Room identifier
+
+    Returns:
+        RoomInviteSecrets with encrypted data for server storage
+    """
+    encrypted = encrypt_base_secret_for_member(
+        base_secret=base_secret,
+        member_public_key=invitee_public_key,
+        sender_private_key=inviter_keypair.private_key,
+        room_id=room_id,
+    )
+
+    return RoomInviteSecrets(
+        encrypted_base_secret=encrypted,
+        inviter_public_key=inviter_keypair.public_key,
+        secret_version=secret_version,
+    )

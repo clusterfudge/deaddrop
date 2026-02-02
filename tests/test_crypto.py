@@ -1,5 +1,7 @@
 """Tests for the crypto module."""
 
+import os
+
 import pytest
 from cryptography.exceptions import InvalidTag
 
@@ -7,11 +9,17 @@ from deadrop.crypto import (
     base64url_to_bytes,
     bytes_to_base64url,
     create_invite_secrets,
+    create_room_invite_secrets,
+    decrypt_base_secret_from_invite,
     decrypt_invite_secret,
     decrypt_secret,
+    encrypt_base_secret_for_member,
     encrypt_secret,
     generate_invite_id,
     generate_key,
+    generate_keypair,
+    rotate_base_secret,
+    RoomInviteSecrets,
 )
 
 
@@ -1032,3 +1040,210 @@ class TestEpochKeyDistribution:
         # Bob tries to decrypt Alice's key
         with pytest.raises(CryptoError):
             decrypt_epoch_key(encrypted_for_alice, distributor.public_key, bob.private_key)
+
+
+# =============================================================================
+# True E2E Room Encryption Tests
+# =============================================================================
+
+
+class TestBaseSecretRotation:
+    """Tests for deterministic base secret rotation."""
+
+    def test_rotate_base_secret_deterministic(self):
+        """Same inputs produce same output."""
+        secret = os.urandom(32)
+        room_id = "room-123"
+        removed_id = "removed-member"
+        rotation = 1
+
+        result1 = rotate_base_secret(secret, room_id, removed_id, rotation)
+        result2 = rotate_base_secret(secret, room_id, removed_id, rotation)
+
+        assert result1 == result2
+
+    def test_rotate_base_secret_length(self):
+        """Rotated secret is 32 bytes."""
+        secret = os.urandom(32)
+        result = rotate_base_secret(secret, "room", "member", 1)
+        assert len(result) == 32
+
+    def test_rotate_base_secret_different_removed_member(self):
+        """Different removed member produces different secret."""
+        secret = os.urandom(32)
+        room_id = "room-123"
+
+        result1 = rotate_base_secret(secret, room_id, "alice", 1)
+        result2 = rotate_base_secret(secret, room_id, "bob", 1)
+
+        assert result1 != result2
+
+    def test_rotate_base_secret_different_rotation_number(self):
+        """Different rotation number produces different secret."""
+        secret = os.urandom(32)
+        room_id = "room-123"
+        removed_id = "alice"
+
+        result1 = rotate_base_secret(secret, room_id, removed_id, 1)
+        result2 = rotate_base_secret(secret, room_id, removed_id, 2)
+
+        assert result1 != result2
+
+    def test_rotate_base_secret_chain(self):
+        """Can chain multiple rotations."""
+        secret = os.urandom(32)
+        room_id = "room-123"
+
+        # Alice removed (rotation 1)
+        secret_v1 = rotate_base_secret(secret, room_id, "alice", 1)
+        # Bob removed (rotation 2)
+        secret_v2 = rotate_base_secret(secret_v1, room_id, "bob", 2)
+        # Carol removed (rotation 3)
+        secret_v3 = rotate_base_secret(secret_v2, room_id, "carol", 3)
+
+        # All secrets should be different
+        assert len({secret.hex(), secret_v1.hex(), secret_v2.hex(), secret_v3.hex()}) == 4
+
+
+class TestBaseSecretEncryption:
+    """Tests for encrypting base secrets for member delivery."""
+
+    def test_encrypt_decrypt_roundtrip(self):
+        """Encrypted secret can be decrypted by intended recipient."""
+        base_secret = os.urandom(32)
+        room_id = "room-123"
+
+        inviter = generate_keypair()
+        invitee = generate_keypair()
+
+        encrypted = encrypt_base_secret_for_member(
+            base_secret=base_secret,
+            member_public_key=invitee.public_key,
+            sender_private_key=inviter.private_key,
+            room_id=room_id,
+        )
+
+        decrypted = decrypt_base_secret_from_invite(
+            encrypted_secret=encrypted,
+            sender_public_key=inviter.public_key,
+            recipient_private_key=invitee.private_key,
+            room_id=room_id,
+        )
+
+        assert decrypted == base_secret
+
+    def test_wrong_room_id_fails(self):
+        """Decryption with wrong room_id fails."""
+        base_secret = os.urandom(32)
+
+        inviter = generate_keypair()
+        invitee = generate_keypair()
+
+        encrypted = encrypt_base_secret_for_member(
+            base_secret=base_secret,
+            member_public_key=invitee.public_key,
+            sender_private_key=inviter.private_key,
+            room_id="room-123",
+        )
+
+        with pytest.raises(ValueError, match="Room ID mismatch"):
+            decrypt_base_secret_from_invite(
+                encrypted_secret=encrypted,
+                sender_public_key=inviter.public_key,
+                recipient_private_key=invitee.private_key,
+                room_id="different-room",  # Wrong room
+            )
+
+    def test_wrong_recipient_fails(self):
+        """Wrong recipient cannot decrypt."""
+        base_secret = os.urandom(32)
+        room_id = "room-123"
+
+        inviter = generate_keypair()
+        invitee = generate_keypair()
+        attacker = generate_keypair()
+
+        encrypted = encrypt_base_secret_for_member(
+            base_secret=base_secret,
+            member_public_key=invitee.public_key,
+            sender_private_key=inviter.private_key,
+            room_id=room_id,
+        )
+
+        with pytest.raises(Exception):  # CryptoError
+            decrypt_base_secret_from_invite(
+                encrypted_secret=encrypted,
+                sender_public_key=inviter.public_key,
+                recipient_private_key=attacker.private_key,  # Wrong key
+                room_id=room_id,
+            )
+
+
+class TestRoomInviteSecrets:
+    """Tests for room invite secret container."""
+
+    def test_create_room_invite_secrets(self):
+        """Can create invite secrets."""
+        base_secret = os.urandom(32)
+        inviter = generate_keypair()
+        invitee = generate_keypair()
+        room_id = "room-123"
+
+        secrets = create_room_invite_secrets(
+            base_secret=base_secret,
+            secret_version=0,
+            invitee_public_key=invitee.public_key,
+            inviter_keypair=inviter,
+            room_id=room_id,
+        )
+
+        assert secrets.secret_version == 0
+        assert secrets.inviter_public_key == inviter.public_key
+        assert len(secrets.encrypted_base_secret) > 0
+
+    def test_room_invite_secrets_serialization(self):
+        """RoomInviteSecrets can serialize/deserialize."""
+        base_secret = os.urandom(32)
+        inviter = generate_keypair()
+        invitee = generate_keypair()
+
+        secrets = create_room_invite_secrets(
+            base_secret=base_secret,
+            secret_version=5,
+            invitee_public_key=invitee.public_key,
+            inviter_keypair=inviter,
+            room_id="room-123",
+        )
+
+        # Round-trip through dict
+        data = secrets.to_dict()
+        restored = RoomInviteSecrets.from_dict(data)
+
+        assert restored.encrypted_base_secret == secrets.encrypted_base_secret
+        assert restored.inviter_public_key == secrets.inviter_public_key
+        assert restored.secret_version == secrets.secret_version
+
+    def test_invite_secrets_can_decrypt(self):
+        """Invitee can decrypt base secret from invite."""
+        base_secret = os.urandom(32)
+        inviter = generate_keypair()
+        invitee = generate_keypair()
+        room_id = "room-123"
+
+        secrets = create_room_invite_secrets(
+            base_secret=base_secret,
+            secret_version=0,
+            invitee_public_key=invitee.public_key,
+            inviter_keypair=inviter,
+            room_id=room_id,
+        )
+
+        # Invitee decrypts
+        decrypted = decrypt_base_secret_from_invite(
+            encrypted_secret=secrets.encrypted_base_secret,
+            sender_public_key=secrets.inviter_public_key,
+            recipient_private_key=invitee.private_key,
+            room_id=room_id,
+        )
+
+        assert decrypted == base_secret

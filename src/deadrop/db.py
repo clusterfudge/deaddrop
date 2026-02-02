@@ -413,11 +413,13 @@ def _migrate_004_add_room_encryption(conn: sqlite3.Connection) -> None:
 
     Adds:
     - room_epochs table for tracking encryption epochs
-    - room_epoch_keys table for distributing encrypted keys to members
+    - room_epoch_keys table for distributing encrypted keys to members (legacy, kept for compatibility)
     - rooms.encryption_enabled flag
     - rooms.current_epoch_number tracking
-    - rooms.base_secret for key derivation (server-side only)
+    - rooms.base_secret for key derivation (DEPRECATED - legacy server-mediated mode)
+    - rooms.secret_version for tracking base secret rotations (true E2E mode)
     - room_messages encryption fields (epoch_number, encrypted, encryption_meta, signature)
+    - room_member_secrets table for encrypted base secrets per member (true E2E mode)
     """
     # Create room_epochs table
     conn.execute("""
@@ -468,6 +470,25 @@ def _migrate_004_add_room_encryption(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE rooms ADD COLUMN server_private_key TEXT")
     if "server_public_key" not in room_columns:
         conn.execute("ALTER TABLE rooms ADD COLUMN server_public_key TEXT")
+    if "secret_version" not in room_columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN secret_version INTEGER DEFAULT 0")
+
+    # Create room_member_secrets table for true E2E mode
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS room_member_secrets (
+            room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+            identity_id TEXT NOT NULL,
+            encrypted_base_secret TEXT NOT NULL,
+            inviter_public_key TEXT NOT NULL,
+            secret_version INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (room_id, identity_id, secret_version)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_member_secrets_identity "
+        "ON room_member_secrets(room_id, identity_id)"
+    )
 
     # Add columns to room_messages table
     cursor = conn.execute("PRAGMA table_info(room_messages)")
@@ -603,7 +624,8 @@ SCHEMA_SQL = """
         current_epoch_number INTEGER DEFAULT 0,
         base_secret TEXT,
         server_private_key TEXT,
-        server_public_key TEXT
+        server_public_key TEXT,
+        secret_version INTEGER DEFAULT 0
     );
     
     CREATE INDEX IF NOT EXISTS idx_rooms_ns ON rooms(ns);
@@ -659,6 +681,20 @@ SCHEMA_SQL = """
     );
     
     CREATE INDEX IF NOT EXISTS idx_room_epoch_keys_identity ON room_epoch_keys(identity_id);
+    
+    -- Encrypted base secrets per member (true E2E mode)
+    CREATE TABLE IF NOT EXISTS room_member_secrets (
+        room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+        identity_id TEXT NOT NULL,
+        encrypted_base_secret TEXT NOT NULL,
+        inviter_public_key TEXT NOT NULL,
+        secret_version INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (room_id, identity_id, secret_version)
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_room_member_secrets_identity 
+        ON room_member_secrets(room_id, identity_id);
     
     -- Public keys for e2e encryption
     CREATE TABLE IF NOT EXISTS pubkeys (
@@ -2738,13 +2774,13 @@ def get_room_with_encryption(room_id: str, conn: sqlite3.Connection | None = Non
     Returns:
         Dict with room_id, ns, display_name, created_by, created_at,
         encryption_enabled, current_epoch_number, base_secret,
-        server_private_key, server_public_key, or None if not found
+        server_private_key, server_public_key, secret_version, or None if not found
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
         """SELECT room_id, ns, display_name, created_by, created_at,
                   encryption_enabled, current_epoch_number, base_secret,
-                  server_private_key, server_public_key
+                  server_private_key, server_public_key, secret_version
            FROM rooms WHERE room_id = ?""",
         (room_id,),
     )
@@ -3120,3 +3156,293 @@ def validate_message_epoch(
         )
 
     return True
+
+
+# =============================================================================
+# True E2E Room Encryption (Client-side key management)
+# =============================================================================
+
+
+def store_member_secret(
+    room_id: str,
+    identity_id: str,
+    encrypted_base_secret: str,
+    inviter_public_key: str,
+    secret_version: int,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Store an encrypted base secret for a room member.
+
+    In true E2E mode, the server stores encrypted secrets that only
+    members can decrypt with their private keys.
+
+    Args:
+        room_id: Room ID
+        identity_id: Member's identity ID
+        encrypted_base_secret: Base64-encoded encrypted secret
+        inviter_public_key: Base64-encoded public key of inviter (for decryption)
+        secret_version: Version of the secret (0 for initial, increments on rotation)
+        conn: Optional database connection
+
+    Returns:
+        Dict with stored record info
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """INSERT OR REPLACE INTO room_member_secrets 
+           (room_id, identity_id, encrypted_base_secret, inviter_public_key, secret_version, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (room_id, identity_id, encrypted_base_secret, inviter_public_key, secret_version, now),
+    )
+    conn.commit()
+
+    return {
+        "room_id": room_id,
+        "identity_id": identity_id,
+        "encrypted_base_secret": encrypted_base_secret,
+        "inviter_public_key": inviter_public_key,
+        "secret_version": secret_version,
+        "created_at": now,
+    }
+
+
+def get_member_secret(
+    room_id: str,
+    identity_id: str,
+    secret_version: int | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Get an encrypted base secret for a room member.
+
+    Args:
+        room_id: Room ID
+        identity_id: Member's identity ID
+        secret_version: Specific version to fetch, or None for latest
+        conn: Optional database connection
+
+    Returns:
+        Dict with encrypted_base_secret, inviter_public_key, secret_version, or None
+    """
+    conn = _get_conn(conn)
+
+    if secret_version is not None:
+        cursor = conn.execute(
+            """SELECT room_id, identity_id, encrypted_base_secret, inviter_public_key, 
+                      secret_version, created_at
+               FROM room_member_secrets
+               WHERE room_id = ? AND identity_id = ? AND secret_version = ?""",
+            (room_id, identity_id, secret_version),
+        )
+    else:
+        # Get latest version
+        cursor = conn.execute(
+            """SELECT room_id, identity_id, encrypted_base_secret, inviter_public_key,
+                      secret_version, created_at
+               FROM room_member_secrets
+               WHERE room_id = ? AND identity_id = ?
+               ORDER BY secret_version DESC LIMIT 1""",
+            (room_id, identity_id),
+        )
+
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def list_member_secrets(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """List all secret versions for a member (for catching up after being offline).
+
+    Args:
+        room_id: Room ID
+        identity_id: Member's identity ID
+        conn: Optional database connection
+
+    Returns:
+        List of dicts with encrypted secrets, ordered by version ascending
+    """
+    conn = _get_conn(conn)
+
+    cursor = conn.execute(
+        """SELECT room_id, identity_id, encrypted_base_secret, inviter_public_key,
+                  secret_version, created_at
+           FROM room_member_secrets
+           WHERE room_id = ? AND identity_id = ?
+           ORDER BY secret_version ASC""",
+        (room_id, identity_id),
+    )
+
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def get_current_secret_version(room_id: str, conn: sqlite3.Connection | None = None) -> int:
+    """Get the current secret version for a room.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        Current secret version number (0 if not set)
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        "SELECT secret_version FROM rooms WHERE room_id = ?",
+        (room_id,),
+    )
+    row = cursor.fetchone()
+    return row[0] if row and row[0] is not None else 0
+
+
+def update_secret_version(
+    room_id: str,
+    secret_version: int,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Update the current secret version for a room.
+
+    Args:
+        room_id: Room ID
+        secret_version: New secret version
+        conn: Optional database connection
+
+    Returns:
+        True if updated, False if room not found
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        "UPDATE rooms SET secret_version = ? WHERE room_id = ?",
+        (secret_version, room_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def initialize_room_encryption_e2e(
+    room_id: str,
+    creator_id: str,
+    encrypted_base_secret: str,
+    creator_public_key: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Initialize encryption for a room in true E2E mode.
+
+    The server only stores encrypted secrets - it never sees the plaintext.
+
+    Args:
+        room_id: Room ID
+        creator_id: Creator's identity ID
+        encrypted_base_secret: Base64-encoded encrypted secret for creator
+        creator_public_key: Base64-encoded public key (creator is own inviter)
+        conn: Optional database connection
+
+    Returns:
+        Dict with initialization info
+
+    Raises:
+        ValueError: If room doesn't exist
+    """
+    conn = _get_conn(conn)
+
+    # Enable encryption on room (without storing plaintext secret)
+    cursor = conn.execute(
+        """UPDATE rooms SET encryption_enabled = 1, secret_version = 0, 
+           current_epoch_number = 0, base_secret = NULL
+           WHERE room_id = ?""",
+        (room_id,),
+    )
+    if cursor.rowcount == 0:
+        raise ValueError(f"Room {room_id} not found")
+    conn.commit()
+
+    # Store creator's encrypted secret
+    store_member_secret(
+        room_id=room_id,
+        identity_id=creator_id,
+        encrypted_base_secret=encrypted_base_secret,
+        inviter_public_key=creator_public_key,
+        secret_version=0,
+        conn=conn,
+    )
+
+    return {
+        "room_id": room_id,
+        "encryption_enabled": True,
+        "secret_version": 0,
+        "current_epoch_number": 0,
+    }
+
+
+def rotate_room_secret_e2e(
+    room_id: str,
+    new_secret_version: int,
+    member_secrets: list[dict],
+    triggered_by: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Rotate the room's base secret in true E2E mode.
+
+    The caller provides pre-encrypted secrets for each remaining member.
+    The server validates and stores them without seeing plaintext.
+
+    Args:
+        room_id: Room ID
+        new_secret_version: New version number (must be current + 1)
+        member_secrets: List of dicts with identity_id, encrypted_base_secret, inviter_public_key
+        triggered_by: Identity ID that triggered rotation (optional)
+        conn: Optional database connection
+
+    Returns:
+        Dict with rotation info
+
+    Raises:
+        ValueError: If room not found, version mismatch, or missing members
+    """
+    conn = _get_conn(conn)
+
+    # Verify room exists and get current version
+    room = get_room_with_encryption(room_id, conn=conn)
+    if not room:
+        raise ValueError(f"Room {room_id} not found")
+    if not room["encryption_enabled"]:
+        raise ValueError(f"Room {room_id} does not have encryption enabled")
+
+    current_version = room.get("secret_version", 0) or 0
+    if new_secret_version != current_version + 1:
+        raise ValueError(
+            f"Invalid secret version: expected {current_version + 1}, got {new_secret_version}"
+        )
+
+    # Verify all current members are included
+    members = list_room_members(room_id, conn=conn)
+    member_ids = {m["identity_id"] for m in members}
+    provided_ids = {s["identity_id"] for s in member_secrets}
+
+    if member_ids != provided_ids:
+        missing = member_ids - provided_ids
+        extra = provided_ids - member_ids
+        raise ValueError(f"Member mismatch: missing={missing}, extra={extra}")
+
+    # Store new secrets for each member
+    for secret in member_secrets:
+        store_member_secret(
+            room_id=room_id,
+            identity_id=secret["identity_id"],
+            encrypted_base_secret=secret["encrypted_base_secret"],
+            inviter_public_key=secret["inviter_public_key"],
+            secret_version=new_secret_version,
+            conn=conn,
+        )
+
+    # Update room's secret version
+    update_secret_version(room_id, new_secret_version, conn=conn)
+
+    return {
+        "room_id": room_id,
+        "secret_version": new_secret_version,
+        "member_count": len(member_secrets),
+        "triggered_by": triggered_by,
+    }

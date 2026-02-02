@@ -975,3 +975,204 @@ class TestEncryptedMessages:
         """validate_message_epoch raises for nonexistent room."""
         with pytest.raises(ValueError, match="not found"):
             db.validate_message_epoch("nonexistent-room", 0)
+
+
+# =============================================================================
+# True E2E Room Encryption Tests
+# =============================================================================
+
+
+class TestMemberSecretStorage:
+    """Tests for storing encrypted base secrets per member."""
+
+    def test_store_member_secret(self):
+        """Can store an encrypted secret for a member."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        result = db.store_member_secret(
+            room_id=room["room_id"],
+            identity_id=alice["id"],
+            encrypted_base_secret="encrypted_secret_base64",
+            inviter_public_key="inviter_pubkey_base64",
+            secret_version=0,
+        )
+
+        assert result["room_id"] == room["room_id"]
+        assert result["identity_id"] == alice["id"]
+        assert result["secret_version"] == 0
+
+    def test_get_member_secret_latest(self):
+        """Can retrieve latest secret for a member."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        # Store multiple versions
+        db.store_member_secret(room["room_id"], alice["id"], "secret_v0", "pk", 0)
+        db.store_member_secret(room["room_id"], alice["id"], "secret_v1", "pk", 1)
+        db.store_member_secret(room["room_id"], alice["id"], "secret_v2", "pk", 2)
+
+        result = db.get_member_secret(room["room_id"], alice["id"])
+
+        assert result["secret_version"] == 2
+        assert result["encrypted_base_secret"] == "secret_v2"
+
+    def test_get_member_secret_specific_version(self):
+        """Can retrieve a specific version."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        db.store_member_secret(room["room_id"], alice["id"], "secret_v0", "pk", 0)
+        db.store_member_secret(room["room_id"], alice["id"], "secret_v1", "pk", 1)
+
+        result = db.get_member_secret(room["room_id"], alice["id"], secret_version=0)
+
+        assert result["secret_version"] == 0
+        assert result["encrypted_base_secret"] == "secret_v0"
+
+    def test_list_member_secrets(self):
+        """Can list all secret versions for a member."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        db.store_member_secret(room["room_id"], alice["id"], "v0", "pk", 0)
+        db.store_member_secret(room["room_id"], alice["id"], "v1", "pk", 1)
+        db.store_member_secret(room["room_id"], alice["id"], "v2", "pk", 2)
+
+        secrets = db.list_member_secrets(room["room_id"], alice["id"])
+
+        assert len(secrets) == 3
+        assert secrets[0]["secret_version"] == 0
+        assert secrets[1]["secret_version"] == 1
+        assert secrets[2]["secret_version"] == 2
+
+
+class TestInitializeRoomEncryptionE2E:
+    """Tests for initializing E2E encryption."""
+
+    def test_initialize_room_encryption_e2e(self):
+        """Can initialize encryption in E2E mode."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pubkey", "signing_pubkey")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        result = db.initialize_room_encryption_e2e(
+            room_id=room["room_id"],
+            creator_id=alice["id"],
+            encrypted_base_secret="encrypted_secret_for_alice",
+            creator_public_key="alice_pubkey",
+        )
+
+        assert result["encryption_enabled"] is True
+        assert result["secret_version"] == 0
+
+        # Verify room state
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["encryption_enabled"] == 1
+        assert room_info["secret_version"] == 0
+        assert room_info["base_secret"] is None  # Not stored in E2E mode
+
+        # Verify creator's secret is stored
+        secret = db.get_member_secret(room["room_id"], alice["id"])
+        assert secret["encrypted_base_secret"] == "encrypted_secret_for_alice"
+
+
+class TestRotateRoomSecretE2E:
+    """Tests for rotating secrets in E2E mode."""
+
+    def test_rotate_secret_e2e(self):
+        """Can rotate secret in E2E mode."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        # Initialize E2E
+        db.initialize_room_encryption_e2e(
+            room["room_id"], alice["id"], "enc_secret_alice", "alice_pk"
+        )
+
+        # Add Bob
+        db.add_room_member(room["room_id"], bob["id"], trigger_rotation=False)
+        db.store_member_secret(room["room_id"], bob["id"], "enc_secret_bob", "alice_pk", 0)
+
+        # Rotate (e.g., after Carol was removed)
+        result = db.rotate_room_secret_e2e(
+            room_id=room["room_id"],
+            new_secret_version=1,
+            member_secrets=[
+                {
+                    "identity_id": alice["id"],
+                    "encrypted_base_secret": "enc_v1_alice",
+                    "inviter_public_key": "alice_pk",
+                },
+                {
+                    "identity_id": bob["id"],
+                    "encrypted_base_secret": "enc_v1_bob",
+                    "inviter_public_key": "alice_pk",
+                },
+            ],
+        )
+
+        assert result["secret_version"] == 1
+        assert result["member_count"] == 2
+
+        # Verify new secrets
+        alice_secret = db.get_member_secret(room["room_id"], alice["id"])
+        assert alice_secret["secret_version"] == 1
+        assert alice_secret["encrypted_base_secret"] == "enc_v1_alice"
+
+    def test_rotate_secret_version_mismatch(self):
+        """Rotation fails with wrong version number."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk", "spk")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "enc", "pk")
+
+        with pytest.raises(ValueError, match="Invalid secret version"):
+            db.rotate_room_secret_e2e(
+                room_id=room["room_id"],
+                new_secret_version=5,  # Should be 1
+                member_secrets=[
+                    {
+                        "identity_id": alice["id"],
+                        "encrypted_base_secret": "enc",
+                        "inviter_public_key": "pk",
+                    },
+                ],
+            )
+
+    def test_rotate_secret_missing_member(self):
+        """Rotation fails if not all members have secrets."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "enc", "pk")
+        db.add_room_member(room["room_id"], bob["id"], trigger_rotation=False)
+
+        with pytest.raises(ValueError, match="Member mismatch"):
+            db.rotate_room_secret_e2e(
+                room_id=room["room_id"],
+                new_secret_version=1,
+                member_secrets=[
+                    # Missing bob
+                    {
+                        "identity_id": alice["id"],
+                        "encrypted_base_secret": "enc",
+                        "inviter_public_key": "pk",
+                    },
+                ],
+            )
