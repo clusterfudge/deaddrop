@@ -488,61 +488,77 @@ class TestRotateRoomEpoch:
     """Tests for rotating room epochs."""
 
     def test_rotate_epoch_member_joined(self):
-        """Rotate epoch when a member joins."""
+        """Rotate epoch when a member joins (via add_room_member)."""
         ns = db.create_namespace()
         alice = db.create_identity(ns["ns"])
         bob = db.create_identity(ns["ns"])
+
+        # Bob needs a pubkey to join encrypted room
+        bob_kp = generate_keypair()
+        db.create_pubkey(
+            ns["ns"],
+            bob["id"],
+            bytes_to_base64url(bob_kp.public_key),
+            bytes_to_base64url(bob_kp.signing_public_key),
+        )
+
         room = db.create_room(ns["ns"], alice["id"])
         base_secret = generate_room_base_secret()
 
         # Initialize encryption (epoch 0)
         db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
 
-        # Add Bob
+        # Add Bob - this automatically triggers rotation
         db.add_room_member(room["room_id"], bob["id"])
 
-        # Rotate (epoch 1)
-        result = db.rotate_room_epoch(
-            room_id=room["room_id"],
-            reason="member_joined",
-            triggered_by=bob["id"],
-        )
-
-        assert result["epoch"]["epoch_number"] == 1
-        assert result["epoch"]["reason"] == "member_joined"
-        assert len(result["member_keys"]) == 2  # Alice + Bob
-
-        # Room should be at epoch 1
+        # Room should be at epoch 1 (auto-rotated on member add)
         room_info = db.get_room_with_encryption(room["room_id"])
         assert room_info["current_epoch_number"] == 1
 
+        # Verify epoch 1 exists and has correct reason
+        epoch = db.get_epoch_by_number(room["room_id"], 1)
+        assert epoch is not None
+        assert epoch["reason"] == "member_joined"
+        assert epoch["triggered_by"] == bob["id"]
+
+        # Both members should have keys for epoch 1
+        alice_key = db.get_epoch_key_for_identity(room["room_id"], 1, alice["id"])
+        bob_key = db.get_epoch_key_for_identity(room["room_id"], 1, bob["id"])
+        assert alice_key is not None
+        assert bob_key is not None
+
     def test_rotate_epoch_member_left(self):
-        """Rotate epoch when a member leaves."""
+        """Rotate epoch when a member leaves (via remove_room_member)."""
         ns = db.create_namespace()
         alice = db.create_identity(ns["ns"])
         bob = db.create_identity(ns["ns"])
         room = db.create_room(ns["ns"], alice["id"])
         base_secret = generate_room_base_secret()
 
-        # Add Bob before encryption
+        # Add Bob before encryption (no pubkey required for unencrypted room)
         db.add_room_member(room["room_id"], bob["id"])
 
         # Initialize encryption (epoch 0)
         db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
 
-        # Remove Bob
+        # Remove Bob - this automatically triggers rotation
         db.remove_room_member(room["room_id"], bob["id"])
 
-        # Rotate (epoch 1)
-        result = db.rotate_room_epoch(
-            room_id=room["room_id"],
-            reason="member_left",
-            triggered_by=bob["id"],
-        )
+        # Room should be at epoch 1 (auto-rotated on member remove)
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 1
 
-        assert result["epoch"]["epoch_number"] == 1
-        assert result["epoch"]["reason"] == "member_left"
-        assert len(result["member_keys"]) == 1  # Just Alice
+        # Verify epoch 1 exists and has correct reason
+        epoch = db.get_epoch_by_number(room["room_id"], 1)
+        assert epoch is not None
+        assert epoch["reason"] == "member_left"
+        assert epoch["triggered_by"] == bob["id"]
+
+        # Only Alice should have key for epoch 1
+        alice_key = db.get_epoch_key_for_identity(room["room_id"], 1, alice["id"])
+        bob_key = db.get_epoch_key_for_identity(room["room_id"], 1, bob["id"])
+        assert alice_key is not None
+        assert bob_key is None  # Bob removed, shouldn't have new epoch key
 
     def test_rotate_epoch_verifies_key_chain(self):
         """Verify epoch keys form a correct derivation chain."""
@@ -614,3 +630,189 @@ class TestRotateRoomEpoch:
         # Should have 6 epochs total
         epochs = db.list_room_epochs(room["room_id"])
         assert len(epochs) == 6
+
+
+# =============================================================================
+# Pubkey Enforcement Tests
+# =============================================================================
+
+
+class TestPubkeyEnforcementOnMembership:
+    """Tests for pubkey requirement enforcement on encrypted rooms."""
+
+    def test_join_encrypted_room_without_pubkey_fails(self):
+        """Cannot join encrypted room without a pubkey."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])  # Bob has no pubkey
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        with pytest.raises(ValueError, match="must have a registered pubkey"):
+            db.add_room_member(room["room_id"], bob["id"])
+
+    def test_join_encrypted_room_with_pubkey_succeeds(self):
+        """Can join encrypted room with a pubkey."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+
+        # Register Bob's pubkey
+        bob_kp = generate_keypair()
+        db.create_pubkey(
+            ns["ns"],
+            bob["id"],
+            bytes_to_base64url(bob_kp.public_key),
+            bytes_to_base64url(bob_kp.signing_public_key),
+        )
+
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Bob can join
+        member = db.add_room_member(room["room_id"], bob["id"])
+        assert member["identity_id"] == bob["id"]
+
+        # Verify Bob is a member
+        assert db.is_room_member(room["room_id"], bob["id"])
+
+    def test_join_unencrypted_room_without_pubkey_succeeds(self):
+        """Can join unencrypted room without a pubkey."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])  # Bob has no pubkey
+        room = db.create_room(ns["ns"], alice["id"])
+
+        # Room is not encrypted, so Bob can join
+        member = db.add_room_member(room["room_id"], bob["id"])
+        assert member["identity_id"] == bob["id"]
+
+    def test_join_triggers_rotation_for_encrypted_room(self):
+        """Joining encrypted room triggers epoch rotation."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+
+        # Register Bob's pubkey
+        bob_kp = generate_keypair()
+        db.create_pubkey(
+            ns["ns"],
+            bob["id"],
+            bytes_to_base64url(bob_kp.public_key),
+            bytes_to_base64url(bob_kp.signing_public_key),
+        )
+
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Room at epoch 0
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 0
+
+        # Bob joins
+        db.add_room_member(room["room_id"], bob["id"])
+
+        # Room should be at epoch 1
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 1
+
+    def test_join_no_rotation_for_unencrypted_room(self):
+        """Joining unencrypted room does not create epochs."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+
+        db.add_room_member(room["room_id"], bob["id"])
+
+        # No epochs should exist
+        epochs = db.list_room_epochs(room["room_id"])
+        assert len(epochs) == 0
+
+    def test_leave_triggers_rotation_for_encrypted_room(self):
+        """Leaving encrypted room triggers epoch rotation."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+
+        # Add Bob before encryption
+        db.add_room_member(room["room_id"], bob["id"])
+
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Room at epoch 0
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 0
+
+        # Bob leaves
+        db.remove_room_member(room["room_id"], bob["id"])
+
+        # Room should be at epoch 1
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 1
+
+    def test_leave_no_rotation_for_unencrypted_room(self):
+        """Leaving unencrypted room does not create epochs."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+
+        db.add_room_member(room["room_id"], bob["id"])
+        db.remove_room_member(room["room_id"], bob["id"])
+
+        # No epochs should exist
+        epochs = db.list_room_epochs(room["room_id"])
+        assert len(epochs) == 0
+
+    def test_leave_no_rotation_when_last_member(self):
+        """Removing last member doesn't trigger rotation (no one to rotate for)."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Room at epoch 0
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 0
+
+        # Alice leaves (last member)
+        db.remove_room_member(room["room_id"], alice["id"])
+
+        # Room should still be at epoch 0 (no rotation for empty room)
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 0
+
+    def test_trigger_rotation_false_skips_rotation(self):
+        """trigger_rotation=False skips automatic rotation."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+
+        # Register Bob's pubkey
+        bob_kp = generate_keypair()
+        db.create_pubkey(
+            ns["ns"],
+            bob["id"],
+            bytes_to_base64url(bob_kp.public_key),
+            bytes_to_base64url(bob_kp.signing_public_key),
+        )
+
+        room = db.create_room(ns["ns"], alice["id"])
+        base_secret = generate_room_base_secret()
+        db.initialize_room_encryption(room["room_id"], base_secret, alice["id"])
+
+        # Add Bob with trigger_rotation=False
+        db.add_room_member(room["room_id"], bob["id"], trigger_rotation=False)
+
+        # Room should still be at epoch 0
+        room_info = db.get_room_with_encryption(room["room_id"])
+        assert room_info["current_epoch_number"] == 0

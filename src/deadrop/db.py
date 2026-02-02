@@ -1873,33 +1873,52 @@ def add_room_member(
     room_id: str,
     identity_id: str,
     conn: sqlite3.Connection | None = None,
+    trigger_rotation: bool = True,
 ) -> dict:
     """Add a member to a room.
+
+    For encrypted rooms:
+    - Identity must have a registered public key
+    - Adding a member triggers epoch rotation (unless trigger_rotation=False)
 
     Args:
         room_id: Room ID
         identity_id: Identity ID to add
         conn: Optional database connection
+        trigger_rotation: If True and room is encrypted, trigger epoch rotation
 
     Returns:
         Member info dict
 
     Raises:
-        ValueError: If room not found or identity not in same namespace
+        ValueError: If room not found, identity not in namespace, or
+                   identity lacks pubkey for encrypted room
     """
     conn = _get_conn(conn)
 
-    # Get room info to verify it exists and get namespace
-    room = get_room(room_id, conn=conn)
+    # Get room info including encryption status
+    room = get_room_with_encryption(room_id, conn=conn)
     if not room:
         raise ValueError(f"Room {room_id} not found")
 
     ns = room["ns"]
 
     # Verify identity exists in same namespace
-    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, identity_id))
-    if not cursor.fetchone():
+    cursor = conn.execute(
+        "SELECT id, current_pubkey_id FROM identities WHERE ns = ? AND id = ?",
+        (ns, identity_id),
+    )
+    identity_row = cursor.fetchone()
+    if not identity_row:
         raise ValueError(f"Identity {identity_id} not found in namespace {ns}")
+
+    # For encrypted rooms, verify identity has a pubkey
+    if room["encryption_enabled"]:
+        current_pubkey_id = identity_row[1]
+        if not current_pubkey_id:
+            raise ValueError(
+                f"Identity {identity_id} must have a registered pubkey to join encrypted room"
+            )
 
     # Check if already a member
     if is_room_member(room_id, identity_id, conn=conn):
@@ -1919,6 +1938,10 @@ def add_room_member(
     )
     conn.commit()
 
+    # Trigger epoch rotation for encrypted rooms
+    if room["encryption_enabled"] and trigger_rotation:
+        rotate_room_epoch(room_id, reason="member_joined", triggered_by=identity_id, conn=conn)
+
     return {
         "room_id": room_id,
         "identity_id": identity_id,
@@ -1932,24 +1955,44 @@ def remove_room_member(
     room_id: str,
     identity_id: str,
     conn: sqlite3.Connection | None = None,
+    trigger_rotation: bool = True,
 ) -> bool:
     """Remove a member from a room.
+
+    For encrypted rooms, removing a member triggers epoch rotation
+    to ensure the removed member can't decrypt future messages.
 
     Args:
         room_id: Room ID
         identity_id: Identity ID to remove
         conn: Optional database connection
+        trigger_rotation: If True and room is encrypted, trigger epoch rotation
 
     Returns:
         True if removed, False if not a member
     """
     conn = _get_conn(conn)
+
+    # Get room encryption status before removal
+    room = get_room_with_encryption(room_id, conn=conn)
+    is_encrypted = room and room["encryption_enabled"]
+
     cursor = conn.execute(
         "DELETE FROM room_members WHERE room_id = ? AND identity_id = ?",
         (room_id, identity_id),
     )
     conn.commit()
-    return cursor.rowcount > 0
+
+    removed = cursor.rowcount > 0
+
+    # Trigger epoch rotation for encrypted rooms if member was actually removed
+    # and there are still members left
+    if removed and is_encrypted and trigger_rotation:
+        members = list_room_members(room_id, conn=conn)
+        if members:  # Only rotate if there are remaining members
+            rotate_room_epoch(room_id, reason="member_left", triggered_by=identity_id, conn=conn)
+
+    return removed
 
 
 def list_room_members(
