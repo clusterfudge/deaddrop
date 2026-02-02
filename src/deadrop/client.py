@@ -857,3 +857,73 @@ class Deaddrop:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+    # --- Invite Methods ---
+
+    def create_invite(
+        self,
+        ns: str,
+        identity_id: str,
+        identity_secret: str,
+        ns_secret: str,
+        display_name: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an invite for an identity.
+
+        The invite URL can be shared to allow claiming the identity's credentials.
+        The URL contains an encryption key in the fragment that never leaves the client.
+
+        Args:
+            ns: Namespace ID
+            identity_id: Identity to create invite for
+            identity_secret: The identity's secret (to be encrypted in the invite)
+            ns_secret: Namespace secret (for authorization)
+            display_name: Optional display name for the invite
+            expires_at: Optional expiration time (ISO 8601)
+
+        Returns:
+            dict with:
+                invite_id: The invite identifier
+                invite_url: Full URL to share (includes encryption key in fragment)
+                expires_at: When the invite expires (if set)
+
+        Example:
+            # Create an invite for Bob
+            invite = client.create_invite(ns, bob["id"], bob["secret"], ns_secret)
+            print(f"Share this link: {invite['invite_url']}")
+        """
+        return self._backend.create_invite(
+            ns=ns,
+            identity_id=identity_id,
+            identity_secret=identity_secret,
+            ns_secret=ns_secret,
+            display_name=display_name,
+            expires_at=expires_at,
+        )
+
+    def claim_invite(
+        self,
+        invite_url: str,
+    ) -> dict[str, Any]:
+        """Claim an invite and get the identity credentials.
+
+        The invite URL contains the server, invite ID, and encryption key.
+        After claiming, the invite cannot be used again.
+
+        Args:
+            invite_url: Full invite URL (e.g., https://server/join/{id}#{key})
+
+        Returns:
+            dict with:
+                ns: Namespace ID
+                identity_id: Identity ID
+                secret: Identity secret (decrypted)
+                display_name: Identity display name (if set)
+
+        Example:
+            # Claim an invite URL
+            creds = client.claim_invite("https://deaddrop.example.com/join/abc123#key")
+            print(f"Got credentials for identity {creds['identity_id']}")
+        """
+        return self._backend.claim_invite(invite_url=invite_url)

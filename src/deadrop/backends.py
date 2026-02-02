@@ -449,6 +449,38 @@ class Backend(ABC):
         """
         ...
 
+    # --- Invite Methods ---
+
+    @abstractmethod
+    def create_invite(
+        self,
+        ns: str,
+        identity_id: str,
+        identity_secret: str,
+        ns_secret: str,
+        display_name: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an invite for an identity.
+
+        Args:
+            ns: Namespace ID
+            identity_id: Identity to create invite for
+            identity_secret: The identity's secret (to be encrypted)
+            ns_secret: Namespace secret (for authorization)
+            display_name: Optional display name
+            expires_at: Optional expiration (ISO 8601)
+
+        Returns:
+            dict with invite_id, invite_url, expires_at
+        """
+        ...
+
+    @abstractmethod
+    def claim_invite(self, invite_url: str) -> dict[str, Any]:
+        """Claim an invite URL and return decrypted credentials."""
+        ...
+
     # --- Utility Methods ---
 
     def verify_identity_secret(self, ns: str, identity_id: str, secret: str) -> bool:
@@ -968,6 +1000,26 @@ class LocalBackend(Backend):
         ns_config = self.config.namespaces.get(ns)
         return ns_config["secret"] if ns_config else None
 
+    # --- Invite Methods ---
+
+    def create_invite(
+        self,
+        ns: str,
+        identity_id: str,
+        identity_secret: str,
+        ns_secret: str,
+        display_name: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an invite for an identity (local backend)."""
+        # For local backend, invites work differently - we create a file:// URL
+        # This is primarily used for testing; production uses remote backend
+        raise NotImplementedError("Local backend invites not yet implemented")
+
+    def claim_invite(self, invite_url: str) -> dict[str, Any]:
+        """Claim an invite URL (local backend)."""
+        raise NotImplementedError("Local backend invite claiming not yet implemented")
+
 
 class RemoteBackend(Backend):
     """Remote HTTP API backend.
@@ -1459,6 +1511,78 @@ class RemoteBackend(Backend):
             headers=self._inbox_headers(secret),
         )
         return result.get("unread_count", 0)
+
+    # --- Invite Methods ---
+
+    def create_invite(
+        self,
+        ns: str,
+        identity_id: str,
+        identity_secret: str,
+        ns_secret: str,
+        display_name: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an invite for an identity."""
+        from .crypto import create_invite_secrets
+
+        # Generate invite secrets (encrypts the identity secret)
+        invite_secrets = create_invite_secrets(identity_secret)
+
+        # Send to server
+        result = self._request(
+            "POST",
+            f"/{ns}/invites",
+            json={
+                "identity_id": identity_id,
+                "invite_id": invite_secrets.invite_id,
+                "encrypted_secret": invite_secrets.encrypted_secret_hex,
+                "display_name": display_name,
+                "expires_at": expires_at,
+            },
+            headers=self._ns_headers(ns_secret),
+        )
+
+        # Build the invite URL with the encryption key in the fragment
+        invite_url = f"{self._url}/join/{invite_secrets.invite_id}#{invite_secrets.key_base64}"
+
+        return {
+            "invite_id": invite_secrets.invite_id,
+            "invite_url": invite_url,
+            "expires_at": result.get("expires_at"),
+        }
+
+    def claim_invite(self, invite_url: str) -> dict[str, Any]:
+        """Claim an invite URL and return decrypted credentials."""
+        import re
+        from urllib.parse import urlparse
+        from .crypto import decrypt_invite_secret
+
+        # Parse the invite URL: https://server/join/{invite_id}#{key}
+        parsed = urlparse(invite_url)
+        fragment = parsed.fragment  # The encryption key
+        path = parsed.path
+
+        # Extract invite_id from path
+        match = re.match(r"/join/([a-f0-9]+)", path)
+        if not match:
+            raise ValueError(f"Invalid invite URL format: {invite_url}")
+
+        invite_id = match.group(1)
+
+        # Claim from server
+        result = self._request("POST", f"/api/invites/{invite_id}/claim")
+
+        # Decrypt the secret using the key from the URL fragment
+        encrypted_secret = result["encrypted_secret"]
+        identity_secret = decrypt_invite_secret(encrypted_secret, fragment, invite_id)
+
+        return {
+            "ns": result["ns"],
+            "identity_id": result["identity_id"],
+            "secret": identity_secret,
+            "display_name": result.get("identity_display_name"),
+        }
 
 
 class InMemoryBackend(LocalBackend):
