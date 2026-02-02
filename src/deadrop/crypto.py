@@ -4,14 +4,19 @@ Includes:
 - AES-256-GCM for encrypting mailbox secrets in invite links
 - NaCl box (X25519 + XSalsa20-Poly1305) for end-to-end message encryption
 - Ed25519 for message signing
+- Room encryption with forward secrecy (HKDF + SecretBox)
 """
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from nacl.public import Box, PrivateKey, PublicKey
+from nacl.secret import SecretBox
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
 
@@ -326,3 +331,257 @@ def verify_signature(message: str, signature: bytes, public_key: bytes) -> bool:
         return True
     except BadSignatureError:
         return False
+
+
+# =============================================================================
+# Room Encryption (Symmetric key with forward secrecy)
+# =============================================================================
+
+
+def compute_membership_hash(member_ids: list[str]) -> str:
+    """
+    Compute a deterministic hash of room membership.
+
+    The hash is order-independent (members are sorted) to ensure
+    consistent results regardless of how members are enumerated.
+
+    Args:
+        member_ids: List of identity IDs in the room
+
+    Returns:
+        64-character hex string (SHA-256 hash)
+    """
+    # Sort for determinism, join with separator that can't appear in IDs
+    sorted_ids = sorted(member_ids)
+    membership_string = "\x00".join(sorted_ids)
+    return hashlib.sha256(membership_string.encode("utf-8")).hexdigest()
+
+
+def derive_epoch_key(
+    previous_key_or_secret: bytes,
+    epoch_number: int,
+    room_id: str,
+    membership_hash: str,
+) -> bytes:
+    """
+    Derive an epoch key using HKDF.
+
+    For epoch 0: previous_key_or_secret is the room's base secret
+    For epoch N>0: previous_key_or_secret is the epoch N-1 key
+
+    This provides forward secrecy - knowing epoch N key, you cannot
+    derive epoch N-1 key (HKDF is one-way).
+
+    Args:
+        previous_key_or_secret: 32-byte base secret (epoch 0) or previous epoch key
+        epoch_number: The epoch number being derived
+        room_id: Room identifier (binds key to room)
+        membership_hash: Hash of current members (binds key to membership)
+
+    Returns:
+        32-byte epoch key for use with SecretBox
+    """
+    # Build info string that binds key to context
+    info = f"deaddrop-room-epoch:{room_id}:{epoch_number}:{membership_hash}".encode("utf-8")
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,  # No salt - previous key provides entropy
+        info=info,
+    )
+
+    return hkdf.derive(previous_key_or_secret)
+
+
+def generate_room_base_secret() -> bytes:
+    """
+    Generate a random base secret for a new encrypted room.
+
+    This secret is used to derive epoch 0 key and should be
+    stored securely (never transmitted, only used server-side
+    for key derivation).
+
+    Returns:
+        32-byte random secret
+    """
+    return os.urandom(32)
+
+
+@dataclass
+class EncryptedRoomMessage:
+    """Container for an encrypted room message."""
+
+    ciphertext: bytes  # SecretBox encrypted: plaintext + signature
+    nonce: bytes  # 24-byte nonce
+    signature: bytes  # 64-byte Ed25519 signature (for verification after decrypt)
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "ciphertext": bytes_to_base64url(self.ciphertext),
+            "nonce": bytes_to_base64url(self.nonce),
+            "signature": bytes_to_base64url(self.signature),
+            "algorithm": "xsalsa20-poly1305+ed25519",
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EncryptedRoomMessage":
+        """Reconstruct from dictionary."""
+        return cls(
+            ciphertext=base64url_to_bytes(data["ciphertext"]),
+            nonce=base64url_to_bytes(data["nonce"]),
+            signature=base64url_to_bytes(data["signature"]),
+        )
+
+    def to_json(self) -> str:
+        """Serialize to JSON string."""
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "EncryptedRoomMessage":
+        """Deserialize from JSON string."""
+        return cls.from_dict(json.loads(json_str))
+
+
+def encrypt_room_message(
+    plaintext: str,
+    epoch_key: bytes,
+    sender_signing_key: bytes,
+    room_id: str,
+    epoch_number: int,
+) -> EncryptedRoomMessage:
+    """
+    Encrypt a message for a room using the epoch's symmetric key.
+
+    The message is signed before encryption (sign-then-encrypt) so that:
+    1. Only room members with the epoch key can decrypt
+    2. After decryption, the signature proves the sender's identity
+
+    Args:
+        plaintext: Message to encrypt
+        epoch_key: 32-byte symmetric key for this epoch
+        sender_signing_key: 32-byte Ed25519 private key of sender
+        room_id: Room identifier (included in signed data)
+        epoch_number: Epoch number (included in signed data)
+
+    Returns:
+        EncryptedRoomMessage with ciphertext, nonce, and signature
+    """
+    # Create the data to sign (binds message to room and epoch)
+    sign_data = f"{room_id}:{epoch_number}:{plaintext}"
+    signature = sign_message(sign_data, sender_signing_key)
+
+    # Combine plaintext with signature for encryption
+    # Format: <plaintext_length:4 bytes><plaintext><signature:64 bytes>
+    plaintext_bytes = plaintext.encode("utf-8")
+    length_prefix = len(plaintext_bytes).to_bytes(4, "big")
+    combined = length_prefix + plaintext_bytes + signature
+
+    # Encrypt with SecretBox (XSalsa20-Poly1305)
+    box = SecretBox(epoch_key)
+    nonce = os.urandom(24)
+    ciphertext = box.encrypt(combined, nonce).ciphertext
+
+    return EncryptedRoomMessage(
+        ciphertext=ciphertext,
+        nonce=nonce,
+        signature=signature,
+    )
+
+
+def decrypt_room_message(
+    encrypted: EncryptedRoomMessage,
+    epoch_key: bytes,
+    sender_signing_pubkey: bytes,
+    room_id: str,
+    epoch_number: int,
+) -> str:
+    """
+    Decrypt a room message and verify the sender's signature.
+
+    Args:
+        encrypted: The encrypted message container
+        epoch_key: 32-byte symmetric key for this epoch
+        sender_signing_pubkey: 32-byte Ed25519 public key of claimed sender
+        room_id: Room identifier (for signature verification)
+        epoch_number: Epoch number (for signature verification)
+
+    Returns:
+        Decrypted plaintext string
+
+    Raises:
+        nacl.exceptions.CryptoError: If decryption fails (wrong key or tampered)
+        ValueError: If signature verification fails
+    """
+    # Decrypt with SecretBox
+    box = SecretBox(epoch_key)
+    combined = box.decrypt(encrypted.ciphertext, encrypted.nonce)
+
+    # Parse: <plaintext_length:4 bytes><plaintext><signature:64 bytes>
+    plaintext_length = int.from_bytes(combined[:4], "big")
+    plaintext_bytes = combined[4 : 4 + plaintext_length]
+    signature = combined[4 + plaintext_length :]
+
+    plaintext = plaintext_bytes.decode("utf-8")
+
+    # Verify signature
+    sign_data = f"{room_id}:{epoch_number}:{plaintext}"
+    if not verify_signature(sign_data, signature, sender_signing_pubkey):
+        raise ValueError("Invalid signature - message may be forged or corrupted")
+
+    return plaintext
+
+
+def encrypt_epoch_key_for_member(
+    epoch_key: bytes,
+    member_public_key: bytes,
+    distributor_private_key: bytes,
+) -> bytes:
+    """
+    Encrypt an epoch key for delivery to a room member.
+
+    Uses NaCl box (asymmetric encryption) so only the intended
+    member can decrypt with their private key.
+
+    Args:
+        epoch_key: 32-byte epoch key to encrypt
+        member_public_key: 32-byte X25519 public key of the member
+        distributor_private_key: 32-byte private key of the key distributor
+
+    Returns:
+        Encrypted epoch key (nonce + ciphertext)
+    """
+    # Reuse existing encrypt_message but with bytes instead of string
+    sender_key = PrivateKey(distributor_private_key)
+    recipient_key = PublicKey(member_public_key)
+    box = Box(sender_key, recipient_key)
+
+    encrypted = box.encrypt(epoch_key)
+    return bytes(encrypted)
+
+
+def decrypt_epoch_key(
+    encrypted_epoch_key: bytes,
+    distributor_public_key: bytes,
+    member_private_key: bytes,
+) -> bytes:
+    """
+    Decrypt an epoch key received from the key distributor.
+
+    Args:
+        encrypted_epoch_key: Encrypted key (nonce + ciphertext)
+        distributor_public_key: 32-byte X25519 public key of distributor
+        member_private_key: 32-byte private key of the member
+
+    Returns:
+        32-byte epoch key
+
+    Raises:
+        nacl.exceptions.CryptoError: If decryption fails
+    """
+    member_key = PrivateKey(member_private_key)
+    distributor_key = PublicKey(distributor_public_key)
+    box = Box(member_key, distributor_key)
+
+    return bytes(box.decrypt(encrypted_epoch_key))

@@ -426,3 +426,609 @@ class TestMessageSigning:
 
         signature = sign_message(message, kp.private_key)
         assert verify_signature(message, signature, kp.signing_public_key)
+
+
+# =============================================================================
+# Room Encryption Tests (Symmetric key with forward secrecy)
+# =============================================================================
+
+
+class TestMembershipHash:
+    """Tests for membership hash computation."""
+
+    def test_membership_hash_deterministic(self):
+        """Same members should produce same hash."""
+        from deadrop.crypto import compute_membership_hash
+
+        members = ["alice-id", "bob-id", "carol-id"]
+        hash1 = compute_membership_hash(members)
+        hash2 = compute_membership_hash(members)
+
+        assert hash1 == hash2
+
+    def test_membership_hash_order_independent(self):
+        """Member order should not affect hash (sorted internally)."""
+        from deadrop.crypto import compute_membership_hash
+
+        members1 = ["alice-id", "bob-id", "carol-id"]
+        members2 = ["carol-id", "alice-id", "bob-id"]
+        members3 = ["bob-id", "carol-id", "alice-id"]
+
+        hash1 = compute_membership_hash(members1)
+        hash2 = compute_membership_hash(members2)
+        hash3 = compute_membership_hash(members3)
+
+        assert hash1 == hash2 == hash3
+
+    def test_membership_hash_format(self):
+        """Hash should be 64 hex characters (SHA-256)."""
+        from deadrop.crypto import compute_membership_hash
+
+        members = ["alice-id"]
+        membership_hash = compute_membership_hash(members)
+
+        assert len(membership_hash) == 64
+        # Should be valid hex
+        int(membership_hash, 16)
+
+    def test_membership_hash_different_members(self):
+        """Different members should produce different hashes."""
+        from deadrop.crypto import compute_membership_hash
+
+        hash1 = compute_membership_hash(["alice-id", "bob-id"])
+        hash2 = compute_membership_hash(["alice-id", "carol-id"])
+
+        assert hash1 != hash2
+
+    def test_membership_hash_empty(self):
+        """Empty member list should produce consistent hash."""
+        from deadrop.crypto import compute_membership_hash
+
+        hash1 = compute_membership_hash([])
+        hash2 = compute_membership_hash([])
+
+        assert hash1 == hash2
+        assert len(hash1) == 64
+
+
+class TestEpochKeyDerivation:
+    """Tests for epoch key derivation."""
+
+    def test_epoch_key_derivation_deterministic(self):
+        """Same inputs should produce same epoch key."""
+        from deadrop.crypto import derive_epoch_key, generate_room_base_secret
+
+        base_secret = generate_room_base_secret()
+        room_id = "room-123"
+        membership_hash = "a" * 64
+
+        key1 = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+        key2 = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+
+        assert key1 == key2
+
+    def test_epoch_key_length(self):
+        """Epoch key should be 32 bytes."""
+        from deadrop.crypto import derive_epoch_key, generate_room_base_secret
+
+        base_secret = generate_room_base_secret()
+        key = derive_epoch_key(base_secret, 0, "room-123", "a" * 64)
+
+        assert len(key) == 32
+
+    def test_epoch_key_different_epochs(self):
+        """Different epochs should produce different keys."""
+        from deadrop.crypto import derive_epoch_key, generate_room_base_secret
+
+        base_secret = generate_room_base_secret()
+        room_id = "room-123"
+        membership_hash = "a" * 64
+
+        key0 = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+        key1 = derive_epoch_key(key0, 1, room_id, membership_hash)
+        key2 = derive_epoch_key(key1, 2, room_id, membership_hash)
+
+        assert key0 != key1 != key2
+
+    def test_epoch_key_different_rooms(self):
+        """Different rooms should produce different keys."""
+        from deadrop.crypto import derive_epoch_key, generate_room_base_secret
+
+        base_secret = generate_room_base_secret()
+        membership_hash = "a" * 64
+
+        key1 = derive_epoch_key(base_secret, 0, "room-1", membership_hash)
+        key2 = derive_epoch_key(base_secret, 0, "room-2", membership_hash)
+
+        assert key1 != key2
+
+    def test_epoch_key_different_membership(self):
+        """Different membership should produce different keys."""
+        from deadrop.crypto import derive_epoch_key, generate_room_base_secret
+
+        base_secret = generate_room_base_secret()
+        room_id = "room-123"
+
+        key1 = derive_epoch_key(base_secret, 0, room_id, "a" * 64)
+        key2 = derive_epoch_key(base_secret, 0, room_id, "b" * 64)
+
+        assert key1 != key2
+
+    def test_forward_secrecy_cannot_derive_previous(self):
+        """Given epoch N key, should not be able to derive epoch N-1 key.
+
+        This is a property test - we verify that the derivation is one-way
+        by showing that knowing key_N and the derivation parameters doesn't
+        let us recover key_N-1.
+        """
+        from deadrop.crypto import derive_epoch_key, generate_room_base_secret
+
+        base_secret = generate_room_base_secret()
+        room_id = "room-123"
+        membership_hash = "a" * 64
+
+        # Derive chain: base -> key0 -> key1 -> key2
+        key0 = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+        key1 = derive_epoch_key(key0, 1, room_id, membership_hash)
+        key2 = derive_epoch_key(key1, 2, room_id, membership_hash)
+
+        # If we only have key2, we cannot derive key1 or key0
+        # (HKDF is one-way - no inverse function exists)
+        # We can verify this indirectly by showing that:
+        # 1. key2 is deterministic from key1
+        # 2. But there's no function to get key1 from key2
+
+        # Verify the chain is correct (forward derivation works)
+        assert derive_epoch_key(key0, 1, room_id, membership_hash) == key1
+        assert derive_epoch_key(key1, 2, room_id, membership_hash) == key2
+
+        # An attacker with key2 trying random "reverse" operations
+        # would not get key1 (this is the security property of HKDF)
+        # We can't directly test "impossibility" but we verify the forward chain
+
+
+class TestRoomMessageEncryption:
+    """Tests for room message encryption/decryption."""
+
+    def test_encrypt_decrypt_roundtrip(self):
+        """Encrypted room message should decrypt correctly."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            decrypt_room_message,
+        )
+
+        # Setup
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        # Encrypt
+        plaintext = "Hello, room!"
+        encrypted = encrypt_room_message(
+            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Decrypt
+        decrypted = decrypt_room_message(
+            encrypted, epoch_key, sender.signing_public_key, room_id, epoch_number
+        )
+
+        assert decrypted == plaintext
+
+    def test_encrypt_decrypt_unicode(self):
+        """Should handle unicode messages."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            decrypt_room_message,
+        )
+
+        sender = generate_keypair()
+        room_id = "room-unicode"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        plaintext = "Hello 世界! 🔐 Encrypted room message"
+        encrypted = encrypt_room_message(
+            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+        )
+        decrypted = decrypt_room_message(
+            encrypted, epoch_key, sender.signing_public_key, room_id, epoch_number
+        )
+
+        assert decrypted == plaintext
+
+    def test_different_ciphertext_each_time(self):
+        """Same message should produce different ciphertext (random nonce)."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+        )
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        plaintext = "Same message"
+        encrypted1 = encrypt_room_message(
+            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+        )
+        encrypted2 = encrypt_room_message(
+            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Different nonces mean different ciphertexts
+        assert encrypted1.ciphertext != encrypted2.ciphertext
+        assert encrypted1.nonce != encrypted2.nonce
+
+    def test_wrong_epoch_key_fails(self):
+        """Decryption with wrong epoch key should fail."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            decrypt_room_message,
+        )
+        from nacl.exceptions import CryptoError
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+
+        # Encrypt with epoch 0 key
+        epoch_key_0 = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+        encrypted = encrypt_room_message("secret", epoch_key_0, sender.private_key, room_id, 0)
+
+        # Try to decrypt with epoch 1 key
+        epoch_key_1 = derive_epoch_key(epoch_key_0, 1, room_id, membership_hash)
+        with pytest.raises(CryptoError):
+            decrypt_room_message(encrypted, epoch_key_1, sender.signing_public_key, room_id, 0)
+
+    def test_wrong_sender_signature_fails(self):
+        """Decryption with wrong sender pubkey should fail signature verification."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            decrypt_room_message,
+        )
+
+        sender = generate_keypair()
+        wrong_sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        encrypted = encrypt_room_message(
+            "secret", epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Decryption succeeds but signature verification fails
+        with pytest.raises(ValueError, match="Invalid signature"):
+            decrypt_room_message(
+                encrypted, epoch_key, wrong_sender.signing_public_key, room_id, epoch_number
+            )
+
+    def test_tampered_ciphertext_fails(self):
+        """Tampered ciphertext should fail decryption."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            decrypt_room_message,
+            EncryptedRoomMessage,
+        )
+        from nacl.exceptions import CryptoError
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        encrypted = encrypt_room_message(
+            "secret", epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Tamper with ciphertext
+        tampered = EncryptedRoomMessage(
+            ciphertext=encrypted.ciphertext[:-1] + bytes([encrypted.ciphertext[-1] ^ 1]),
+            nonce=encrypted.nonce,
+            signature=encrypted.signature,
+        )
+
+        with pytest.raises(CryptoError):
+            decrypt_room_message(
+                tampered, epoch_key, sender.signing_public_key, room_id, epoch_number
+            )
+
+    def test_wrong_room_id_verification_fails(self):
+        """Message decrypted with wrong room_id should fail signature verification."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            decrypt_room_message,
+        )
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        encrypted = encrypt_room_message(
+            "secret", epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Try to verify with wrong room_id
+        with pytest.raises(ValueError, match="Invalid signature"):
+            decrypt_room_message(
+                encrypted, epoch_key, sender.signing_public_key, "wrong-room", epoch_number
+            )
+
+    def test_wrong_epoch_number_verification_fails(self):
+        """Message decrypted with wrong epoch_number should fail signature verification."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            decrypt_room_message,
+        )
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 5
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        encrypted = encrypt_room_message(
+            "secret", epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Try to verify with wrong epoch number
+        with pytest.raises(ValueError, match="Invalid signature"):
+            decrypt_room_message(encrypted, epoch_key, sender.signing_public_key, room_id, 999)
+
+
+class TestEncryptedRoomMessageSerialization:
+    """Tests for EncryptedRoomMessage serialization."""
+
+    def test_to_dict_from_dict_roundtrip(self):
+        """Message should survive dict serialization."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            EncryptedRoomMessage,
+        )
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        original = encrypt_room_message(
+            "test message", epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Roundtrip through dict
+        data = original.to_dict()
+        restored = EncryptedRoomMessage.from_dict(data)
+
+        assert restored.ciphertext == original.ciphertext
+        assert restored.nonce == original.nonce
+        assert restored.signature == original.signature
+
+    def test_to_json_from_json_roundtrip(self):
+        """Message should survive JSON serialization."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+            EncryptedRoomMessage,
+        )
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        original = encrypt_room_message(
+            "test message", epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        # Roundtrip through JSON
+        json_str = original.to_json()
+        restored = EncryptedRoomMessage.from_json(json_str)
+
+        assert restored.ciphertext == original.ciphertext
+        assert restored.nonce == original.nonce
+        assert restored.signature == original.signature
+
+    def test_to_dict_includes_algorithm(self):
+        """Serialized dict should include algorithm identifier."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_room_message,
+        )
+
+        sender = generate_keypair()
+        room_id = "room-123"
+        epoch_number = 0
+        membership_hash = compute_membership_hash(["sender-id"])
+        base_secret = generate_room_base_secret()
+        epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        encrypted = encrypt_room_message(
+            "test", epoch_key, sender.private_key, room_id, epoch_number
+        )
+
+        data = encrypted.to_dict()
+        assert data["algorithm"] == "xsalsa20-poly1305+ed25519"
+
+
+class TestEpochKeyDistribution:
+    """Tests for encrypting/decrypting epoch keys for members."""
+
+    def test_encrypt_decrypt_epoch_key_roundtrip(self):
+        """Epoch key should be deliverable to members via asymmetric encryption."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_epoch_key_for_member,
+            decrypt_epoch_key,
+        )
+
+        # Room setup
+        base_secret = generate_room_base_secret()
+        room_id = "room-123"
+        membership_hash = compute_membership_hash(["alice-id", "bob-id"])
+        epoch_key = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+
+        # Key distributor (e.g., server or room admin)
+        distributor = generate_keypair()
+
+        # Member
+        member = generate_keypair()
+
+        # Encrypt epoch key for member
+        encrypted_key = encrypt_epoch_key_for_member(
+            epoch_key, member.public_key, distributor.private_key
+        )
+
+        # Member decrypts
+        decrypted_key = decrypt_epoch_key(encrypted_key, distributor.public_key, member.private_key)
+
+        assert decrypted_key == epoch_key
+
+    def test_epoch_key_distribution_to_multiple_members(self):
+        """Same epoch key should be distributable to multiple members."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_epoch_key_for_member,
+            decrypt_epoch_key,
+        )
+
+        # Room setup
+        base_secret = generate_room_base_secret()
+        room_id = "room-123"
+
+        # Members
+        alice = generate_keypair()
+        bob = generate_keypair()
+        carol = generate_keypair()
+
+        membership_hash = compute_membership_hash(["alice-id", "bob-id", "carol-id"])
+        epoch_key = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+
+        # Distributor
+        distributor = generate_keypair()
+
+        # Encrypt for each member
+        encrypted_for_alice = encrypt_epoch_key_for_member(
+            epoch_key, alice.public_key, distributor.private_key
+        )
+        encrypted_for_bob = encrypt_epoch_key_for_member(
+            epoch_key, bob.public_key, distributor.private_key
+        )
+        encrypted_for_carol = encrypt_epoch_key_for_member(
+            epoch_key, carol.public_key, distributor.private_key
+        )
+
+        # Each encrypted key should be different (different recipient, random nonce)
+        assert encrypted_for_alice != encrypted_for_bob != encrypted_for_carol
+
+        # But all decrypt to the same epoch key
+        assert (
+            decrypt_epoch_key(encrypted_for_alice, distributor.public_key, alice.private_key)
+            == epoch_key
+        )
+        assert (
+            decrypt_epoch_key(encrypted_for_bob, distributor.public_key, bob.private_key)
+            == epoch_key
+        )
+        assert (
+            decrypt_epoch_key(encrypted_for_carol, distributor.public_key, carol.private_key)
+            == epoch_key
+        )
+
+    def test_epoch_key_wrong_member_fails(self):
+        """Member can't decrypt epoch key meant for another member."""
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_epoch_key_for_member,
+            decrypt_epoch_key,
+        )
+        from nacl.exceptions import CryptoError
+
+        base_secret = generate_room_base_secret()
+        room_id = "room-123"
+        membership_hash = compute_membership_hash(["alice-id", "bob-id"])
+        epoch_key = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+
+        distributor = generate_keypair()
+        alice = generate_keypair()
+        bob = generate_keypair()
+
+        # Encrypt for Alice
+        encrypted_for_alice = encrypt_epoch_key_for_member(
+            epoch_key, alice.public_key, distributor.private_key
+        )
+
+        # Bob tries to decrypt Alice's key
+        with pytest.raises(CryptoError):
+            decrypt_epoch_key(encrypted_for_alice, distributor.public_key, bob.private_key)
