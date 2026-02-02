@@ -2593,12 +2593,12 @@ def get_room_with_encryption(room_id: str, conn: sqlite3.Connection | None = Non
 
     Returns:
         Dict with room_id, ns, display_name, created_by, created_at,
-        encryption_enabled, current_epoch_number, or None if not found
+        encryption_enabled, current_epoch_number, base_secret, or None if not found
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
         """SELECT room_id, ns, display_name, created_by, created_at,
-                  encryption_enabled, current_epoch_number
+                  encryption_enabled, current_epoch_number, base_secret
            FROM rooms WHERE room_id = ?""",
         (room_id,),
     )
@@ -2653,3 +2653,265 @@ def list_room_epochs(
 
     cursor = conn.execute(query, params)
     return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def get_room_members_with_pubkeys(
+    room_id: str, conn: sqlite3.Connection | None = None
+) -> list[dict]:
+    """Get all room members along with their current pubkeys.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        List of dicts with identity_id, ns, public_key, signing_public_key.
+        Members without pubkeys will have None for the key fields.
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT rm.identity_id, rm.ns,
+                  p.public_key, p.signing_public_key
+           FROM room_members rm
+           LEFT JOIN identities i ON rm.ns = i.ns AND rm.identity_id = i.id
+           LEFT JOIN pubkeys p ON p.pubkey_id = i.current_pubkey_id
+           WHERE rm.room_id = ?""",
+        (room_id,),
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def rotate_room_epoch(
+    room_id: str,
+    reason: str,
+    triggered_by: str | None = None,
+    server_keypair: tuple[bytes, bytes] | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Rotate the room's encryption epoch.
+
+    This function:
+    1. Gets current members with their pubkeys
+    2. Computes new membership hash
+    3. Derives new epoch key from previous key (or base secret for epoch 0)
+    4. Creates epoch record
+    5. Encrypts epoch key for each member
+    6. Updates room's current_epoch_number
+
+    Args:
+        room_id: Room ID
+        reason: Why rotation is happening ('created', 'member_joined', 'member_left', 'manual')
+        triggered_by: Identity ID that triggered this rotation (optional)
+        server_keypair: (private_key, public_key) bytes for encrypting keys to members.
+                       If None, keys are not encrypted (testing mode).
+        conn: Optional database connection
+
+    Returns:
+        Dict with epoch info and list of member keys
+
+    Raises:
+        ValueError: If room doesn't exist or encryption not enabled
+        ValueError: If any member lacks a pubkey (when server_keypair provided)
+    """
+    from deadrop.crypto import (
+        compute_membership_hash,
+        derive_epoch_key,
+        encrypt_epoch_key_for_member,
+        bytes_to_base64url,
+        base64url_to_bytes,
+    )
+
+    conn = _get_conn(conn)
+
+    # Get room info
+    room = get_room_with_encryption(room_id, conn)
+    if room is None:
+        raise ValueError(f"Room {room_id} not found")
+    if not room["encryption_enabled"]:
+        raise ValueError(f"Room {room_id} does not have encryption enabled")
+
+    # Get members with their pubkeys
+    members = get_room_members_with_pubkeys(room_id, conn)
+    if not members:
+        raise ValueError(f"Room {room_id} has no members")
+
+    # Check all members have pubkeys (if we need to encrypt)
+    if server_keypair is not None:
+        for member in members:
+            if member["public_key"] is None:
+                raise ValueError(
+                    f"Member {member['identity_id']} does not have a registered pubkey"
+                )
+
+    # Compute membership hash
+    member_ids = [m["identity_id"] for m in members]
+    membership_hash = compute_membership_hash(member_ids)
+
+    # Determine new epoch number
+    current_epoch_number = room["current_epoch_number"]
+    new_epoch_number = current_epoch_number + 1
+
+    # Derive the new epoch key
+    # For epoch 1+, we need the previous epoch's key
+    # But we don't store raw keys - only encrypted versions
+    # So we need to re-derive from base_secret
+    if room["base_secret"] is None:
+        raise ValueError(f"Room {room_id} has no base_secret set")
+
+    base_secret = base64url_to_bytes(room["base_secret"])
+
+    # Derive keys from base_secret through the chain
+    # epoch 0 -> epoch 1 -> ... -> epoch N
+    epoch_key = base_secret
+    for i in range(new_epoch_number + 1):
+        # Get the membership hash for epoch i
+        if i < new_epoch_number:
+            old_epoch = get_epoch_by_number(room_id, i, conn)
+            if old_epoch is None:
+                raise ValueError(f"Missing epoch {i} for room {room_id}")
+            old_membership_hash = old_epoch["membership_hash"]
+        else:
+            old_membership_hash = membership_hash
+
+        epoch_key = derive_epoch_key(epoch_key, i, room_id, old_membership_hash)
+
+    # Create epoch record
+    epoch = create_room_epoch(
+        room_id=room_id,
+        epoch_number=new_epoch_number,
+        membership_hash=membership_hash,
+        reason=reason,
+        triggered_by=triggered_by,
+        conn=conn,
+    )
+
+    # Encrypt and store keys for each member
+    member_keys = []
+    for member in members:
+        if server_keypair is not None and member["public_key"] is not None:
+            member_pubkey = base64url_to_bytes(member["public_key"])
+            encrypted_key = encrypt_epoch_key_for_member(
+                epoch_key, member_pubkey, server_keypair[0]
+            )
+            encrypted_key_b64 = bytes_to_base64url(encrypted_key)
+        else:
+            # Testing mode or member lacks pubkey
+            encrypted_key_b64 = bytes_to_base64url(epoch_key)  # Store raw for testing
+
+        key_record = store_epoch_key(
+            epoch_id=epoch["epoch_id"],
+            identity_id=member["identity_id"],
+            encrypted_epoch_key=encrypted_key_b64,
+            conn=conn,
+        )
+        member_keys.append(key_record)
+
+    # Update room's current epoch number
+    update_room_epoch_number(room_id, new_epoch_number, conn)
+
+    return {
+        "epoch": epoch,
+        "member_keys": member_keys,
+        "membership_hash": membership_hash,
+    }
+
+
+def initialize_room_encryption(
+    room_id: str,
+    base_secret: bytes,
+    triggered_by: str | None = None,
+    server_keypair: tuple[bytes, bytes] | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Initialize encryption for a room (create epoch 0).
+
+    This sets up the base secret and creates the first epoch.
+    Should be called when creating an encrypted room.
+
+    Args:
+        room_id: Room ID
+        base_secret: 32-byte base secret for key derivation
+        triggered_by: Identity ID that created the room
+        server_keypair: (private_key, public_key) for encrypting keys
+        conn: Optional database connection
+
+    Returns:
+        Dict with epoch info and member keys
+
+    Raises:
+        ValueError: If room doesn't exist
+    """
+    from deadrop.crypto import (
+        compute_membership_hash,
+        derive_epoch_key,
+        encrypt_epoch_key_for_member,
+        bytes_to_base64url,
+        base64url_to_bytes,
+    )
+
+    conn = _get_conn(conn)
+
+    # Set encryption_enabled and base_secret on room
+    base_secret_b64 = bytes_to_base64url(base_secret)
+    cursor = conn.execute(
+        "UPDATE rooms SET encryption_enabled = 1, base_secret = ?, current_epoch_number = 0 WHERE room_id = ?",
+        (base_secret_b64, room_id),
+    )
+    if cursor.rowcount == 0:
+        raise ValueError(f"Room {room_id} not found")
+    conn.commit()
+
+    # Get members with their pubkeys
+    members = get_room_members_with_pubkeys(room_id, conn)
+
+    # Check all members have pubkeys (if we need to encrypt)
+    if server_keypair is not None:
+        for member in members:
+            if member["public_key"] is None:
+                raise ValueError(
+                    f"Member {member['identity_id']} does not have a registered pubkey"
+                )
+
+    # Compute membership hash
+    member_ids = [m["identity_id"] for m in members]
+    membership_hash = compute_membership_hash(member_ids)
+
+    # Derive epoch 0 key
+    epoch_key = derive_epoch_key(base_secret, 0, room_id, membership_hash)
+
+    # Create epoch 0 record
+    epoch = create_room_epoch(
+        room_id=room_id,
+        epoch_number=0,
+        membership_hash=membership_hash,
+        reason="created",
+        triggered_by=triggered_by,
+        conn=conn,
+    )
+
+    # Encrypt and store keys for each member
+    member_keys = []
+    for member in members:
+        if server_keypair is not None and member["public_key"] is not None:
+            member_pubkey = base64url_to_bytes(member["public_key"])
+            encrypted_key = encrypt_epoch_key_for_member(
+                epoch_key, member_pubkey, server_keypair[0]
+            )
+            encrypted_key_b64 = bytes_to_base64url(encrypted_key)
+        else:
+            # Testing mode
+            encrypted_key_b64 = bytes_to_base64url(epoch_key)
+
+        key_record = store_epoch_key(
+            epoch_id=epoch["epoch_id"],
+            identity_id=member["identity_id"],
+            encrypted_epoch_key=encrypted_key_b64,
+            conn=conn,
+        )
+        member_keys.append(key_record)
+
+    return {
+        "epoch": epoch,
+        "member_keys": member_keys,
+        "membership_hash": membership_hash,
+    }
