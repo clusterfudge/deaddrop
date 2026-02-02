@@ -2408,3 +2408,248 @@ def revoke_pubkey(pubkey_id: str) -> bool:
         conn.commit()
         return True
     return False
+
+
+# =============================================================================
+# Room Epoch Management (for E2E encryption)
+# =============================================================================
+
+
+def create_room_epoch(
+    room_id: str,
+    epoch_number: int,
+    membership_hash: str,
+    reason: str,
+    triggered_by: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Create a new room epoch record.
+
+    Args:
+        room_id: Room ID
+        epoch_number: Sequential epoch number (0, 1, 2, ...)
+        membership_hash: SHA256 hash of sorted member IDs
+        reason: Why this epoch was created ('created', 'member_joined', 'member_left', 'manual')
+        triggered_by: Identity ID that triggered this epoch (optional)
+        conn: Optional database connection
+
+    Returns:
+        Dict with epoch info
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    epoch_id = str(make_uuid7())
+
+    conn.execute(
+        """INSERT INTO room_epochs 
+           (epoch_id, room_id, epoch_number, membership_hash, reason, triggered_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (epoch_id, room_id, epoch_number, membership_hash, reason, triggered_by, now),
+    )
+    conn.commit()
+
+    return {
+        "epoch_id": epoch_id,
+        "room_id": room_id,
+        "epoch_number": epoch_number,
+        "membership_hash": membership_hash,
+        "reason": reason,
+        "triggered_by": triggered_by,
+        "created_at": now,
+    }
+
+
+def get_current_epoch(room_id: str, conn: sqlite3.Connection | None = None) -> dict | None:
+    """Get the current (highest numbered) epoch for a room.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        Dict with epoch info or None if room has no epochs
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT epoch_id, room_id, epoch_number, membership_hash, reason, triggered_by, created_at
+           FROM room_epochs 
+           WHERE room_id = ?
+           ORDER BY epoch_number DESC LIMIT 1""",
+        (room_id,),
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def get_epoch_by_number(
+    room_id: str, epoch_number: int, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    """Get a specific epoch by room and epoch number.
+
+    Args:
+        room_id: Room ID
+        epoch_number: The epoch number to fetch
+        conn: Optional database connection
+
+    Returns:
+        Dict with epoch info or None if not found
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT epoch_id, room_id, epoch_number, membership_hash, reason, triggered_by, created_at
+           FROM room_epochs 
+           WHERE room_id = ? AND epoch_number = ?""",
+        (room_id, epoch_number),
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def store_epoch_key(
+    epoch_id: str,
+    identity_id: str,
+    encrypted_epoch_key: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Store an encrypted epoch key for a room member.
+
+    Args:
+        epoch_id: The epoch this key belongs to
+        identity_id: The member who can decrypt this key
+        encrypted_epoch_key: Base64-encoded encrypted key
+        conn: Optional database connection
+
+    Returns:
+        Dict with stored key info
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """INSERT INTO room_epoch_keys (epoch_id, identity_id, encrypted_epoch_key, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (epoch_id, identity_id, encrypted_epoch_key, now),
+    )
+    conn.commit()
+
+    return {
+        "epoch_id": epoch_id,
+        "identity_id": identity_id,
+        "encrypted_epoch_key": encrypted_epoch_key,
+        "created_at": now,
+    }
+
+
+def get_epoch_key_for_identity(
+    room_id: str, epoch_number: int, identity_id: str, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    """Get the encrypted epoch key for a specific member.
+
+    Args:
+        room_id: Room ID
+        epoch_number: The epoch number
+        identity_id: The member's identity ID
+        conn: Optional database connection
+
+    Returns:
+        Dict with epoch_id, identity_id, encrypted_epoch_key, created_at or None
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT ek.epoch_id, ek.identity_id, ek.encrypted_epoch_key, ek.created_at
+           FROM room_epoch_keys ek
+           JOIN room_epochs e ON ek.epoch_id = e.epoch_id
+           WHERE e.room_id = ? AND e.epoch_number = ? AND ek.identity_id = ?""",
+        (room_id, epoch_number, identity_id),
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def list_epoch_keys(epoch_id: str, conn: sqlite3.Connection | None = None) -> list[dict]:
+    """List all encrypted keys for an epoch.
+
+    Args:
+        epoch_id: The epoch ID
+        conn: Optional database connection
+
+    Returns:
+        List of dicts with epoch_id, identity_id, encrypted_epoch_key, created_at
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT epoch_id, identity_id, encrypted_epoch_key, created_at
+           FROM room_epoch_keys
+           WHERE epoch_id = ?
+           ORDER BY created_at""",
+        (epoch_id,),
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def get_room_with_encryption(room_id: str, conn: sqlite3.Connection | None = None) -> dict | None:
+    """Get room info including encryption status.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        Dict with room_id, ns, display_name, created_by, created_at,
+        encryption_enabled, current_epoch_number, or None if not found
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT room_id, ns, display_name, created_by, created_at,
+                  encryption_enabled, current_epoch_number
+           FROM rooms WHERE room_id = ?""",
+        (room_id,),
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def update_room_epoch_number(
+    room_id: str, epoch_number: int, conn: sqlite3.Connection | None = None
+) -> bool:
+    """Update the current epoch number for a room.
+
+    Args:
+        room_id: Room ID
+        epoch_number: New epoch number
+        conn: Optional database connection
+
+    Returns:
+        True if updated, False if room not found
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        "UPDATE rooms SET current_epoch_number = ? WHERE room_id = ?",
+        (epoch_number, room_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def list_room_epochs(
+    room_id: str, limit: int | None = None, conn: sqlite3.Connection | None = None
+) -> list[dict]:
+    """List epochs for a room (most recent first).
+
+    Args:
+        room_id: Room ID
+        limit: Maximum number of epochs to return
+        conn: Optional database connection
+
+    Returns:
+        List of epoch dicts
+    """
+    conn = _get_conn(conn)
+    query = """SELECT epoch_id, room_id, epoch_number, membership_hash, reason, triggered_by, created_at
+               FROM room_epochs 
+               WHERE room_id = ?
+               ORDER BY epoch_number DESC"""
+    params: list = [room_id]
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor = conn.execute(query, params)
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
