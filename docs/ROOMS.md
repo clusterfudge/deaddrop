@@ -424,11 +424,100 @@ HTTP 409
 {"error": "epoch_mismatch", "expected_epoch": 6, "provided_epoch": 5}
 ```
 
+### True E2E Mode (Client-Side Key Management)
+
+For maximum security, Deaddrop supports a true E2E mode where the server **never sees** the plaintext room secret. In this mode:
+
+- The room creator generates the base secret client-side
+- The secret is encrypted to each member's public key before sending to the server
+- The server stores only encrypted secrets
+- Members derive epoch keys locally
+
+**Why it matters:** In server-mediated mode, the server operator can read all messages. In true E2E mode, even a compromised server cannot decrypt messages.
+
+### Two-Phase Exit Protocol (Forward Secrecy Fix)
+
+When a member leaves a room, we need to rotate the secret so they can't read future messages. However, using deterministic derivation (HKDF) has a vulnerability: **the removed member can compute the new secret** if they know who's still in the room.
+
+The **two-phase exit protocol** fixes this:
+
+1. **Exit Request**: Member calls DELETE to leave. Server marks them as "pending removal" (HTTP 202).
+2. **Secret Rotation**: A remaining member generates a **fresh random** secret and encrypts it for all remaining members.
+3. **Finalize**: The rotation API accepts `finalize_removal` to complete the exit.
+
+```python
+# Bob requests to leave (two-phase)
+result = client.remove_room_member(ns["ns"], room["room_id"], bob["id"], bob["secret"])
+# result = {"pending": True, "pending_removal_id": bob["id"], ...}
+
+# Alice generates FRESH secret (not derived!)
+new_secret = os.urandom(32)
+
+# Alice encrypts for remaining members (NOT Bob)
+alice_enc = encrypt_for_member(new_secret, alice_pubkey)
+carol_enc = encrypt_for_member(new_secret, carol_pubkey)
+
+# Alice rotates and finalizes Bob's removal
+client.rotate_room_secret_e2e(
+    ns["ns"], room["room_id"],
+    new_secret_version=1,
+    member_secrets=[
+        {"identity_id": alice["id"], "encrypted_base_secret": alice_enc},
+        {"identity_id": carol["id"], "encrypted_base_secret": carol_enc},
+    ],
+    finalize_removal=bob["id"]
+)
+# Bob is now fully removed and cannot derive the new secret
+```
+
+**Why fresh random is critical:**
+- If we derived `new_secret = HKDF(old_secret, ...)`, Bob could compute it
+- By using `os.urandom(32)`, Bob has no way to derive the new secret
+- This provides true forward secrecy for member removal
+
+**Voluntary vs Forced Exit:**
+- **Voluntary**: Bob requests to leave → pending state → waiting for rotation
+- **Forced (kicked)**: Alice kicks Bob → Alice provides rotation in same flow
+
+**Cancellation:**
+```python
+# Bob changes mind before rotation completes
+client.cancel_pending_exit(ns["ns"], room["room_id"], bob["secret"])
+```
+
+**API Endpoints:**
+```bash
+# Request exit (returns 202 for E2E rooms)
+DELETE /{ns}/rooms/{room_id}/members/{identity_id}
+
+# Cancel pending exit
+POST /{ns}/rooms/{room_id}/cancel-exit
+
+# Rotate with finalize
+POST /{ns}/rooms/{room_id}/rotate-secret
+{
+    "new_secret_version": 1,
+    "member_secrets": [...],
+    "finalize_removal": "bob_id"
+}
+```
+
+### Security Properties Summary
+
+| Property | Server-Mediated | True E2E |
+|----------|-----------------|----------|
+| Server can read messages | ✅ Yes | ❌ No |
+| Forward secrecy (new members) | ✅ Yes | ✅ Yes |
+| Forward secrecy (removed members) | ⚠️ HKDF vulnerable | ✅ Fresh random |
+| Offline member support | ✅ Server derives | ✅ Encrypted backup |
+| Complexity | Lower | Higher |
+
 ### Limitations
 
 - **No migration**: Existing unencrypted rooms cannot be converted to encrypted
 - **Pubkey required at join time**: All members must have registered keypairs before joining
-- **No offline key delivery**: Members must be able to receive the epoch key when it rotates
+- **Rotation requires online member**: For member removal, at least one remaining member must be online to rotate
+- **Pending exit gap**: Between exit request and rotation, the exiting member can still derive keys
 - **Performance**: O(N) key encryption per rotation (practical for <1000 members)
 
 ## Rooms vs 1:1 Messaging

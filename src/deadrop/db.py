@@ -472,6 +472,10 @@ def _migrate_004_add_room_encryption(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE rooms ADD COLUMN server_public_key TEXT")
     if "secret_version" not in room_columns:
         conn.execute("ALTER TABLE rooms ADD COLUMN secret_version INTEGER DEFAULT 0")
+    if "pending_removal_id" not in room_columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN pending_removal_id TEXT")
+    if "pending_removal_at" not in room_columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN pending_removal_at TIMESTAMP")
 
     # Create room_member_secrets table for true E2E mode
     conn.execute("""
@@ -625,7 +629,9 @@ SCHEMA_SQL = """
         base_secret TEXT,
         server_private_key TEXT,
         server_public_key TEXT,
-        secret_version INTEGER DEFAULT 0
+        secret_version INTEGER DEFAULT 0,
+        pending_removal_id TEXT,
+        pending_removal_at TIMESTAMP
     );
     
     CREATE INDEX IF NOT EXISTS idx_rooms_ns ON rooms(ns);
@@ -2025,27 +2031,66 @@ def remove_room_member(
     identity_id: str,
     conn: sqlite3.Connection | None = None,
     trigger_rotation: bool = True,
-) -> bool:
+    use_two_phase: bool | None = None,
+) -> dict:
     """Remove a member from a room.
 
-    For encrypted rooms, removing a member triggers epoch rotation
-    to ensure the removed member can't decrypt future messages.
+    For E2E encrypted rooms with true forward secrecy, this uses a two-phase
+    protocol where the removal is "pending" until a remaining member rotates
+    the secret with fresh randomness.
+
+    For server-mediated encrypted rooms, immediate removal with HKDF rotation
+    is used (less secure but simpler).
 
     Args:
         room_id: Room ID
         identity_id: Identity ID to remove
         conn: Optional database connection
         trigger_rotation: If True and room is encrypted, trigger epoch rotation
+            (only applies to non-E2E rooms)
+        use_two_phase: If True, use two-phase protocol. If None, auto-detect
+            based on whether room uses E2E mode (has secret_version set)
 
     Returns:
-        True if removed, False if not a member
+        Dict with removal status:
+        - For immediate removal: {"removed": True, "immediate": True}
+        - For pending removal: {"removed": False, "pending": True, "pending_removal_id": ..., ...}
+        - For not a member: {"removed": False, "immediate": False, "error": "not_member"}
     """
     conn = _get_conn(conn)
 
     # Get room encryption status before removal
     room = get_room_with_encryption(room_id, conn=conn)
+    if not room:
+        return {"removed": False, "immediate": False, "error": "room_not_found"}
+
     is_encrypted = room and room["encryption_enabled"]
 
+    # Check if this room uses E2E mode (no plaintext base_secret stored)
+    # E2E mode is indicated by encryption enabled but no base_secret
+    # Server-mediated mode stores base_secret; E2E mode doesn't
+    is_e2e_mode = is_encrypted and room.get("base_secret") is None
+
+    # Decide whether to use two-phase protocol
+    if use_two_phase is None:
+        use_two_phase = bool(is_e2e_mode)
+
+    # Two-phase protocol for E2E rooms
+    if use_two_phase and is_encrypted:
+        # Set as pending removal instead of immediate
+        try:
+            result = set_pending_removal(room_id, identity_id, conn=conn)
+            return {
+                "removed": False,
+                "pending": True,
+                "pending_removal_id": result["pending_removal_id"],
+                "pending_removal_at": result["pending_removal_at"],
+                "message": "Removal pending. A remaining member must rotate the secret.",
+            }
+        except ValueError as e:
+            return {"removed": False, "pending": False, "error": str(e)}
+
+    # Immediate removal for non-E2E rooms
     cursor = conn.execute(
         "DELETE FROM room_members WHERE room_id = ? AND identity_id = ?",
         (room_id, identity_id),
@@ -2054,14 +2099,18 @@ def remove_room_member(
 
     removed = cursor.rowcount > 0
 
+    if not removed:
+        return {"removed": False, "immediate": False, "error": "not_member"}
+
     # Trigger epoch rotation for encrypted rooms if member was actually removed
-    # and there are still members left
-    if removed and is_encrypted and trigger_rotation:
+    # and there are still members left (server-mediated mode only)
+    # For E2E mode, rotation must be done separately with fresh secrets
+    if removed and is_encrypted and trigger_rotation and not use_two_phase and not is_e2e_mode:
         members = list_room_members(room_id, conn=conn)
         if members:  # Only rotate if there are remaining members
             rotate_room_epoch(room_id, reason="member_left", triggered_by=identity_id, conn=conn)
 
-    return removed
+    return {"removed": True, "immediate": True}
 
 
 def list_room_members(
@@ -2774,13 +2823,15 @@ def get_room_with_encryption(room_id: str, conn: sqlite3.Connection | None = Non
     Returns:
         Dict with room_id, ns, display_name, created_by, created_at,
         encryption_enabled, current_epoch_number, base_secret,
-        server_private_key, server_public_key, secret_version, or None if not found
+        server_private_key, server_public_key, secret_version,
+        pending_removal_id, pending_removal_at, or None if not found
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
         """SELECT room_id, ns, display_name, created_by, created_at,
                   encryption_enabled, current_epoch_number, base_secret,
-                  server_private_key, server_public_key, secret_version
+                  server_private_key, server_public_key, secret_version,
+                  pending_removal_id, pending_removal_at
            FROM rooms WHERE room_id = ?""",
         (room_id,),
     )
@@ -3121,6 +3172,165 @@ def initialize_room_encryption(
     }
 
 
+# =============================================================================
+# Pending Removal State Management (Two-Phase Exit Protocol)
+# =============================================================================
+
+
+def set_pending_removal(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Set a member as pending removal (two-phase exit protocol).
+
+    In E2E encrypted rooms, member removal requires a remaining member to
+    rotate the secret before the removal is finalized. This function marks
+    the member as "pending removal" without actually removing them.
+
+    Args:
+        room_id: Room ID
+        identity_id: Member to mark as pending removal
+        conn: Optional database connection
+
+    Returns:
+        Dict with room_id, pending_removal_id, pending_removal_at
+
+    Raises:
+        ValueError: If room not found or already has pending removal
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Check current state
+    room = get_room_with_encryption(room_id, conn=conn)
+    if not room:
+        raise ValueError(f"Room {room_id} not found")
+
+    if room.get("pending_removal_id"):
+        raise ValueError(
+            f"Room already has pending removal: {room['pending_removal_id']}. "
+            "Complete or cancel that first."
+        )
+
+    # Verify member exists
+    if not is_room_member(room_id, identity_id, conn=conn):
+        raise ValueError(f"Identity {identity_id} is not a member of room {room_id}")
+
+    cursor = conn.execute(
+        "UPDATE rooms SET pending_removal_id = ?, pending_removal_at = ? WHERE room_id = ?",
+        (identity_id, now, room_id),
+    )
+    if cursor.rowcount == 0:
+        raise ValueError(f"Room {room_id} not found")
+    conn.commit()
+
+    return {
+        "room_id": room_id,
+        "pending_removal_id": identity_id,
+        "pending_removal_at": now,
+    }
+
+
+def clear_pending_removal(
+    room_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Clear the pending removal state (cancel exit or after finalization).
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        True if cleared, False if no pending removal
+    """
+    conn = _get_conn(conn)
+
+    cursor = conn.execute(
+        "UPDATE rooms SET pending_removal_id = NULL, pending_removal_at = NULL WHERE room_id = ?",
+        (room_id,),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_pending_removal(
+    room_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Get pending removal info for a room.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        Dict with pending_removal_id and pending_removal_at, or None if no pending
+    """
+    conn = _get_conn(conn)
+
+    cursor = conn.execute(
+        "SELECT pending_removal_id, pending_removal_at FROM rooms WHERE room_id = ?",
+        (room_id,),
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if row and row.get("pending_removal_id"):
+        return {
+            "pending_removal_id": row["pending_removal_id"],
+            "pending_removal_at": row["pending_removal_at"],
+        }
+    return None
+
+
+def finalize_pending_removal(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Finalize a pending removal (actually remove the member).
+
+    This should be called after a successful secret rotation that excludes
+    the pending member.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity to finalize removal for (must match pending)
+        conn: Optional database connection
+
+    Returns:
+        True if removed, False if not found or mismatch
+
+    Raises:
+        ValueError: If identity doesn't match pending removal
+    """
+    conn = _get_conn(conn)
+
+    # Verify pending removal matches
+    pending = get_pending_removal(room_id, conn=conn)
+    if not pending:
+        raise ValueError(f"Room {room_id} has no pending removal")
+    if pending["pending_removal_id"] != identity_id:
+        raise ValueError(
+            f"Pending removal mismatch: expected {pending['pending_removal_id']}, got {identity_id}"
+        )
+
+    # Remove the member (bypass rotation since we just did one)
+    cursor = conn.execute(
+        "DELETE FROM room_members WHERE room_id = ? AND identity_id = ?",
+        (room_id, identity_id),
+    )
+    if cursor.rowcount == 0:
+        raise ValueError(f"Member {identity_id} not found in room {room_id}")
+
+    # Clear pending state
+    clear_pending_removal(room_id, conn=conn)
+
+    conn.commit()
+    return True
+
+
 def validate_message_epoch(
     room_id: str,
     epoch_number: int,
@@ -3381,6 +3591,7 @@ def rotate_room_secret_e2e(
     new_secret_version: int,
     member_secrets: list[dict],
     triggered_by: str | None = None,
+    finalize_removal: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> dict:
     """Rotate the room's base secret in true E2E mode.
@@ -3388,18 +3599,24 @@ def rotate_room_secret_e2e(
     The caller provides pre-encrypted secrets for each remaining member.
     The server validates and stores them without seeing plaintext.
 
+    If finalize_removal is provided, this completes a two-phase exit by:
+    1. Validating the pending removal matches
+    2. Storing new secrets for remaining members (excluding removed member)
+    3. Finalizing the removal (actually deleting membership)
+
     Args:
         room_id: Room ID
         new_secret_version: New version number (must be current + 1)
         member_secrets: List of dicts with identity_id, encrypted_base_secret, inviter_public_key
         triggered_by: Identity ID that triggered rotation (optional)
+        finalize_removal: Identity ID to finalize removal for (completes two-phase exit)
         conn: Optional database connection
 
     Returns:
-        Dict with rotation info
+        Dict with rotation info, including removed_member if finalize_removal was used
 
     Raises:
-        ValueError: If room not found, version mismatch, or missing members
+        ValueError: If room not found, version mismatch, missing members, or removal mismatch
     """
     conn = _get_conn(conn)
 
@@ -3416,9 +3633,25 @@ def rotate_room_secret_e2e(
             f"Invalid secret version: expected {current_version + 1}, got {new_secret_version}"
         )
 
-    # Verify all current members are included
+    # If finalizing removal, validate pending removal matches
+    if finalize_removal:
+        pending = get_pending_removal(room_id, conn=conn)
+        if not pending:
+            raise ValueError(f"No pending removal to finalize for room {room_id}")
+        if pending["pending_removal_id"] != finalize_removal:
+            raise ValueError(
+                f"Pending removal mismatch: expected {pending['pending_removal_id']}, "
+                f"got {finalize_removal}"
+            )
+
+    # Verify all current members are included (excluding pending removal if applicable)
     members = list_room_members(room_id, conn=conn)
     member_ids = {m["identity_id"] for m in members}
+
+    # If finalizing removal, the removed member should NOT be in member_secrets
+    if finalize_removal:
+        member_ids.discard(finalize_removal)
+
     provided_ids = {s["identity_id"] for s in member_secrets}
 
     if member_ids != provided_ids:
@@ -3440,9 +3673,16 @@ def rotate_room_secret_e2e(
     # Update room's secret version
     update_secret_version(room_id, new_secret_version, conn=conn)
 
-    return {
+    result = {
         "room_id": room_id,
         "secret_version": new_secret_version,
         "member_count": len(member_secrets),
         "triggered_by": triggered_by,
     }
+
+    # Finalize pending removal if specified
+    if finalize_removal:
+        finalize_pending_removal(room_id, finalize_removal, conn=conn)
+        result["removed_member"] = finalize_removal
+
+    return result

@@ -1176,3 +1176,411 @@ class TestRotateRoomSecretE2E:
                     },
                 ],
             )
+
+
+class TestPendingRemoval:
+    """Tests for two-phase exit protocol (pending removal state)."""
+
+    def test_set_pending_removal(self):
+        """Can set a member as pending removal."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        result = db.set_pending_removal(room["room_id"], bob["id"])
+
+        assert result["pending_removal_id"] == bob["id"]
+        assert result["pending_removal_at"] is not None
+
+    def test_set_pending_removal_nonmember_fails(self):
+        """Cannot set pending removal for non-member."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        with pytest.raises(ValueError, match="not a member"):
+            db.set_pending_removal(room["room_id"], bob["id"])
+
+    def test_set_pending_removal_already_pending_fails(self):
+        """Cannot set pending removal if one already exists."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        carol = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+        db.add_room_member(room["room_id"], carol["id"])
+
+        db.set_pending_removal(room["room_id"], bob["id"])
+
+        with pytest.raises(ValueError, match="already has pending removal"):
+            db.set_pending_removal(room["room_id"], carol["id"])
+
+    def test_get_pending_removal(self):
+        """Can retrieve pending removal state."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        # No pending removal initially
+        assert db.get_pending_removal(room["room_id"]) is None
+
+        # After setting
+        db.set_pending_removal(room["room_id"], bob["id"])
+        pending = db.get_pending_removal(room["room_id"])
+
+        assert pending["pending_removal_id"] == bob["id"]
+        assert pending["pending_removal_at"] is not None
+
+    def test_clear_pending_removal(self):
+        """Can clear pending removal state."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        db.set_pending_removal(room["room_id"], bob["id"])
+        assert db.get_pending_removal(room["room_id"]) is not None
+
+        db.clear_pending_removal(room["room_id"])
+        assert db.get_pending_removal(room["room_id"]) is None
+
+    def test_finalize_pending_removal(self):
+        """Can finalize pending removal."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        db.set_pending_removal(room["room_id"], bob["id"])
+
+        result = db.finalize_pending_removal(room["room_id"], bob["id"])
+        assert result is True
+
+        # Bob should no longer be a member
+        assert not db.is_room_member(room["room_id"], bob["id"])
+
+        # Pending state should be cleared
+        assert db.get_pending_removal(room["room_id"]) is None
+
+    def test_finalize_wrong_member_fails(self):
+        """Finalize with wrong member ID fails."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        carol = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+        db.add_room_member(room["room_id"], carol["id"])
+
+        db.set_pending_removal(room["room_id"], bob["id"])
+
+        with pytest.raises(ValueError, match="mismatch"):
+            db.finalize_pending_removal(room["room_id"], carol["id"])
+
+
+class TestRemoveRoomMemberTwoPhase:
+    """Tests for remove_room_member with two-phase protocol."""
+
+    def test_e2e_room_uses_two_phase(self):
+        """E2E encrypted room uses two-phase by default."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        # Initialize as E2E room
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "encrypted", "pubkey")
+
+        # Remove should use two-phase
+        result = db.remove_room_member(room["room_id"], bob["id"])
+
+        assert result["removed"] is False
+        assert result["pending"] is True
+        assert result["pending_removal_id"] == bob["id"]
+
+        # Bob should still be a member
+        assert db.is_room_member(room["room_id"], bob["id"])
+
+    def test_non_e2e_room_immediate_removal(self):
+        """Non-E2E room uses immediate removal."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        result = db.remove_room_member(room["room_id"], bob["id"])
+
+        assert result["removed"] is True
+        assert result["immediate"] is True
+        assert not db.is_room_member(room["room_id"], bob["id"])
+
+    def test_force_immediate_removal(self):
+        """Can force immediate removal even for E2E rooms."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "encrypted", "pubkey")
+
+        # Force immediate removal
+        result = db.remove_room_member(room["room_id"], bob["id"], use_two_phase=False)
+
+        assert result["removed"] is True
+        assert result["immediate"] is True
+        assert not db.is_room_member(room["room_id"], bob["id"])
+
+
+class TestRotateWithFinalize:
+    """Tests for rotating with finalize_removal (complete two-phase exit)."""
+
+    def test_rotate_with_finalize_removal(self):
+        """Can rotate and finalize pending removal in one step."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        carol = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        db.create_pubkey(ns["ns"], carol["id"], "pk_c", "spk_c")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+        db.add_room_member(room["room_id"], carol["id"])
+
+        # Initialize E2E
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "enc_alice", "pk_a")
+        db.store_member_secret(room["room_id"], bob["id"], "enc_bob", "pk_a", 0)
+        db.store_member_secret(room["room_id"], carol["id"], "enc_carol", "pk_a", 0)
+
+        # Bob requests to leave (two-phase)
+        db.set_pending_removal(room["room_id"], bob["id"])
+        assert db.is_room_member(room["room_id"], bob["id"])  # Still member
+
+        # Alice rotates with fresh secret, excluding Bob
+        result = db.rotate_room_secret_e2e(
+            room_id=room["room_id"],
+            new_secret_version=1,
+            member_secrets=[
+                {
+                    "identity_id": alice["id"],
+                    "encrypted_base_secret": "new_enc_alice",
+                    "inviter_public_key": "pk_a",
+                },
+                {
+                    "identity_id": carol["id"],
+                    "encrypted_base_secret": "new_enc_carol",
+                    "inviter_public_key": "pk_a",
+                },
+            ],
+            triggered_by=alice["id"],
+            finalize_removal=bob["id"],
+        )
+
+        assert result["secret_version"] == 1
+        assert result["removed_member"] == bob["id"]
+        assert result["member_count"] == 2  # Alice and Carol
+
+        # Bob should now be removed
+        assert not db.is_room_member(room["room_id"], bob["id"])
+        assert db.is_room_member(room["room_id"], alice["id"])
+        assert db.is_room_member(room["room_id"], carol["id"])
+
+        # Pending removal should be cleared
+        assert db.get_pending_removal(room["room_id"]) is None
+
+    def test_rotate_finalize_wrong_member_fails(self):
+        """Cannot finalize with wrong member ID."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        carol = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        db.create_pubkey(ns["ns"], carol["id"], "pk_c", "spk_c")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+        db.add_room_member(room["room_id"], carol["id"])
+
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "enc_alice", "pk_a")
+        db.store_member_secret(room["room_id"], bob["id"], "enc_bob", "pk_a", 0)
+        db.store_member_secret(room["room_id"], carol["id"], "enc_carol", "pk_a", 0)
+
+        # Bob requests to leave
+        db.set_pending_removal(room["room_id"], bob["id"])
+
+        # Try to finalize Carol instead of Bob
+        with pytest.raises(ValueError, match="mismatch"):
+            db.rotate_room_secret_e2e(
+                room_id=room["room_id"],
+                new_secret_version=1,
+                member_secrets=[
+                    {
+                        "identity_id": alice["id"],
+                        "encrypted_base_secret": "new",
+                        "inviter_public_key": "pk",
+                    },
+                    {
+                        "identity_id": bob["id"],
+                        "encrypted_base_secret": "new",
+                        "inviter_public_key": "pk",
+                    },
+                ],
+                finalize_removal=carol["id"],  # Wrong member
+            )
+
+    def test_rotate_finalize_no_pending_fails(self):
+        """Cannot finalize removal if none is pending."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "enc_alice", "pk_a")
+
+        with pytest.raises(ValueError, match="No pending removal"):
+            db.rotate_room_secret_e2e(
+                room_id=room["room_id"],
+                new_secret_version=1,
+                member_secrets=[
+                    {
+                        "identity_id": alice["id"],
+                        "encrypted_base_secret": "new",
+                        "inviter_public_key": "pk",
+                    },
+                ],
+                finalize_removal=alice["id"],
+            )
+
+
+class TestForwardSecrecyFix:
+    """Tests proving forward secrecy is now fixed with fresh random secrets.
+
+    The vulnerability was: removed member could derive future epoch keys
+    because HKDF derivation is deterministic.
+
+    The fix: Use fresh random secrets for member removal (not HKDF derivation).
+    """
+
+    def test_removed_member_cannot_derive_new_secret_with_fresh_random(self):
+        """Prove that with fresh random secrets, removed member cannot derive new key.
+
+        This is the core security test for the two-phase exit fix.
+        """
+        from deadrop.crypto import (
+            generate_keypair,
+            generate_room_base_secret,
+            derive_epoch_key,
+            compute_membership_hash,
+            encrypt_base_secret_for_member,
+            decrypt_base_secret_from_invite,
+        )
+
+        # Setup: Alice, Bob, Carol in a room
+        room_id = "test-room-id"
+        base_secret_v0 = generate_room_base_secret()
+
+        alice = generate_keypair()
+        # bob keypair not needed - we test that Bob with base_secret_v0 cannot derive v1
+        carol = generate_keypair()
+
+        # Epoch 0: All three members have the base secret
+        members_v0 = ["alice", "bob", "carol"]
+        hash_v0 = compute_membership_hash(members_v0)
+        epoch_key_0 = derive_epoch_key(base_secret_v0, 0, room_id, hash_v0)
+
+        # Bob is removed. Alice generates FRESH RANDOM secret (not derived!)
+        base_secret_v1 = generate_room_base_secret()  # Fresh random!
+
+        # Alice encrypts new secret for herself and Carol only
+        enc_alice = encrypt_base_secret_for_member(
+            base_secret_v1, alice.public_key, alice.private_key, room_id
+        )
+        enc_carol = encrypt_base_secret_for_member(
+            base_secret_v1, carol.public_key, alice.private_key, room_id
+        )
+
+        # Verify Alice and Carol can decrypt
+        alice_secret = decrypt_base_secret_from_invite(
+            enc_alice, alice.public_key, alice.private_key, room_id
+        )
+        carol_secret = decrypt_base_secret_from_invite(
+            enc_carol, alice.public_key, carol.private_key, room_id
+        )
+
+        assert alice_secret == base_secret_v1
+        assert carol_secret == base_secret_v1
+
+        # Derive epoch 1 key from new base secret
+        members_v1 = ["alice", "carol"]
+        hash_v1 = compute_membership_hash(members_v1)
+        epoch_key_1_real = derive_epoch_key(base_secret_v1, 0, room_id, hash_v1)
+
+        # BOB'S ATTACK: Try to derive the new epoch key
+        # Bob has: base_secret_v0, epoch_key_0, knows the new membership
+        # Bob tries HKDF derivation (the old vulnerability)
+        bob_attempt_hkdf = derive_epoch_key(base_secret_v0, 1, room_id, hash_v1)
+        bob_attempt_from_epoch = derive_epoch_key(epoch_key_0, 1, room_id, hash_v1)
+
+        # Bob's attempts should NOT match the real key
+        assert bob_attempt_hkdf != epoch_key_1_real, (
+            "Bob derived key via HKDF - forward secrecy broken!"
+        )
+        assert bob_attempt_from_epoch != epoch_key_1_real, (
+            "Bob derived key from previous epoch - forward secrecy broken!"
+        )
+
+        # The base secrets should also be different
+        assert base_secret_v0 != base_secret_v1, (
+            "Base secrets should be different (fresh random vs original)"
+        )
+
+    def test_hkdf_derivation_is_vulnerable_demonstration(self):
+        """Demonstrate why HKDF derivation was vulnerable (for documentation).
+
+        This test shows the attack that was possible before the fix.
+        """
+        from deadrop.crypto import derive_epoch_key, compute_membership_hash
+        import os
+
+        room_id = "test-room"
+        base_secret = os.urandom(32)
+
+        # Original members
+        members_with_bob = ["alice", "bob", "carol"]
+        hash_with_bob = compute_membership_hash(members_with_bob)
+        epoch_key_0 = derive_epoch_key(base_secret, 0, room_id, hash_with_bob)
+
+        # Bob removed - if we use HKDF derivation:
+        members_without_bob = ["alice", "carol"]
+        hash_without_bob = compute_membership_hash(members_without_bob)
+
+        # This is how the OLD implementation would derive the new key
+        epoch_key_1_hkdf = derive_epoch_key(epoch_key_0, 1, room_id, hash_without_bob)
+
+        # Bob has epoch_key_0 and can guess the new membership
+        # Bob computes:
+        bob_computed = derive_epoch_key(epoch_key_0, 1, room_id, hash_without_bob)
+
+        # WITH HKDF DERIVATION: Bob can compute the new key!
+        assert bob_computed == epoch_key_1_hkdf, (
+            "This test demonstrates the vulnerability - Bob CAN derive with HKDF"
+        )
+
+        # This is why we MUST use fresh random secrets for member removal

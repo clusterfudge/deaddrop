@@ -17,10 +17,14 @@ from deadrop import db
 from deadrop.crypto import (
     bytes_to_base64url,
     base64url_to_bytes,
-    generate_keypair,
+    compute_membership_hash,
+    derive_epoch_key,
+    encrypt_base_secret_for_member,
     encrypt_room_message,
     decrypt_room_message,
     EncryptedRoomMessage,
+    generate_keypair,
+    generate_room_base_secret,
 )
 
 
@@ -570,3 +574,155 @@ class TestOfflineMemberCatchup:
         )
 
         assert decrypted == msg5_plain
+
+
+class TestTwoPhaseExitProtocol:
+    """Integration tests for the two-phase exit protocol.
+
+    These tests verify the complete flow from member exit request
+    through secret rotation to finalized removal.
+    """
+
+    def test_voluntary_exit_two_phase_flow(self):
+        """Test complete voluntary exit flow with two-phase protocol."""
+        # Setup: Alice, Bob, Carol in an E2E room
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        carol = db.create_identity(ns["ns"])
+
+        # Create keypairs
+        alice_kp = generate_keypair()
+        bob_kp = generate_keypair()
+        carol_kp = generate_keypair()
+
+        db.create_pubkey(
+            ns["ns"], alice["id"], alice_kp.public_key_base64, alice_kp.signing_public_key_base64
+        )
+        db.create_pubkey(
+            ns["ns"], bob["id"], bob_kp.public_key_base64, bob_kp.signing_public_key_base64
+        )
+        db.create_pubkey(
+            ns["ns"], carol["id"], carol_kp.public_key_base64, carol_kp.signing_public_key_base64
+        )
+
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+        db.add_room_member(room["room_id"], carol["id"])
+
+        # Initialize E2E encryption
+        base_secret_v0 = generate_room_base_secret()
+        db.initialize_room_encryption_e2e(
+            room["room_id"],
+            alice["id"],
+            encrypt_base_secret_for_member(
+                base_secret_v0, alice_kp.public_key, alice_kp.private_key, room["room_id"]
+            ).hex(),
+            alice_kp.public_key_base64,
+        )
+        db.store_member_secret(
+            room["room_id"],
+            bob["id"],
+            encrypt_base_secret_for_member(
+                base_secret_v0, bob_kp.public_key, alice_kp.private_key, room["room_id"]
+            ).hex(),
+            alice_kp.public_key_base64,
+            0,
+        )
+        db.store_member_secret(
+            room["room_id"],
+            carol["id"],
+            encrypt_base_secret_for_member(
+                base_secret_v0, carol_kp.public_key, alice_kp.private_key, room["room_id"]
+            ).hex(),
+            alice_kp.public_key_base64,
+            0,
+        )
+
+        # Step 1: Bob requests to leave (triggers pending removal)
+        result = db.remove_room_member(room["room_id"], bob["id"])
+        assert result["pending"] is True
+        assert result["pending_removal_id"] == bob["id"]
+
+        # Bob is still a member at this point
+        assert db.is_room_member(room["room_id"], bob["id"])
+
+        # Step 2: Alice generates FRESH random secret (not derived!)
+        base_secret_v1 = generate_room_base_secret()
+        assert base_secret_v0 != base_secret_v1  # Must be fresh
+
+        # Step 3: Alice encrypts new secret for remaining members (Alice + Carol, NOT Bob)
+        enc_alice_v1 = encrypt_base_secret_for_member(
+            base_secret_v1, alice_kp.public_key, alice_kp.private_key, room["room_id"]
+        ).hex()
+        enc_carol_v1 = encrypt_base_secret_for_member(
+            base_secret_v1, carol_kp.public_key, alice_kp.private_key, room["room_id"]
+        ).hex()
+
+        # Step 4: Alice rotates secret and finalizes Bob's removal
+        rotate_result = db.rotate_room_secret_e2e(
+            room_id=room["room_id"],
+            new_secret_version=1,
+            member_secrets=[
+                {
+                    "identity_id": alice["id"],
+                    "encrypted_base_secret": enc_alice_v1,
+                    "inviter_public_key": alice_kp.public_key_base64,
+                },
+                {
+                    "identity_id": carol["id"],
+                    "encrypted_base_secret": enc_carol_v1,
+                    "inviter_public_key": alice_kp.public_key_base64,
+                },
+            ],
+            triggered_by=alice["id"],
+            finalize_removal=bob["id"],
+        )
+
+        assert rotate_result["secret_version"] == 1
+        assert rotate_result["removed_member"] == bob["id"]
+
+        # Step 5: Verify Bob is now removed
+        assert not db.is_room_member(room["room_id"], bob["id"])
+        assert db.is_room_member(room["room_id"], alice["id"])
+        assert db.is_room_member(room["room_id"], carol["id"])
+
+        # Step 6: Verify Bob cannot derive the new secret
+        # Bob only has base_secret_v0, Alice and Carol have base_secret_v1
+        # The secrets are different, so Bob cannot read new messages
+
+        # Step 7: Verify Alice and Carol can derive new epoch key
+        members_v1 = [alice["id"], carol["id"]]
+        hash_v1 = compute_membership_hash(members_v1)
+        epoch_key_v1 = derive_epoch_key(base_secret_v1, 0, room["room_id"], hash_v1)
+
+        # Bob tries to derive with his old secret
+        bob_attempt = derive_epoch_key(base_secret_v0, 1, room["room_id"], hash_v1)
+
+        assert bob_attempt != epoch_key_v1, "Bob should NOT be able to derive new key!"
+
+    def test_cancel_pending_exit(self):
+        """Test that pending exit can be cancelled."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        # Initialize E2E
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "encrypted", "pubkey")
+
+        # Bob requests to leave
+        result = db.remove_room_member(room["room_id"], bob["id"])
+        assert result["pending"] is True
+
+        # Bob changes mind and cancels
+        db.clear_pending_removal(room["room_id"])
+
+        # No pending removal
+        assert db.get_pending_removal(room["room_id"]) is None
+
+        # Bob is still a member
+        assert db.is_room_member(room["room_id"], bob["id"])

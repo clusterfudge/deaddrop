@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -1344,6 +1344,18 @@ def add_room_member(
     return RoomMemberInfo(**member_info)
 
 
+class RemoveMemberResponse(BaseModel):
+    """Response for member removal."""
+
+    ok: bool = True
+    immediate: bool = False
+    pending: bool = False
+    pending_removal_id: str | None = None
+    pending_removal_at: str | None = None
+    current_epoch_number: int | None = None
+    message: str | None = None
+
+
 @app.delete("/{ns}/rooms/{room_id}/members/{identity_id}")
 def remove_room_member(
     ns: str,
@@ -1354,7 +1366,17 @@ def remove_room_member(
     """Remove a member from a room.
 
     Members can remove themselves. Namespace owner can remove anyone.
-    For encrypted rooms, removing a member triggers epoch rotation.
+
+    For E2E encrypted rooms, removal uses a two-phase protocol:
+    1. This endpoint marks the member as "pending removal" (returns 202)
+    2. A remaining member must rotate the secret with fresh randomness
+    3. The rotation finalizes the removal
+
+    For server-mediated encrypted rooms, removal is immediate with HKDF rotation.
+
+    Returns:
+        200 with ok=True for immediate removal
+        202 with pending=True for two-phase (E2E) removal
     """
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
@@ -1371,20 +1393,70 @@ def remove_room_member(
         if not db.is_room_member(room_id, caller_id):
             raise HTTPException(403, "Not authorized to remove members")
 
-    # Check encryption status before removal
+    # Perform removal (may be immediate or pending depending on room type)
+    result = db.remove_room_member(room_id, identity_id)
+
+    if result.get("error"):
+        if result["error"] == "not_member":
+            raise HTTPException(404, "Member not found")
+        elif result["error"] == "room_not_found":
+            raise HTTPException(404, "Room not found")
+        else:
+            raise HTTPException(400, result["error"])
+
+    # Two-phase pending removal (E2E rooms)
+    if result.get("pending"):
+        return Response(
+            content=RemoveMemberResponse(
+                ok=True,
+                pending=True,
+                pending_removal_id=result["pending_removal_id"],
+                pending_removal_at=result["pending_removal_at"],
+                message=result.get("message"),
+            ).model_dump_json(),
+            status_code=202,
+            media_type="application/json",
+        )
+
+    # Immediate removal
     room_info = db.get_room_with_encryption(room_id)
-    was_encrypted = room_info and room_info.get("encryption_enabled")
+    return RemoveMemberResponse(
+        ok=True,
+        immediate=True,
+        current_epoch_number=room_info["current_epoch_number"] if room_info else None,
+    )
 
-    if not db.remove_room_member(room_id, identity_id):
-        raise HTTPException(404, "Member not found")
 
-    # For encrypted rooms, include new epoch info in response
-    if was_encrypted:
-        room_info = db.get_room_with_encryption(room_id)
-        if room_info:
-            return {"ok": True, "current_epoch_number": room_info["current_epoch_number"]}
+@app.post("/{ns}/rooms/{room_id}/cancel-exit")
+def cancel_pending_exit(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Cancel a pending exit request.
 
-    return {"ok": True}
+    Only the member who requested to leave can cancel their exit.
+    """
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    room = db.get_room(room_id)
+    if not room or room["ns"] != ns:
+        raise HTTPException(404, "Room not found")
+
+    caller_id = derive_id(x_inbox_secret)
+
+    # Check pending removal
+    pending = db.get_pending_removal(room_id)
+    if not pending:
+        raise HTTPException(404, "No pending exit to cancel")
+
+    # Only the pending member can cancel
+    if pending["pending_removal_id"] != caller_id:
+        raise HTTPException(403, "Only the exiting member can cancel their exit")
+
+    db.clear_pending_removal(room_id)
+    return {"ok": True, "cancelled": True}
 
 
 @app.get("/{ns}/rooms/{room_id}/messages")
@@ -1599,6 +1671,85 @@ def get_epoch_by_number(
         epoch=EpochInfo(**epoch),
         encrypted_epoch_key=encrypted_key,
         distributor_public_key=distributor_public_key,
+    )
+
+
+class MemberSecretInput(BaseModel):
+    """Encrypted secret for one member."""
+
+    identity_id: str
+    encrypted_base_secret: str  # Base64-encoded encrypted secret
+    inviter_public_key: str  # Base64-encoded public key of inviter
+
+
+class RotateSecretE2ERequest(BaseModel):
+    """Request to rotate room secret in E2E mode."""
+
+    new_secret_version: int
+    member_secrets: list[MemberSecretInput]
+    finalize_removal: str | None = None  # If set, completes a two-phase exit
+
+
+class RotateSecretE2EResponse(BaseModel):
+    """Response from E2E secret rotation."""
+
+    room_id: str
+    secret_version: int
+    member_count: int
+    removed_member: str | None = None
+
+
+@app.post("/{ns}/rooms/{room_id}/rotate-secret", response_model=RotateSecretE2EResponse)
+def rotate_room_secret_e2e(
+    ns: str,
+    room_id: str,
+    request: RotateSecretE2ERequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Rotate room secret in E2E mode with client-provided encrypted secrets.
+
+    This is used in true E2E mode where the server never sees plaintext secrets.
+    The caller provides pre-encrypted secrets for each remaining member.
+
+    If finalize_removal is set, this completes a two-phase exit:
+    1. The pending member is excluded from member_secrets
+    2. After successful rotation, the removal is finalized
+
+    Only room members can trigger rotation.
+    """
+    room, caller_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    # Check if room has encryption
+    room_info = db.get_room_with_encryption(room_id)
+    if not room_info or not room_info.get("encryption_enabled"):
+        raise HTTPException(400, "Room does not have encryption enabled")
+
+    # Check if this is an E2E room (no base_secret stored)
+    if room_info.get("base_secret"):
+        raise HTTPException(
+            400,
+            "This room uses server-mediated encryption. Use POST /rotate instead.",
+        )
+
+    try:
+        result = db.rotate_room_secret_e2e(
+            room_id=room_id,
+            new_secret_version=request.new_secret_version,
+            member_secrets=[s.model_dump() for s in request.member_secrets],
+            triggered_by=caller_id,
+            finalize_removal=request.finalize_removal,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return RotateSecretE2EResponse(
+        room_id=result["room_id"],
+        secret_version=result["secret_version"],
+        member_count=result["member_count"],
+        removed_member=result.get("removed_member"),
     )
 
 

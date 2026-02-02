@@ -233,11 +233,13 @@ class TestRoomMembers:
 
         result = db.remove_room_member(room["room_id"], bob["id"])
 
-        assert result is True
+        # Non-encrypted rooms use immediate removal
+        assert result["removed"] is True
+        assert result["immediate"] is True
         assert db.is_room_member(room["room_id"], bob["id"]) is False
 
     def test_remove_room_member_not_member(self):
-        """Removing non-member returns False."""
+        """Removing non-member returns error."""
         ns = db.create_namespace()
         alice = db.create_identity(ns["ns"])
         bob = db.create_identity(ns["ns"])
@@ -245,7 +247,8 @@ class TestRoomMembers:
 
         result = db.remove_room_member(room["room_id"], bob["id"])
 
-        assert result is False
+        assert result["removed"] is False
+        assert result.get("error") == "not_member"
 
     def test_list_room_members(self):
         """List all members of a room."""
