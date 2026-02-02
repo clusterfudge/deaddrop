@@ -1019,6 +1019,7 @@ def claim_invite(invite_id: str, request: Request):
 
 class CreateRoomRequest(BaseModel):
     display_name: str | None = None
+    encryption_enabled: bool = False
 
 
 class RoomInfo(BaseModel):
@@ -1027,6 +1028,8 @@ class RoomInfo(BaseModel):
     display_name: str | None
     created_by: str
     created_at: str
+    encryption_enabled: bool = False
+    current_epoch_number: int = 0
 
 
 class RoomWithMemberInfo(BaseModel):
@@ -1037,6 +1040,8 @@ class RoomWithMemberInfo(BaseModel):
     created_at: str
     joined_at: str
     last_read_mid: str | None
+    encryption_enabled: bool = False
+    current_epoch_number: int = 0
 
 
 class AddRoomMemberRequest(BaseModel):
@@ -1055,6 +1060,11 @@ class RoomMemberInfo(BaseModel):
 class SendRoomMessageRequest(BaseModel):
     body: str
     content_type: str = "text/plain"
+    # Encryption fields (optional, for encrypted messages)
+    epoch_number: int | None = None
+    encrypted: bool = False
+    encryption_meta: str | None = None
+    signature: str | None = None
 
 
 class RoomMessageInfo(BaseModel):
@@ -1064,11 +1074,16 @@ class RoomMessageInfo(BaseModel):
     body: str
     content_type: str
     created_at: str
+    # Encryption fields (optional, only present for encrypted messages)
+    encrypted: bool | None = None
+    epoch_number: int | None = None
+    encryption_meta: str | None = None
+    signature: str | None = None
 
     @classmethod
     def from_db(cls, data: dict) -> "RoomMessageInfo":
         """Create from db result which uses 'from' key."""
-        return cls(
+        msg = cls(
             mid=data["mid"],
             room_id=data["room_id"],
             from_id=data["from"],
@@ -1076,10 +1091,59 @@ class RoomMessageInfo(BaseModel):
             content_type=data.get("content_type", "text/plain"),
             created_at=data["created_at"],
         )
+        # Include encryption fields if present
+        if data.get("encrypted"):
+            msg.encrypted = True
+            msg.epoch_number = data.get("epoch_number")
+            msg.encryption_meta = data.get("encryption_meta")
+            msg.signature = data.get("signature")
+        return msg
 
 
 class UpdateReadCursorRequest(BaseModel):
     last_read_mid: str
+
+
+# --- Room Encryption Models ---
+
+
+class EpochInfo(BaseModel):
+    """Information about a room epoch."""
+
+    epoch_id: str
+    room_id: str
+    epoch_number: int
+    membership_hash: str
+    reason: str
+    triggered_by: str | None
+    created_at: str
+
+
+class EpochKeyResponse(BaseModel):
+    """Response containing epoch info and the caller's encrypted key."""
+
+    epoch: EpochInfo
+    encrypted_epoch_key: str | None  # Base64 NaCl box ciphertext, None if caller not in epoch
+
+
+class RoomMessageEncryptedRequest(BaseModel):
+    """Request to send an encrypted room message."""
+
+    body: str  # Encrypted ciphertext
+    content_type: str = "text/plain"
+    epoch_number: int
+    encrypted: bool = True
+    encryption_meta: str | None = None  # JSON with algorithm, nonce
+    signature: str | None = None  # Base64 Ed25519 signature
+
+
+class EpochMismatchResponse(BaseModel):
+    """Response when epoch mismatch occurs (409 Conflict)."""
+
+    error: str = "epoch_mismatch"
+    expected_epoch: int
+    provided_epoch: int
+    room_id: str
 
 
 # --- Room Helper Functions ---
@@ -1121,6 +1185,9 @@ def create_room(
 
     The caller becomes the first member of the room.
     Requires inbox secret of an identity in the namespace.
+
+    If encryption_enabled=True, the room will use E2E encryption.
+    The creator must have a registered pubkey.
     """
     require_active_namespace(ns)
 
@@ -1128,11 +1195,41 @@ def create_room(
     created_by = require_inbox_secret_any(ns, x_inbox_secret)
 
     display_name = request.display_name if request else None
+    encryption_enabled = request.encryption_enabled if request else False
 
     try:
         room = db.create_room(ns, created_by, display_name=display_name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    # Initialize encryption if requested
+    if encryption_enabled:
+        from .crypto import generate_keypair, generate_room_base_secret
+
+        # Verify creator has a pubkey
+        identity = db.get_identity(ns, created_by)
+        if not identity or not identity.get("pubkey_id"):
+            # Delete the room we just created since we can't enable encryption
+            db.delete_room(room["room_id"])
+            raise HTTPException(
+                400, "Creator must have a registered pubkey to create an encrypted room"
+            )
+
+        # Generate room base secret and initialize encryption
+        base_secret = generate_room_base_secret()
+        server_keypair = generate_keypair()
+
+        db.initialize_room_encryption(
+            room_id=room["room_id"],
+            base_secret=base_secret,
+            triggered_by=created_by,
+            server_keypair=(server_keypair.private_key, server_keypair.public_key),
+        )
+
+        # Get updated room info with encryption status
+        room_updated = db.get_room_with_encryption(room["room_id"])
+        if room_updated:
+            room = room_updated
 
     return RoomInfo(**room)
 
@@ -1164,7 +1261,11 @@ def get_room(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    return RoomInfo(**room)
+    # Get full room info with encryption status
+    room_full = db.get_room_with_encryption(room_id)
+    if not room_full:
+        raise HTTPException(404, "Room not found")
+    return RoomInfo(**room_full)
 
 
 @app.delete("/{ns}/rooms/{room_id}")
@@ -1203,7 +1304,7 @@ def list_room_members(
     return [RoomMemberInfo(**m) for m in members]
 
 
-@app.post("/{ns}/rooms/{room_id}/members", response_model=RoomMemberInfo)
+@app.post("/{ns}/rooms/{room_id}/members")
 def add_room_member(
     ns: str,
     room_id: str,
@@ -1213,6 +1314,8 @@ def add_room_member(
     """Add a member to a room.
 
     Any room member can invite other identities from the same namespace.
+    For encrypted rooms, the invitee must have a registered pubkey.
+    Adding a member to an encrypted room triggers epoch rotation.
     """
     room, _ = require_room_member(room_id, x_inbox_secret)
 
@@ -1229,6 +1332,14 @@ def add_room_member(
     if not member_info:
         raise HTTPException(500, "Failed to get member info")
 
+    # For encrypted rooms, include epoch info in response
+    room_info = db.get_room_with_encryption(room_id)
+    if room_info and room_info.get("encryption_enabled"):
+        return {
+            "member": RoomMemberInfo(**member_info).model_dump(),
+            "current_epoch_number": room_info["current_epoch_number"],
+        }
+
     return RoomMemberInfo(**member_info)
 
 
@@ -1242,6 +1353,7 @@ def remove_room_member(
     """Remove a member from a room.
 
     Members can remove themselves. Namespace owner can remove anyone.
+    For encrypted rooms, removing a member triggers epoch rotation.
     """
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
@@ -1258,8 +1370,18 @@ def remove_room_member(
         if not db.is_room_member(room_id, caller_id):
             raise HTTPException(403, "Not authorized to remove members")
 
+    # Check encryption status before removal
+    room_info = db.get_room_with_encryption(room_id)
+    was_encrypted = room_info and room_info.get("encryption_enabled")
+
     if not db.remove_room_member(room_id, identity_id):
         raise HTTPException(404, "Member not found")
+
+    # For encrypted rooms, include new epoch info in response
+    if was_encrypted:
+        room_info = db.get_room_with_encryption(room_id)
+        if room_info:
+            return {"ok": True, "current_epoch_number": room_info["current_epoch_number"]}
 
     return {"ok": True}
 
@@ -1314,7 +1436,16 @@ def send_room_message(
     request: SendRoomMessageRequest,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
-    """Send a message to a room. Requires membership."""
+    """Send a message to a room. Requires membership.
+
+    For encrypted rooms, include:
+    - epoch_number: The epoch used to encrypt
+    - encrypted: True
+    - encryption_meta: JSON with algorithm info
+    - signature: Ed25519 signature
+
+    Returns 409 Conflict if epoch_number doesn't match current epoch.
+    """
     room, from_id = require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
@@ -1326,6 +1457,21 @@ def send_room_message(
             from_id=from_id,
             body=request.body,
             content_type=request.content_type,
+            epoch_number=request.epoch_number,
+            encrypted=request.encrypted,
+            encryption_meta=request.encryption_meta,
+            signature=request.signature,
+        )
+    except db.EpochMismatchError as e:
+        # Return 409 Conflict with epoch info for client retry
+        raise HTTPException(
+            409,
+            detail={
+                "error": "epoch_mismatch",
+                "expected_epoch": e.expected_epoch,
+                "provided_epoch": e.provided_epoch,
+                "room_id": e.room_id,
+            },
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -1370,6 +1516,127 @@ def get_unread_count(
 
     count = db.get_room_unread_count(room_id, identity_id)
     return {"unread_count": count, "room_id": room_id}
+
+
+# --- Room Encryption Endpoints ---
+
+
+@app.get("/{ns}/rooms/{room_id}/epoch", response_model=EpochKeyResponse)
+def get_current_epoch(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get the current epoch info and caller's encrypted key.
+
+    For encrypted rooms, this returns the current epoch information
+    along with the caller's encrypted epoch key (if they have one).
+    """
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    # Check if room has encryption
+    room_info = db.get_room_with_encryption(room_id)
+    if not room_info or not room_info.get("encryption_enabled"):
+        raise HTTPException(400, "Room does not have encryption enabled")
+
+    # Get current epoch
+    epoch = db.get_current_epoch(room_id)
+    if not epoch:
+        raise HTTPException(404, "No epochs found for this room")
+
+    # Get caller's encrypted key for this epoch
+    key_record = db.get_epoch_key_for_identity(room_id, epoch["epoch_number"], identity_id)
+    encrypted_key = key_record["encrypted_epoch_key"] if key_record else None
+
+    return EpochKeyResponse(
+        epoch=EpochInfo(**epoch),
+        encrypted_epoch_key=encrypted_key,
+    )
+
+
+@app.get("/{ns}/rooms/{room_id}/epoch/{epoch_number}", response_model=EpochKeyResponse)
+def get_epoch_by_number(
+    ns: str,
+    room_id: str,
+    epoch_number: int,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get a specific epoch info and caller's encrypted key.
+
+    Use this to fetch epoch keys for decrypting older messages.
+    """
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    # Check if room has encryption
+    room_info = db.get_room_with_encryption(room_id)
+    if not room_info or not room_info.get("encryption_enabled"):
+        raise HTTPException(400, "Room does not have encryption enabled")
+
+    # Get specific epoch
+    epoch = db.get_epoch_by_number(room_id, epoch_number)
+    if not epoch:
+        raise HTTPException(404, f"Epoch {epoch_number} not found")
+
+    # Get caller's encrypted key for this epoch
+    key_record = db.get_epoch_key_for_identity(room_id, epoch_number, identity_id)
+    encrypted_key = key_record["encrypted_epoch_key"] if key_record else None
+
+    return EpochKeyResponse(
+        epoch=EpochInfo(**epoch),
+        encrypted_epoch_key=encrypted_key,
+    )
+
+
+@app.post("/{ns}/rooms/{room_id}/rotate", response_model=EpochKeyResponse)
+def rotate_room_epoch(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Manually rotate the room's epoch key.
+
+    Only the room creator can trigger manual rotation.
+    This is useful after a potential key compromise.
+    """
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    # Only room creator can rotate
+    if room.get("created_by") != identity_id:
+        raise HTTPException(403, "Only room creator can trigger manual rotation")
+
+    # Check if room has encryption
+    room_info = db.get_room_with_encryption(room_id)
+    if not room_info or not room_info.get("encryption_enabled"):
+        raise HTTPException(400, "Room does not have encryption enabled")
+
+    try:
+        result = db.rotate_room_epoch(
+            room_id=room_id,
+            reason="manual",
+            triggered_by=identity_id,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # Get caller's encrypted key for the new epoch
+    key_record = db.get_epoch_key_for_identity(
+        room_id, result["epoch"]["epoch_number"], identity_id
+    )
+    encrypted_key = key_record["encrypted_epoch_key"] if key_record else None
+
+    return EpochKeyResponse(
+        epoch=EpochInfo(**result["epoch"]),
+        encrypted_epoch_key=encrypted_key,
+    )
 
 
 # --- Web App Routes ---

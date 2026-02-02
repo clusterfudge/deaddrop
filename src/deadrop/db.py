@@ -1838,12 +1838,13 @@ def list_rooms_for_identity(
         conn: Optional database connection
 
     Returns:
-        List of room info dicts with member info
+        List of room info dicts with member info including encryption status
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
         """SELECT r.room_id, r.ns, r.display_name, r.created_by, r.created_at,
-                  m.joined_at, m.last_read_mid
+                  m.joined_at, m.last_read_mid,
+                  r.encryption_enabled, r.current_epoch_number
            FROM rooms r
            JOIN room_members m ON r.room_id = m.room_id
            WHERE r.ns = ? AND m.identity_id = ?
