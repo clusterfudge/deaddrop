@@ -46,7 +46,7 @@ DEFAULT_TTL_HOURS = 24
 # v1: Base schema
 # v2: Add rooms tables for group communication
 # v3: Add e2e encryption infrastructure (pubkeys table, encryption columns)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -382,11 +382,85 @@ def _migrate_003_add_encryption(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_004_add_room_encryption(conn: sqlite3.Connection) -> None:
+    """Migration 004: Add room encryption support (epochs and encrypted messages).
+
+    Adds:
+    - room_epochs table for tracking encryption epochs
+    - room_epoch_keys table for distributing encrypted keys to members
+    - rooms.encryption_enabled flag
+    - rooms.current_epoch_number tracking
+    - rooms.base_secret for key derivation (server-side only)
+    - room_messages encryption fields (epoch_number, encrypted, encryption_meta, signature)
+    """
+    # Create room_epochs table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS room_epochs (
+            epoch_id TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+            epoch_number INTEGER NOT NULL,
+            membership_hash TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            triggered_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(room_id, epoch_number)
+        )
+    """)
+
+    # Create room_epoch_keys table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS room_epoch_keys (
+            epoch_id TEXT NOT NULL REFERENCES room_epochs(epoch_id) ON DELETE CASCADE,
+            identity_id TEXT NOT NULL,
+            encrypted_epoch_key TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (epoch_id, identity_id)
+        )
+    """)
+
+    # Create indexes
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_epochs_room ON room_epochs(room_id, epoch_number)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_epoch_keys_identity ON room_epoch_keys(identity_id)"
+    )
+
+    conn.commit()
+
+    # Add columns to rooms table
+    cursor = conn.execute("PRAGMA table_info(rooms)")
+    room_columns = {row[1] for row in cursor.fetchall()}
+
+    if "encryption_enabled" not in room_columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN encryption_enabled BOOLEAN DEFAULT 0")
+    if "current_epoch_number" not in room_columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN current_epoch_number INTEGER DEFAULT 0")
+    if "base_secret" not in room_columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN base_secret TEXT")
+
+    # Add columns to room_messages table
+    cursor = conn.execute("PRAGMA table_info(room_messages)")
+    message_columns = {row[1] for row in cursor.fetchall()}
+
+    if "epoch_number" not in message_columns:
+        conn.execute("ALTER TABLE room_messages ADD COLUMN epoch_number INTEGER")
+    if "encrypted" not in message_columns:
+        conn.execute("ALTER TABLE room_messages ADD COLUMN encrypted BOOLEAN DEFAULT 0")
+    if "encryption_meta" not in message_columns:
+        conn.execute("ALTER TABLE room_messages ADD COLUMN encryption_meta TEXT")
+    if "signature" not in message_columns:
+        conn.execute("ALTER TABLE room_messages ADD COLUMN signature TEXT")
+
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
     (2, "Add rooms tables for group communication", _migrate_002_add_rooms),
     (3, "Add e2e encryption infrastructure", _migrate_003_add_encryption),
+    (4, "Add room encryption support", _migrate_004_add_room_encryption),
 ]
 
 
@@ -494,7 +568,10 @@ SCHEMA_SQL = """
         ns TEXT NOT NULL REFERENCES namespaces(ns) ON DELETE CASCADE,
         display_name TEXT,
         created_by TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        encryption_enabled BOOLEAN DEFAULT 0,
+        current_epoch_number INTEGER DEFAULT 0,
+        base_secret TEXT
     );
     
     CREATE INDEX IF NOT EXISTS idx_rooms_ns ON rooms(ns);
@@ -517,10 +594,39 @@ SCHEMA_SQL = """
         from_id TEXT NOT NULL,
         body TEXT NOT NULL,
         content_type TEXT DEFAULT 'text/plain',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        epoch_number INTEGER,
+        encrypted BOOLEAN DEFAULT 0,
+        encryption_meta TEXT,
+        signature TEXT
     );
     
     CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at);
+    
+    -- Room encryption epochs
+    CREATE TABLE IF NOT EXISTS room_epochs (
+        epoch_id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+        epoch_number INTEGER NOT NULL,
+        membership_hash TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        triggered_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(room_id, epoch_number)
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_room_epochs_room ON room_epochs(room_id, epoch_number);
+    
+    -- Encrypted epoch keys per member
+    CREATE TABLE IF NOT EXISTS room_epoch_keys (
+        epoch_id TEXT NOT NULL REFERENCES room_epochs(epoch_id) ON DELETE CASCADE,
+        identity_id TEXT NOT NULL,
+        encrypted_epoch_key TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (epoch_id, identity_id)
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_room_epoch_keys_identity ON room_epoch_keys(identity_id);
     
     -- Public keys for e2e encryption
     CREATE TABLE IF NOT EXISTS pubkeys (
@@ -564,6 +670,8 @@ def reset_db(conn: sqlite3.Connection | None = None):
     """Reset database (for testing)."""
     conn = _get_conn(conn)
     conn.executescript("""
+        DROP TABLE IF EXISTS room_epoch_keys;
+        DROP TABLE IF EXISTS room_epochs;
         DROP TABLE IF EXISTS room_messages;
         DROP TABLE IF EXISTS room_members;
         DROP TABLE IF EXISTS rooms;
