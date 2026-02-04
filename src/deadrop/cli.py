@@ -1824,14 +1824,23 @@ def room_send(
         epoch_data = epoch_resp.json()
         epoch_number = epoch_data["epoch"]["epoch_number"]
         encrypted_key = epoch_data["encrypted_epoch_key"]
+        distributor_pubkey = epoch_data.get("distributor_public_key")
 
-        # Decrypt the epoch key
+        # Decrypt the epoch key using our private key and server's public key
+        from .crypto import decrypt_epoch_key
 
-        # We need server's public key to decrypt - but actually the key is
-        # stored as-is in this test mode. In production, this would be
-        # encrypted with the member's public key.
-        # For now, assume the encrypted_key is the actual key in base64 (test mode)
-        epoch_key = base64url_to_bytes(encrypted_key)
+        encrypted_key_bytes = base64url_to_bytes(encrypted_key)
+        if distributor_pubkey and len(encrypted_key_bytes) > 32:
+            # Key is encrypted - decrypt it
+            distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
+            epoch_key = decrypt_epoch_key(
+                encrypted_epoch_key=encrypted_key_bytes,
+                distributor_public_key=distributor_pubkey_bytes,
+                member_private_key=keypair.private_key,
+            )
+        else:
+            # Fallback for unencrypted keys (legacy/test mode)
+            epoch_key = encrypted_key_bytes
 
         # Encrypt the message
         encrypted_msg = encrypt_room_message(
@@ -1875,7 +1884,18 @@ def room_send(
 
             epoch_data = epoch_resp.json()
             epoch_number = new_epoch
-            epoch_key = base64url_to_bytes(epoch_data["encrypted_epoch_key"])
+            encrypted_key = epoch_data["encrypted_epoch_key"]
+            distributor_pubkey = epoch_data.get("distributor_public_key")
+            encrypted_key_bytes = base64url_to_bytes(encrypted_key)
+            if distributor_pubkey and len(encrypted_key_bytes) > 32:
+                distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
+                epoch_key = decrypt_epoch_key(
+                    encrypted_epoch_key=encrypted_key_bytes,
+                    distributor_public_key=distributor_pubkey_bytes,
+                    member_private_key=keypair.private_key,
+                )
+            else:
+                epoch_key = encrypted_key_bytes
 
             # Re-encrypt with new epoch
             encrypted_msg = encrypt_room_message(
@@ -1988,10 +2008,15 @@ def room_messages(
         print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
         sys.exit(1)
 
-    messages = response.json()
+    messages_data = response.json()
+    # Handle both {"messages": [...]} and direct list formats
+    if isinstance(messages_data, dict) and "messages" in messages_data:
+        messages = messages_data["messages"]
+    else:
+        messages = messages_data
 
     if raw:
-        print_json(messages)
+        print_json(messages_data)
         return
 
     if not messages:
@@ -2033,7 +2058,23 @@ def room_messages(
             resp = httpx.get(url, headers=headers, timeout=10.0)
             if resp.status_code == 200:
                 data = resp.json()
-                key = base64url_to_bytes(data["encrypted_epoch_key"])
+                encrypted_key = data["encrypted_epoch_key"]
+                distributor_pubkey = data.get("distributor_public_key")
+                encrypted_key_bytes = base64url_to_bytes(encrypted_key)
+
+                if distributor_pubkey and len(encrypted_key_bytes) > 32:
+                    # Key is encrypted - decrypt it
+                    from .crypto import decrypt_epoch_key
+
+                    distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
+                    key = decrypt_epoch_key(
+                        encrypted_epoch_key=encrypted_key_bytes,
+                        distributor_public_key=distributor_pubkey_bytes,
+                        member_private_key=keypair.private_key,
+                    )
+                else:
+                    key = encrypted_key_bytes
+
                 epoch_keys[epoch_num] = key
                 return key
         except Exception:
