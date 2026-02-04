@@ -2013,8 +2013,10 @@ def add_room_member(
     )
     conn.commit()
 
-    # Trigger epoch rotation for encrypted rooms
-    if room["encryption_enabled"] and trigger_rotation:
+    # Trigger epoch rotation for encrypted rooms (server-mediated mode only)
+    # For E2E mode (no base_secret), the inviter must call rotate_room_secret_e2e separately
+    is_e2e_mode = room["encryption_enabled"] and room.get("base_secret") is None
+    if room["encryption_enabled"] and trigger_rotation and not is_e2e_mode:
         rotate_room_epoch(room_id, reason="member_joined", triggered_by=identity_id, conn=conn)
 
     return {
