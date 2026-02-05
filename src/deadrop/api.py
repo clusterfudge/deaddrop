@@ -1020,6 +1020,9 @@ def claim_invite(invite_id: str, request: Request):
 class CreateRoomRequest(BaseModel):
     display_name: str | None = None
     encryption_enabled: bool = False
+    # For true E2E mode: client provides encrypted secret
+    encrypted_base_secret: str | None = None  # Hex-encoded encrypted secret
+    creator_public_key: str | None = None  # Base64-encoded public key
 
 
 class RoomInfo(BaseModel):
@@ -1205,8 +1208,6 @@ def create_room(
 
     # Initialize encryption if requested
     if encryption_enabled:
-        from .crypto import generate_keypair, generate_room_base_secret
-
         # Verify creator has a pubkey
         identity = db.get_identity(ns, created_by)
         if not identity or not identity.get("pubkey_id"):
@@ -1216,16 +1217,31 @@ def create_room(
                 400, "Creator must have a registered pubkey to create an encrypted room"
             )
 
-        # Generate room base secret and initialize encryption
-        base_secret = generate_room_base_secret()
-        server_keypair = generate_keypair()
+        # Check if client provided encrypted secret (true E2E mode)
+        encrypted_base_secret = request.encrypted_base_secret if request else None
+        creator_public_key = request.creator_public_key if request else None
 
-        db.initialize_room_encryption(
-            room_id=room["room_id"],
-            base_secret=base_secret,
-            triggered_by=created_by,
-            server_keypair=(server_keypair.private_key, server_keypair.public_key),
-        )
+        if encrypted_base_secret and creator_public_key:
+            # True E2E mode: server never sees plaintext secret
+            db.initialize_room_encryption_e2e(
+                room_id=room["room_id"],
+                creator_id=created_by,
+                encrypted_base_secret=encrypted_base_secret,
+                creator_public_key=creator_public_key,
+            )
+        else:
+            # Legacy server-mediated mode (deprecated, kept for backward compatibility)
+            from .crypto import generate_keypair, generate_room_base_secret
+
+            base_secret = generate_room_base_secret()
+            server_keypair = generate_keypair()
+
+            db.initialize_room_encryption(
+                room_id=room["room_id"],
+                base_secret=base_secret,
+                triggered_by=created_by,
+                server_keypair=(server_keypair.private_key, server_keypair.public_key),
+            )
 
         # Get updated room info with encryption status
         room_updated = db.get_room_with_encryption(room["room_id"])
@@ -1592,6 +1608,112 @@ def get_unread_count(
 
 
 # --- Room Encryption Endpoints ---
+
+
+class InitializeE2ERequest(BaseModel):
+    """Request to initialize true E2E encryption on a room."""
+
+    encrypted_base_secret: str  # Hex-encoded encrypted secret
+    creator_public_key: str  # Base64-encoded public key
+
+
+class InitializeE2EResponse(BaseModel):
+    """Response from E2E initialization."""
+
+    room_id: str
+    secret_version: int
+    encryption_enabled: bool
+
+
+class MemberSecretResponse(BaseModel):
+    """Response containing a member's encrypted base secret."""
+
+    room_id: str
+    identity_id: str
+    encrypted_base_secret: str
+    inviter_public_key: str
+    secret_version: int
+
+
+@app.get("/{ns}/rooms/{room_id}/member-secret", response_model=MemberSecretResponse)
+def get_member_secret(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get the caller's encrypted base secret for a true E2E room.
+
+    Returns the encrypted secret that the caller can decrypt with their
+    private key to derive epoch keys.
+
+    Returns 404 if the room is not in true E2E mode (uses server-mediated
+    encryption instead).
+    """
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    # Get member's encrypted secret
+    secret = db.get_member_secret(room_id, identity_id)
+    if not secret:
+        raise HTTPException(
+            404, "No encrypted secret found (room may use server-mediated encryption)"
+        )
+
+    return MemberSecretResponse(
+        room_id=room_id,
+        identity_id=identity_id,
+        encrypted_base_secret=secret["encrypted_base_secret"],
+        inviter_public_key=secret["inviter_public_key"],
+        secret_version=secret["secret_version"],
+    )
+
+
+@app.post("/{ns}/rooms/{room_id}/initialize-e2e", response_model=InitializeE2EResponse)
+def initialize_room_e2e(
+    ns: str,
+    room_id: str,
+    request: InitializeE2ERequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Initialize true E2E encryption on a room.
+
+    The client provides an encrypted base secret (encrypted with their own
+    public key). The server stores ONLY the encrypted secret - it never
+    sees the plaintext.
+
+    This must be called by the room creator before anyone else joins.
+    """
+    room, identity_id = require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    # Verify caller is the room creator
+    if room.get("created_by") != identity_id:
+        raise HTTPException(403, "Only the room creator can initialize encryption")
+
+    # Check room doesn't already have encryption
+    room_info = db.get_room_with_encryption(room_id)
+    if room_info and room_info.get("encryption_enabled"):
+        raise HTTPException(400, "Room already has encryption enabled")
+
+    try:
+        result = db.initialize_room_encryption_e2e(
+            room_id=room_id,
+            creator_id=identity_id,
+            encrypted_base_secret=request.encrypted_base_secret,
+            creator_public_key=request.creator_public_key,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return InitializeE2EResponse(
+        room_id=room_id,
+        secret_version=result["secret_version"],
+        encryption_enabled=True,
+    )
 
 
 @app.get("/{ns}/rooms/{room_id}/epoch", response_model=EpochKeyResponse)

@@ -3525,9 +3525,10 @@ def update_secret_version(
         True if updated, False if room not found
     """
     conn = _get_conn(conn)
+    # Update both secret_version and current_epoch_number to keep them in sync
     cursor = conn.execute(
-        "UPDATE rooms SET secret_version = ? WHERE room_id = ?",
-        (secret_version, room_id),
+        "UPDATE rooms SET secret_version = ?, current_epoch_number = ? WHERE room_id = ?",
+        (secret_version, secret_version, room_id),
     )
     conn.commit()
     return cursor.rowcount > 0

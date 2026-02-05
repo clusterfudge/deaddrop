@@ -1421,6 +1421,71 @@ def room_create(
     if encrypted:
         payload["encryption_enabled"] = True
 
+        # True E2E: Generate secret locally, encrypt for self
+        from .crypto import (
+            generate_room_base_secret,
+            encrypt_base_secret_for_member,
+            KeyPair,
+        )
+
+        # Load keypair from local config
+        if not mb.private_key:
+            print("Error: No private key in local config.", file=sys.stderr)
+            sys.exit(1)
+        keypair = KeyPair.from_private_key_base64(mb.private_key)
+
+        # Generate base secret locally (server never sees this!)
+        base_secret = generate_room_base_secret()
+
+        # We need room_id for encryption, but we don't have it yet.
+        # Create room first without encryption, then initialize E2E
+        payload["encryption_enabled"] = False
+        response = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+
+        if response.status_code >= 400:
+            print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+        room = response.json()
+        room_id = room["room_id"]
+
+        # Now encrypt base_secret for ourselves
+        encrypted_for_self = encrypt_base_secret_for_member(
+            base_secret,
+            keypair.public_key,
+            keypair.private_key,
+            room_id,
+        )
+
+        # Initialize E2E encryption on the room
+        init_url = f"{cfg.url}/{ns}/rooms/{room_id}/initialize-e2e"
+        init_payload = {
+            "encrypted_base_secret": encrypted_for_self.hex(),
+            "creator_public_key": keypair.public_key_base64,
+        }
+        init_response = httpx.post(init_url, headers=headers, json=init_payload, timeout=30.0)
+
+        if init_response.status_code >= 400:
+            print(
+                f"Error initializing E2E: {init_response.status_code}: {init_response.text}",
+                file=sys.stderr,
+            )
+            # Clean up: delete the room
+            httpx.delete(f"{cfg.url}/{ns}/rooms/{room_id}", headers=headers, timeout=30.0)
+            sys.exit(1)
+
+        # Get updated room info
+        room_response = httpx.get(f"{cfg.url}/{ns}/rooms/{room_id}", headers=headers, timeout=30.0)
+        if room_response.status_code == 200:
+            room = room_response.json()
+
+        print("Room created!")
+        print(f"  ID: {room['room_id']}")
+        print(f"  Name: {room['display_name']}")
+        print("  🔒 Encryption: enabled (true E2E)")
+        print(f"  Epoch: {room.get('current_epoch_number', 0)}")
+        return
+
     response = httpx.post(url, headers=headers, json=payload, timeout=30.0)
 
     if response.status_code >= 400:
@@ -1682,6 +1747,8 @@ def room_invite(
     """Add a member to a room.
 
     For encrypted rooms, the invitee must have a registered keypair.
+    For true E2E rooms, this command generates a new secret and
+    distributes it to all members (including the new one).
     """
     ns_cfg = get_namespace_config(ns)
     cfg = get_config()
@@ -1698,10 +1765,21 @@ def room_invite(
             sys.exit(1)
         mb = next(iter(ns_cfg.mailboxes.values()))
 
-    url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
     headers = {"X-Inbox-Secret": mb.secret}
-    payload = {"identity_id": member_id}
 
+    # Check if this is a true E2E room (no server-side base_secret)
+    room_url = f"{cfg.url}/{ns}/rooms/{room_id}"
+    room_response = httpx.get(room_url, headers=headers, timeout=30.0)
+    if room_response.status_code >= 400:
+        print(f"Error getting room: {room_response.status_code}", file=sys.stderr)
+        sys.exit(1)
+
+    room_info = room_response.json()
+    is_encrypted = room_info.get("encryption_enabled", False)
+
+    # Add member first
+    url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
+    payload = {"identity_id": member_id}
     response = httpx.post(url, headers=headers, json=payload, timeout=30.0)
 
     if response.status_code >= 400:
@@ -1709,6 +1787,104 @@ def room_invite(
         sys.exit(1)
 
     data = response.json()
+
+    # For E2E encrypted rooms, we need to do client-side key distribution
+    # Check if the room is in true E2E mode by trying to get our member secret
+    if is_encrypted:
+        member_secret_url = f"{cfg.url}/{ns}/rooms/{room_id}/member-secret"
+        secret_response = httpx.get(member_secret_url, headers=headers, timeout=30.0)
+
+        if secret_response.status_code == 200:
+            # True E2E mode: we have an encrypted secret stored
+            from .crypto import (
+                generate_room_base_secret,
+                encrypt_base_secret_for_member,
+                base64url_to_bytes,
+                KeyPair,
+            )
+
+            # Load our keypair
+            if not mb.private_key:
+                print("Error: No private key in local config.", file=sys.stderr)
+                print("The member was added but secret distribution failed.", file=sys.stderr)
+                sys.exit(1)
+            keypair = KeyPair.from_private_key_base64(mb.private_key)
+
+            # Generate fresh secret for the new epoch (forward secrecy)
+            new_base_secret = generate_room_base_secret()
+
+            # Get all current members' public keys
+            members_url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
+            members_response = httpx.get(members_url, headers=headers, timeout=30.0)
+            if members_response.status_code >= 400:
+                print(f"Error getting members: {members_response.status_code}", file=sys.stderr)
+                sys.exit(1)
+
+            members = members_response.json()
+
+            # Build encrypted secrets for all members
+            member_secrets = []
+            for member in members:
+                mid = member["identity_id"]
+                # Get member's public key
+                identity_url = f"{cfg.url}/{ns}/identities/{mid}"
+                id_response = httpx.get(identity_url, headers=headers, timeout=30.0)
+                if id_response.status_code >= 400:
+                    print(
+                        f"Error getting identity {mid}: {id_response.status_code}", file=sys.stderr
+                    )
+                    continue
+
+                id_info = id_response.json()
+                member_pubkey_b64 = id_info.get("public_key")
+                if not member_pubkey_b64:
+                    print(f"Warning: Member {mid} has no public key, skipping", file=sys.stderr)
+                    continue
+
+                member_pubkey = base64url_to_bytes(member_pubkey_b64)
+
+                # Encrypt new secret for this member
+                encrypted = encrypt_base_secret_for_member(
+                    new_base_secret,
+                    member_pubkey,
+                    keypair.private_key,
+                    room_id,
+                )
+                member_secrets.append(
+                    {
+                        "identity_id": mid,
+                        "encrypted_base_secret": encrypted.hex(),
+                        "inviter_public_key": keypair.public_key_base64,
+                    }
+                )
+
+            # Get current secret version
+            current_version = room_info.get("current_epoch_number", 0)
+
+            # Rotate the secret
+            rotate_url = f"{cfg.url}/{ns}/rooms/{room_id}/rotate-secret"
+            rotate_payload = {
+                "new_secret_version": current_version + 1,
+                "member_secrets": member_secrets,
+            }
+            rotate_response = httpx.post(
+                rotate_url, headers=headers, json=rotate_payload, timeout=30.0
+            )
+
+            if rotate_response.status_code >= 400:
+                print(
+                    f"Error rotating secret: {rotate_response.status_code}: {rotate_response.text}",
+                    file=sys.stderr,
+                )
+                print("The member was added but secret distribution failed.", file=sys.stderr)
+                sys.exit(1)
+
+            rotate_data = rotate_response.json()
+            print(f"Added {member_id} to room.")
+            print(f"New epoch: {rotate_data.get('secret_version', current_version + 1)}")
+            return
+
+    # Server-mediated mode or non-encrypted room
     print(f"Added {member_id} to room.")
     if "current_epoch_number" in data:
         print(f"New epoch: {data['current_epoch_number']}")
@@ -1813,34 +1989,75 @@ def room_send(
 
         keypair = KeyPair.from_private_key_base64(mb.private_key)
 
-        # Get current epoch key
-        epoch_url = f"{cfg.url}/{ns}/rooms/{room_id}/epoch"
-        epoch_resp = httpx.get(epoch_url, headers=headers, timeout=30.0)
+        # Check if this is a true E2E room (has member-secret endpoint)
+        member_secret_url = f"{cfg.url}/{ns}/rooms/{room_id}/member-secret"
+        secret_resp = httpx.get(member_secret_url, headers=headers, timeout=30.0)
 
-        if epoch_resp.status_code >= 400:
-            print(f"Error getting epoch: {epoch_resp.status_code}", file=sys.stderr)
-            sys.exit(1)
-
-        epoch_data = epoch_resp.json()
-        epoch_number = epoch_data["epoch"]["epoch_number"]
-        encrypted_key = epoch_data["encrypted_epoch_key"]
-        distributor_pubkey = epoch_data.get("distributor_public_key")
-
-        # Decrypt the epoch key using our private key and server's public key
-        from .crypto import decrypt_epoch_key
-
-        encrypted_key_bytes = base64url_to_bytes(encrypted_key)
-        if distributor_pubkey and len(encrypted_key_bytes) > 32:
-            # Key is encrypted - decrypt it
-            distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
-            epoch_key = decrypt_epoch_key(
-                encrypted_epoch_key=encrypted_key_bytes,
-                distributor_public_key=distributor_pubkey_bytes,
-                member_private_key=keypair.private_key,
+        if secret_resp.status_code == 200:
+            # True E2E mode: derive epoch key from base secret
+            from .crypto import (
+                decrypt_base_secret_from_invite,
+                derive_epoch_key,
+                compute_membership_hash,
             )
+
+            secret_data = secret_resp.json()
+            encrypted_base_secret = bytes.fromhex(secret_data["encrypted_base_secret"])
+            inviter_pubkey = base64url_to_bytes(secret_data["inviter_public_key"])
+            secret_version = secret_data["secret_version"]
+
+            # Decrypt our base secret
+            base_secret = decrypt_base_secret_from_invite(
+                encrypted_base_secret,
+                inviter_pubkey,
+                keypair.private_key,
+                room_id,
+            )
+
+            # Get current members to compute membership hash
+            members_url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
+            members_resp = httpx.get(members_url, headers=headers, timeout=30.0)
+            if members_resp.status_code >= 400:
+                print(f"Error getting members: {members_resp.status_code}", file=sys.stderr)
+                sys.exit(1)
+
+            members = members_resp.json()
+            member_ids = sorted([m["identity_id"] for m in members])
+            membership_hash = compute_membership_hash(member_ids)
+
+            # Derive epoch key
+            epoch_number = secret_version
+            epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
         else:
-            # Fallback for unencrypted keys (legacy/test mode)
-            epoch_key = encrypted_key_bytes
+            # Server-mediated mode: get epoch key from server
+            epoch_url = f"{cfg.url}/{ns}/rooms/{room_id}/epoch"
+            epoch_resp = httpx.get(epoch_url, headers=headers, timeout=30.0)
+
+            if epoch_resp.status_code >= 400:
+                print(f"Error getting epoch: {epoch_resp.status_code}", file=sys.stderr)
+                sys.exit(1)
+
+            epoch_data = epoch_resp.json()
+            epoch_number = epoch_data["epoch"]["epoch_number"]
+            encrypted_key = epoch_data["encrypted_epoch_key"]
+            distributor_pubkey = epoch_data.get("distributor_public_key")
+
+            # Decrypt the epoch key using our private key and server's public key
+            from .crypto import decrypt_epoch_key
+
+            encrypted_key_bytes = base64url_to_bytes(encrypted_key)
+            if distributor_pubkey and len(encrypted_key_bytes) > 32:
+                # Key is encrypted - decrypt it
+                distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
+                epoch_key = decrypt_epoch_key(
+                    encrypted_epoch_key=encrypted_key_bytes,
+                    distributor_public_key=distributor_pubkey_bytes,
+                    member_private_key=keypair.private_key,
+                )
+            else:
+                # Fallback for unencrypted keys (legacy/test mode)
+                epoch_key = encrypted_key_bytes
 
         # Encrypt the message
         encrypted_msg = encrypt_room_message(
