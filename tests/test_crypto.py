@@ -598,6 +598,11 @@ class TestEpochKeyDerivation:
 class TestRoomMessageEncryption:
     """Tests for room message encryption/decryption."""
 
+    # Test constants for replay protection
+    TEST_SENDER_ID = "test-sender-123"
+    TEST_TIMESTAMP = "2026-01-01T00:00:00Z"
+    TEST_MESSAGE_ID = "test-msg-001"
+
     def test_encrypt_decrypt_roundtrip(self):
         """Encrypted room message should decrypt correctly."""
         from deadrop.crypto import (
@@ -620,12 +625,26 @@ class TestRoomMessageEncryption:
         # Encrypt
         plaintext = "Hello, room!"
         encrypted = encrypt_room_message(
-            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+            plaintext,
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Decrypt
         decrypted = decrypt_room_message(
-            encrypted, epoch_key, sender.signing_public_key, room_id, epoch_number
+            encrypted,
+            epoch_key,
+            sender.signing_public_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         assert decrypted == plaintext
@@ -650,10 +669,24 @@ class TestRoomMessageEncryption:
 
         plaintext = "Hello 世界! 🔐 Encrypted room message"
         encrypted = encrypt_room_message(
-            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+            plaintext,
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
         decrypted = decrypt_room_message(
-            encrypted, epoch_key, sender.signing_public_key, room_id, epoch_number
+            encrypted,
+            epoch_key,
+            sender.signing_public_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         assert decrypted == plaintext
@@ -677,10 +710,24 @@ class TestRoomMessageEncryption:
 
         plaintext = "Same message"
         encrypted1 = encrypt_room_message(
-            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+            plaintext,
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
         encrypted2 = encrypt_room_message(
-            plaintext, epoch_key, sender.private_key, room_id, epoch_number
+            plaintext,
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Different nonces mean different ciphertexts
@@ -706,12 +753,30 @@ class TestRoomMessageEncryption:
 
         # Encrypt with epoch 0 key
         epoch_key_0 = derive_epoch_key(base_secret, 0, room_id, membership_hash)
-        encrypted = encrypt_room_message("secret", epoch_key_0, sender.private_key, room_id, 0)
+        encrypted = encrypt_room_message(
+            "secret",
+            epoch_key_0,
+            sender.private_key,
+            room_id,
+            0,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
+        )
 
         # Try to decrypt with epoch 1 key
         epoch_key_1 = derive_epoch_key(epoch_key_0, 1, room_id, membership_hash)
         with pytest.raises(CryptoError):
-            decrypt_room_message(encrypted, epoch_key_1, sender.signing_public_key, room_id, 0)
+            decrypt_room_message(
+                encrypted,
+                epoch_key_1,
+                sender.signing_public_key,
+                room_id,
+                0,
+                self.TEST_SENDER_ID,
+                self.TEST_TIMESTAMP,
+                self.TEST_MESSAGE_ID,
+            )
 
     def test_wrong_sender_signature_fails(self):
         """Decryption with wrong sender pubkey should fail signature verification."""
@@ -733,13 +798,27 @@ class TestRoomMessageEncryption:
         epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
 
         encrypted = encrypt_room_message(
-            "secret", epoch_key, sender.private_key, room_id, epoch_number
+            "secret",
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Decryption succeeds but signature verification fails
         with pytest.raises(ValueError, match="Invalid signature"):
             decrypt_room_message(
-                encrypted, epoch_key, wrong_sender.signing_public_key, room_id, epoch_number
+                encrypted,
+                epoch_key,
+                wrong_sender.signing_public_key,
+                room_id,
+                epoch_number,
+                self.TEST_SENDER_ID,
+                self.TEST_TIMESTAMP,
+                self.TEST_MESSAGE_ID,
             )
 
     def test_tampered_ciphertext_fails(self):
@@ -763,7 +842,14 @@ class TestRoomMessageEncryption:
         epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
 
         encrypted = encrypt_room_message(
-            "secret", epoch_key, sender.private_key, room_id, epoch_number
+            "secret",
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Tamper with ciphertext
@@ -775,7 +861,14 @@ class TestRoomMessageEncryption:
 
         with pytest.raises(CryptoError):
             decrypt_room_message(
-                tampered, epoch_key, sender.signing_public_key, room_id, epoch_number
+                tampered,
+                epoch_key,
+                sender.signing_public_key,
+                room_id,
+                epoch_number,
+                self.TEST_SENDER_ID,
+                self.TEST_TIMESTAMP,
+                self.TEST_MESSAGE_ID,
             )
 
     def test_wrong_room_id_verification_fails(self):
@@ -797,13 +890,27 @@ class TestRoomMessageEncryption:
         epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
 
         encrypted = encrypt_room_message(
-            "secret", epoch_key, sender.private_key, room_id, epoch_number
+            "secret",
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Try to verify with wrong room_id
         with pytest.raises(ValueError, match="Invalid signature"):
             decrypt_room_message(
-                encrypted, epoch_key, sender.signing_public_key, "wrong-room", epoch_number
+                encrypted,
+                epoch_key,
+                sender.signing_public_key,
+                "wrong-room",
+                epoch_number,
+                self.TEST_SENDER_ID,
+                self.TEST_TIMESTAMP,
+                self.TEST_MESSAGE_ID,
             )
 
     def test_wrong_epoch_number_verification_fails(self):
@@ -825,16 +932,37 @@ class TestRoomMessageEncryption:
         epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
 
         encrypted = encrypt_room_message(
-            "secret", epoch_key, sender.private_key, room_id, epoch_number
+            "secret",
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Try to verify with wrong epoch number
         with pytest.raises(ValueError, match="Invalid signature"):
-            decrypt_room_message(encrypted, epoch_key, sender.signing_public_key, room_id, 999)
+            decrypt_room_message(
+                encrypted,
+                epoch_key,
+                sender.signing_public_key,
+                room_id,
+                999,
+                self.TEST_SENDER_ID,
+                self.TEST_TIMESTAMP,
+                self.TEST_MESSAGE_ID,
+            )
 
 
 class TestEncryptedRoomMessageSerialization:
     """Tests for EncryptedRoomMessage serialization."""
+
+    # Test constants for replay protection
+    TEST_SENDER_ID = "test-sender-123"
+    TEST_TIMESTAMP = "2026-01-01T00:00:00Z"
+    TEST_MESSAGE_ID = "test-msg-001"
 
     def test_to_dict_from_dict_roundtrip(self):
         """Message should survive dict serialization."""
@@ -855,7 +983,14 @@ class TestEncryptedRoomMessageSerialization:
         epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
 
         original = encrypt_room_message(
-            "test message", epoch_key, sender.private_key, room_id, epoch_number
+            "test message",
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Roundtrip through dict
@@ -885,7 +1020,14 @@ class TestEncryptedRoomMessageSerialization:
         epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
 
         original = encrypt_room_message(
-            "test message", epoch_key, sender.private_key, room_id, epoch_number
+            "test message",
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            self.TEST_SENDER_ID,
+            self.TEST_TIMESTAMP,
+            self.TEST_MESSAGE_ID,
         )
 
         # Roundtrip through JSON
@@ -914,7 +1056,14 @@ class TestEncryptedRoomMessageSerialization:
         epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
 
         encrypted = encrypt_room_message(
-            "test", epoch_key, sender.private_key, room_id, epoch_number
+            "test",
+            epoch_key,
+            sender.private_key,
+            room_id,
+            epoch_number,
+            "test-sender",
+            "2026-01-01T00:00:00Z",
+            "test-msg",
         )
 
         data = encrypted.to_dict()

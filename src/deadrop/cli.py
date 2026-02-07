@@ -22,6 +22,7 @@ from pathlib import Path
 
 import cyclopts
 import httpx
+from uuid_extensions import uuid7 as make_uuid7
 
 from .config import (
     GlobalConfig,
@@ -1962,7 +1963,8 @@ def room_send(
         if not ns_cfg.mailboxes:
             print("Error: No mailboxes in namespace config.", file=sys.stderr)
             sys.exit(1)
-        mb = next(iter(ns_cfg.mailboxes.values()))
+        # Get both identity_id and mailbox config from first available
+        identity_id, mb = next(iter(ns_cfg.mailboxes.items()))
 
     # Check if room is encrypted
     room_url = f"{cfg.url}/{ns}/rooms/{room_id}"
@@ -2059,6 +2061,10 @@ def room_send(
                 # Fallback for unencrypted keys (legacy/test mode)
                 epoch_key = encrypted_key_bytes
 
+        # Generate message ID and timestamp for replay protection
+        message_id = str(make_uuid7())
+        timestamp = datetime.now(timezone.utc).isoformat()
+
         # Encrypt the message
         encrypted_msg = encrypt_room_message(
             plaintext=body,
@@ -2066,6 +2072,9 @@ def room_send(
             sender_signing_key=keypair.private_key,
             room_id=room_id,
             epoch_number=epoch_number,
+            sender_id=identity_id,
+            timestamp=timestamp,
+            message_id=message_id,
         )
 
         # Send encrypted message
@@ -2078,6 +2087,9 @@ def room_send(
                 {
                     "algorithm": "xsalsa20-poly1305+ed25519",
                     "nonce": bytes_to_base64url(encrypted_msg.nonce),
+                    "sender_id": identity_id,
+                    "timestamp": timestamp,
+                    "message_id": message_id,
                 }
             ),
             "signature": bytes_to_base64url(encrypted_msg.signature),
@@ -2114,13 +2126,16 @@ def room_send(
             else:
                 epoch_key = encrypted_key_bytes
 
-            # Re-encrypt with new epoch
+            # Re-encrypt with new epoch (use same message_id and timestamp for consistency)
             encrypted_msg = encrypt_room_message(
                 plaintext=body,
                 epoch_key=epoch_key,
                 sender_signing_key=keypair.private_key,
                 room_id=room_id,
                 epoch_number=epoch_number,
+                sender_id=identity_id,
+                timestamp=timestamp,
+                message_id=message_id,
             )
 
             payload = {
@@ -2131,6 +2146,9 @@ def room_send(
                     {
                         "algorithm": "xsalsa20-poly1305+ed25519",
                         "nonce": bytes_to_base64url(encrypted_msg.nonce),
+                        "sender_id": identity_id,
+                        "timestamp": timestamp,
+                        "message_id": message_id,
                     }
                 ),
                 "signature": bytes_to_base64url(encrypted_msg.signature),
@@ -2283,6 +2301,9 @@ def room_messages(
                     # Key is encrypted - decrypt it
                     from .crypto import decrypt_epoch_key
 
+                    if keypair is None:
+                        return None  # Can't decrypt without keypair
+
                     distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
                     key = decrypt_epoch_key(
                         encrypted_epoch_key=encrypted_key_bytes,
@@ -2324,12 +2345,20 @@ def room_messages(
                         # Get sender's signing key
                         sender_key = get_sender_signing_key(from_id)
                         if sender_key:
+                            # Get replay protection fields from metadata
+                            msg_sender_id = meta.get("sender_id", from_id)
+                            msg_timestamp = meta.get("timestamp", msg.get("created_at", ""))
+                            msg_message_id = meta.get("message_id", msg.get("mid", ""))
+
                             body = decrypt_room_message(
                                 encrypted_msg,
                                 epoch_key,
                                 sender_key,
                                 room_id,
                                 epoch_num,
+                                sender_id=msg_sender_id,
+                                timestamp=msg_timestamp,
+                                message_id=msg_message_id,
                             )
                             enc_status = " 🔓"
                             sig_status = " ✓"

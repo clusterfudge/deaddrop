@@ -27,6 +27,11 @@ from deadrop.crypto import (
     generate_room_base_secret,
 )
 
+# Test constants for replay protection
+TEST_SENDER_ID = "test-sender-123"
+TEST_TIMESTAMP = "2026-01-01T00:00:00Z"
+TEST_MESSAGE_ID = "test-msg-001"
+
 
 class TestEncryptedRoomFullLifecycle:
     """Test the complete lifecycle of an encrypted room."""
@@ -118,6 +123,9 @@ class TestEncryptedRoomFullLifecycle:
             sender_signing_key=alice_kp.private_key,
             room_id=room["room_id"],
             epoch_number=1,
+            sender_id=TEST_SENDER_ID,
+            timestamp=TEST_TIMESTAMP,
+            message_id=TEST_MESSAGE_ID,
         )
 
         # Store encrypted message
@@ -159,6 +167,9 @@ class TestEncryptedRoomFullLifecycle:
             alice_kp.signing_public_key,
             room["room_id"],
             1,
+            TEST_SENDER_ID,
+            TEST_TIMESTAMP,
+            TEST_MESSAGE_ID,
         )
         assert decrypted == plaintext
 
@@ -170,6 +181,9 @@ class TestEncryptedRoomFullLifecycle:
             sender_signing_key=bob_kp.private_key,
             room_id=room["room_id"],
             epoch_number=1,
+            sender_id=TEST_SENDER_ID,
+            timestamp=TEST_TIMESTAMP,
+            message_id=TEST_MESSAGE_ID,
         )
 
         db.send_room_message(
@@ -205,6 +219,9 @@ class TestEncryptedRoomFullLifecycle:
             bob_kp.signing_public_key,
             room["room_id"],
             1,
+            TEST_SENDER_ID,
+            TEST_TIMESTAMP,
+            TEST_MESSAGE_ID,
         )
         assert decrypted_bob == bob_plaintext
 
@@ -245,6 +262,9 @@ class TestEncryptedRoomFullLifecycle:
                 alice_kp.signing_public_key,
                 room["room_id"],
                 1,
+                TEST_SENDER_ID,
+                TEST_TIMESTAMP,
+                TEST_MESSAGE_ID,
             )
 
         # === Step 10: Bob is removed - epoch rotates to 3 ===
@@ -273,6 +293,9 @@ class TestEncryptedRoomFullLifecycle:
             sender_signing_key=alice_kp.private_key,
             room_id=room["room_id"],
             epoch_number=3,
+            sender_id=TEST_SENDER_ID,
+            timestamp=TEST_TIMESTAMP,
+            message_id=TEST_MESSAGE_ID,
         )
 
         db.send_room_message(
@@ -306,6 +329,9 @@ class TestEncryptedRoomFullLifecycle:
                 alice_kp.signing_public_key,
                 room["room_id"],
                 3,
+                TEST_SENDER_ID,
+                TEST_TIMESTAMP,
+                TEST_MESSAGE_ID,
             )
 
         # But Carol can decrypt (she has epoch 3 key)
@@ -317,6 +343,9 @@ class TestEncryptedRoomFullLifecycle:
             alice_kp.signing_public_key,
             room["room_id"],
             3,
+            TEST_SENDER_ID,
+            TEST_TIMESTAMP,
+            TEST_MESSAGE_ID,
         )
         assert carol_decrypted == secret_from_bob
 
@@ -401,6 +430,9 @@ class TestEpochMismatchAndRetry:
             sender_signing_key=bob_kp.private_key,
             room_id=room["room_id"],
             epoch_number=5,
+            sender_id=TEST_SENDER_ID,
+            timestamp=TEST_TIMESTAMP,
+            message_id=TEST_MESSAGE_ID,
         )
 
         # === Step 5: Server returns EpochMismatchError ===
@@ -427,6 +459,9 @@ class TestEpochMismatchAndRetry:
             sender_signing_key=bob_kp.private_key,
             room_id=room["room_id"],
             epoch_number=6,
+            sender_id=TEST_SENDER_ID,
+            timestamp=TEST_TIMESTAMP,
+            message_id=TEST_MESSAGE_ID,
         )
 
         msg = db.send_room_message(
@@ -522,6 +557,9 @@ class TestOfflineMemberCatchup:
             sender_signing_key=users["alice"]["keypair"].private_key,
             room_id=room["room_id"],
             epoch_number=5,
+            sender_id=TEST_SENDER_ID,
+            timestamp=TEST_TIMESTAMP,
+            message_id=TEST_MESSAGE_ID,
         )
 
         db.send_room_message(
@@ -571,6 +609,9 @@ class TestOfflineMemberCatchup:
             users["alice"]["keypair"].signing_public_key,
             room["room_id"],
             5,
+            TEST_SENDER_ID,
+            TEST_TIMESTAMP,
+            TEST_MESSAGE_ID,
         )
 
         assert decrypted == msg5_plain

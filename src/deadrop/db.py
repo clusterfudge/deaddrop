@@ -1995,6 +1995,14 @@ def add_room_member(
                 f"Identity {identity_id} must have a registered pubkey to join encrypted room"
             )
 
+        # Block member additions while a removal is pending (security: prevents timing attacks)
+        pending = get_pending_removal(room_id, conn=conn)
+        if pending:
+            raise ValueError(
+                f"Cannot add members while a removal is pending. "
+                f"Complete or cancel the pending removal of {pending['pending_removal_id']} first."
+            )
+
     # Check if already a member
     if is_room_member(room_id, identity_id, conn=conn):
         # Return existing membership
