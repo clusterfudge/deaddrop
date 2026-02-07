@@ -27,12 +27,14 @@ def reset_database():
     # Temporarily disable foreign keys to allow dropping in any order
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.executescript("""
+        DROP TABLE IF EXISTS room_member_secrets;
         DROP TABLE IF EXISTS room_messages;
         DROP TABLE IF EXISTS room_members;
         DROP TABLE IF EXISTS rooms;
         DROP TABLE IF EXISTS archive_batches;
         DROP TABLE IF EXISTS invites;
         DROP TABLE IF EXISTS messages;
+        DROP TABLE IF EXISTS pubkeys;
         DROP TABLE IF EXISTS identities;
         DROP TABLE IF EXISTS namespaces;
         DROP TABLE IF EXISTS schema_version;

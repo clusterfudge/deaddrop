@@ -181,6 +181,9 @@ class MailboxConfig:
     display_name: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str | None = None
+    # E2E encryption keypair (private key stored locally, public key on server)
+    private_key: str | None = None  # Base64-encoded 32-byte seed
+    pubkey_id: str | None = None  # Current pubkey ID on server (for reference)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for YAML serialization."""
@@ -193,6 +196,10 @@ class MailboxConfig:
             data["metadata"] = self.metadata
         if self.created_at:
             data["created_at"] = self.created_at
+        if self.private_key:
+            data["private_key"] = self.private_key
+        if self.pubkey_id:
+            data["pubkey_id"] = self.pubkey_id
         return data
 
     @classmethod
@@ -204,6 +211,8 @@ class MailboxConfig:
             display_name=data.get("display_name"),
             metadata=data.get("metadata", {}),
             created_at=data.get("created_at"),
+            private_key=data.get("private_key"),
+            pubkey_id=data.get("pubkey_id"),
         )
 
 

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import cyclopts
 import httpx
+from uuid_extensions import uuid7 as make_uuid7
 
 from .config import (
     GlobalConfig,
@@ -40,6 +41,7 @@ app = cyclopts.App(
 ns_app = cyclopts.App(name="ns", help="Namespace management")
 identity_app = cyclopts.App(name="identity", help="Identity (mailbox) management")
 message_app = cyclopts.App(name="message", help="Message operations (for testing)")
+room_app = cyclopts.App(name="room", help="Room management and encrypted messaging")
 jobs_app = cyclopts.App(name="jobs", help="Scheduled job operations")
 archive_app = cyclopts.App(name="archive", help="Archive and rehydration operations")
 invite_app = cyclopts.App(name="invite", help="Invite management for web users")
@@ -48,6 +50,7 @@ source_app = cyclopts.App(name="source", help="Multi-source configuration manage
 app.command(ns_app)
 app.command(identity_app)
 app.command(message_app)
+app.command(room_app)
 app.command(jobs_app)
 app.command(archive_app)
 app.command(invite_app)
@@ -107,6 +110,33 @@ def api_request(
 def print_json(data):
     """Pretty print JSON data."""
     print(json.dumps(data, indent=2, default=str))
+
+
+# --- Docs Command ---
+
+
+@app.command
+def docs():
+    """Show comprehensive usage documentation.
+
+    Outputs the built-in documentation in Markdown format.
+    Covers concepts, authentication, CLI usage, API reference, and encryption.
+    """
+    import importlib.resources
+
+    # Read the bundled documentation file
+    try:
+        # Python 3.9+ way
+        files = importlib.resources.files("deadrop.docs")
+        doc_content = (files / "USAGE.md").read_text()
+    except (AttributeError, TypeError):
+        # Fallback for older Python
+        import importlib.resources as resources
+
+        with resources.open_text("deadrop.docs", "USAGE.md") as f:
+            doc_content = f.read()
+
+    print(doc_content)
 
 
 # --- Claim Helpers (needed early for top-level command) ---
@@ -829,6 +859,129 @@ def identity_export(ns: str, identity_id: str, *, format: str = "text"):
 
 
 @identity_app.command
+def generate_keys(ns: str, identity_id: str):
+    """Generate and register an encryption keypair for an identity.
+
+    Creates a new keypair and registers the public key with the server.
+    The private key is stored locally and never sent to the server.
+
+    If the identity already has a keypair, this will rotate the key
+    (old key revoked, new key becomes active).
+    """
+    from deadrop.crypto import generate_keypair
+
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    if identity_id not in ns_cfg.mailboxes:
+        print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+        sys.exit(1)
+
+    mb = ns_cfg.mailboxes[identity_id]
+
+    # Generate keypair
+    keypair = generate_keypair()
+
+    # Register with server
+    url = f"{cfg.url}/{ns}/inbox/{identity_id}/pubkey"
+    headers = {"X-Inbox-Secret": mb.secret}
+    payload = {
+        "public_key": keypair.public_key_base64,
+        "signing_public_key": keypair.signing_public_key_base64,
+        "algorithm": "nacl-box",
+    }
+
+    response = httpx.put(url, headers=headers, json=payload, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    result = response.json()
+
+    # Save private key locally
+    mb.private_key = keypair.private_key_base64
+    mb.pubkey_id = result["pubkey_id"]
+    ns_cfg.save()
+
+    print("Keypair generated and registered!")
+    print(f"  Public key ID: {result['pubkey_id']}")
+    print(f"  Version: {result['version']}")
+    print(f"  Algorithm: {result['algorithm']}")
+    print("\nPrivate key saved to local config.")
+    print("You can now send encrypted messages and sign outgoing messages.")
+
+
+@identity_app.command
+def rotate_key(ns: str, identity_id: str):
+    """Rotate the encryption keypair for an identity.
+
+    Generates a new keypair, registers it with the server (revoking the old one),
+    and keeps the old private key for decrypting historical messages.
+
+    Alias for generate-keys (same behavior).
+    """
+    # Just call generate_keys - it handles rotation automatically
+    generate_keys(ns, identity_id)
+
+
+@identity_app.command
+def show_pubkey(ns: str, identity_id: str):
+    """Show public key information for an identity.
+
+    Shows both local keypair status and server-registered public key.
+    """
+    from deadrop.crypto import KeyPair, pubkey_id
+
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    if identity_id not in ns_cfg.mailboxes:
+        print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+        sys.exit(1)
+
+    mb = ns_cfg.mailboxes[identity_id]
+
+    print(f"Identity: {identity_id}")
+    print(f"Display name: {mb.display_name or '(none)'}")
+    print()
+
+    # Local keypair status
+    print("Local keypair:")
+    if mb.private_key:
+        keypair = KeyPair.from_private_key_base64(mb.private_key)
+        print("  ✓ Private key present")
+        print(f"  Public key: {keypair.public_key_base64}")
+        print(f"  Signing key: {keypair.signing_public_key_base64}")
+        local_pubkey_id = pubkey_id(keypair.public_key)
+        print(f"  Pubkey ID: {local_pubkey_id}")
+        if mb.pubkey_id:
+            if mb.pubkey_id == local_pubkey_id:
+                print("  ✓ Matches server pubkey_id")
+            else:
+                print(f"  ⚠ Different from server pubkey_id: {mb.pubkey_id}")
+    else:
+        print("  ✗ No private key (run 'deadrop identity generate-keys' to create one)")
+
+    # Server-side pubkey
+    print("\nServer pubkey:")
+    url = f"{cfg.url}/{ns}/identities/{identity_id}"
+    headers = {"X-Inbox-Secret": mb.secret}
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"  Error fetching: {response.status_code}")
+    else:
+        identity = response.json()
+        if identity.get("pubkey_id"):
+            print(f"  Pubkey ID: {identity['pubkey_id']}")
+            print(f"  Algorithm: {identity.get('algorithm', 'unknown')}")
+            print(f"  Version: {identity.get('pubkey_version', 'unknown')}")
+        else:
+            print("  ✗ No public key registered on server")
+
+
+@identity_app.command
 def identity_delete(ns: str, identity_id: str, *, force: bool = False, remote: bool = False):
     """Delete an identity.
 
@@ -883,12 +1036,26 @@ def send(
     *,
     identity_id: str | None = None,
     ttl: int | None = None,
+    encrypt: bool | None = None,
+    no_sign: bool = False,
 ):
     """Send a message to another identity.
 
     Uses the first mailbox in the namespace config, or specify --identity-id.
-    Primarily for testing - mailbox owners typically use the API directly.
+
+    Encryption: If sender has a keypair and recipient has a public key registered,
+    the message will be encrypted by default. Use --encrypt=false to send plaintext.
+
+    Signing: If sender has a keypair, messages are always signed (unless --no-sign).
     """
+    from deadrop.crypto import (
+        KeyPair,
+        bytes_to_base64url,
+        encrypt_message,
+        pubkey_id,
+        sign_message,
+    )
+
     ns_cfg = get_namespace_config(ns)
     cfg = get_config()
 
@@ -907,12 +1074,86 @@ def send(
         sender = next(iter(ns_cfg.mailboxes.values()))
         print(f"Sending as: {sender.display_name or sender.id}")
 
+    # Check sender keypair
+    sender_keypair = None
+    if sender.private_key:
+        sender_keypair = KeyPair.from_private_key_base64(sender.private_key)
+
+    # Get recipient's public key (fetch from server - server is authority)
+    recipient_pubkey = None
+    recipient_pubkey_id = None
+    url = f"{cfg.url}/{ns}/identities/{to}"
+    headers = {"X-Inbox-Secret": sender.secret}
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code == 200:
+        recipient_info = response.json()
+        if recipient_info.get("public_key"):
+            from deadrop.crypto import base64url_to_bytes
+
+            recipient_pubkey = base64url_to_bytes(recipient_info["public_key"])
+            recipient_pubkey_id = recipient_info.get("pubkey_id")
+
+    # Determine if we should encrypt
+    should_encrypt = False
+    if encrypt is True:
+        if not sender_keypair:
+            print(
+                "Error: --encrypt requires a keypair. Run 'deadrop identity generate-keys'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not recipient_pubkey:
+            print("Error: Recipient has no public key registered. Cannot encrypt.", file=sys.stderr)
+            sys.exit(1)
+        should_encrypt = True
+    elif encrypt is False:
+        should_encrypt = False
+    else:
+        # Auto-encrypt if both parties have keys
+        should_encrypt = sender_keypair is not None and recipient_pubkey is not None
+
+    # Build the message payload
+    json_data: dict = {"to": to}
+    if ttl is not None:
+        json_data["ttl_hours"] = ttl
+
+    message_body = body  # Body to sign (plaintext for plaintext msgs, or ciphertext for encrypted)
+
+    if should_encrypt:
+        # Encrypt the message (type guards ensure these are not None at this point)
+        assert sender_keypair is not None
+        assert recipient_pubkey is not None
+        ciphertext = encrypt_message(body, recipient_pubkey, sender_keypair.private_key)
+        message_body = bytes_to_base64url(ciphertext)
+        json_data["body"] = message_body
+        json_data["encrypted"] = True
+        json_data["encryption"] = {
+            "algorithm": "nacl-box",
+            "recipient_pubkey_id": recipient_pubkey_id,
+        }
+        print("🔒 Encrypting message...")
+    else:
+        json_data["body"] = body
+        json_data["encrypted"] = False
+        if recipient_pubkey and not sender_keypair:
+            print("⚠ Recipient has encryption key but you don't. Sending plaintext.")
+            print("  Run 'deadrop identity generate-keys' to enable encryption.")
+
+    # Sign the message (always, unless --no-sign)
+    if sender_keypair and not no_sign:
+        signature = sign_message(message_body, sender_keypair.private_key)
+        sender_pubkey_id = pubkey_id(sender_keypair.public_key)
+        json_data["signature"] = {
+            "algorithm": "ed25519",
+            "sender_pubkey_id": sender_pubkey_id,
+            "value": bytes_to_base64url(signature),
+        }
+        print("✍ Signing message...")
+
     # Send message
     url = f"{cfg.url}/{ns}/send"
     headers = {"X-Inbox-Secret": sender.secret}
-    json_data = {"to": to, "body": body}
-    if ttl is not None:
-        json_data["ttl"] = ttl
 
     response = httpx.post(url, headers=headers, json=json_data, timeout=30.0)
 
@@ -932,15 +1173,27 @@ def inbox(
     unread: bool = False,
     after: str | None = None,
     json_output: bool = False,
+    raw: bool = False,
 ):
     """Read messages from an inbox.
 
     Uses the first mailbox in the namespace config, or specify identity-id.
     Reading marks messages as read and starts the TTL countdown.
 
+    Encrypted messages are automatically decrypted if you have the private key.
+    Signatures are verified when the sender's public key is available.
+
     --unread: Only show unread messages
     --after: Only show messages after this message ID (cursor for pagination)
+    --raw: Show raw message data without decryption
     """
+    from deadrop.crypto import (
+        KeyPair,
+        base64url_to_bytes,
+        decrypt_message,
+        verify_signature,
+    )
+
     ns_cfg = get_namespace_config(ns)
     cfg = get_config()
 
@@ -956,6 +1209,11 @@ def inbox(
             sys.exit(1)
         mb = next(iter(ns_cfg.mailboxes.values()))
         print(f"Reading inbox for: {mb.display_name or mb.id}\n")
+
+    # Get recipient keypair (for decryption)
+    recipient_keypair = None
+    if mb.private_key:
+        recipient_keypair = KeyPair.from_private_key_base64(mb.private_key)
 
     # Fetch messages
     url = f"{cfg.url}/{ns}/inbox/{mb.id}"
@@ -985,6 +1243,27 @@ def inbox(
         print("No messages.")
         return
 
+    # Cache for sender info (fetched from server)
+    sender_info_cache: dict[str, dict | None] = {}
+
+    def get_sender_info(sender_id: str) -> dict | None:
+        """Fetch sender's identity info from server (includes both encryption and signing keys)."""
+        if sender_id in sender_info_cache:
+            return sender_info_cache[sender_id]
+
+        try:
+            url = f"{cfg.url}/{ns}/identities/{sender_id}"
+            headers = {"X-Inbox-Secret": mb.secret}
+            resp = httpx.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                info = resp.json()
+                sender_info_cache[sender_id] = info
+                return info
+        except Exception:
+            pass
+        sender_info_cache[sender_id] = None
+        return None
+
     for msg in messages:
         status = ""
         if msg.get("acked_at"):
@@ -994,6 +1273,57 @@ def inbox(
         else:
             status = " [unread]"
 
+        # Encryption/signature status
+        enc_status = ""
+        sig_status = ""
+
+        body = msg["body"]
+        is_encrypted = msg.get("encrypted", False)
+
+        if is_encrypted and not raw:
+            if recipient_keypair:
+                # Try to decrypt
+                try:
+                    # Get sender's encryption public key (X25519, not signing key)
+                    sender_info = get_sender_info(msg["from"])
+                    if sender_info and sender_info.get("public_key"):
+                        sender_enc_pubkey = base64url_to_bytes(sender_info["public_key"])
+                        ciphertext = base64url_to_bytes(msg["body"])
+                        body = decrypt_message(
+                            ciphertext, sender_enc_pubkey, recipient_keypair.private_key
+                        )
+                        enc_status = " 🔓"
+                    else:
+                        body = "[encrypted - sender pubkey not found]"
+                        enc_status = " 🔒"
+                except Exception as e:
+                    body = f"[decryption failed: {e}]"
+                    enc_status = " 🔒❌"
+            else:
+                body = "[encrypted - no private key]"
+                enc_status = " 🔒"
+
+        # Verify signature
+        if msg.get("signature") and not raw:
+            sig_meta = msg["signature"]
+            sender_info = get_sender_info(msg["from"])
+            sender_signing_key = None
+            if sender_info and sender_info.get("signing_public_key"):
+                sender_signing_key = base64url_to_bytes(sender_info["signing_public_key"])
+            if sender_signing_key and sig_meta.get("value"):
+                try:
+                    sig_bytes = base64url_to_bytes(sig_meta["value"])
+                    # Signature is over the original body (ciphertext for encrypted, plaintext for plain)
+                    sig_body = msg["body"]
+                    if verify_signature(sig_body, sig_bytes, sender_signing_key):
+                        sig_status = " ✓verified"
+                    else:
+                        sig_status = " ⚠signature invalid"
+                except Exception:
+                    sig_status = " ⚠signature error"
+            elif sig_meta.get("value"):
+                sig_status = " (unverified - sender pubkey unknown)"
+
         # Try to resolve sender name from local config
         from_name = msg["from"]
         if msg["from"] in ns_cfg.mailboxes:
@@ -1001,10 +1331,10 @@ def inbox(
             if mb_from.display_name:
                 from_name = f"{mb_from.display_name} ({msg['from'][:8]}...)"
 
-        print(f"--- {msg['mid'][:8]}...{status} ---")
+        print(f"--- {msg['mid'][:8]}...{status}{enc_status}{sig_status} ---")
         print(f"From: {from_name}")
         print(f"At:   {msg['created_at']}")
-        print(f"\n{msg['body']}\n")
+        print(f"\n{body}\n")
 
 
 @message_app.command
@@ -1042,6 +1372,1012 @@ def message_delete(
         sys.exit(1)
 
     print(f"Message {mid} deleted.")
+
+
+# --- Room Commands ---
+
+
+@room_app.command
+def room_create(
+    ns: str,
+    name: str,
+    *,
+    identity_id: str | None = None,
+    encrypted: bool = False,
+):
+    """Create a new room.
+
+    Creates a room and makes the caller the first member (and creator).
+
+    --encrypted: Enable end-to-end encryption for this room.
+                 Requires the creator to have a registered keypair.
+                 All future members must also have keypairs.
+    """
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the creator identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+        print(f"Creating room as: {mb.display_name or mb.id}")
+
+    # Check for keypair if encryption requested
+    if encrypted and not mb.private_key:
+        print("Error: Creating an encrypted room requires a keypair.", file=sys.stderr)
+        print("Run 'deadrop identity generate-keys' first.", file=sys.stderr)
+        sys.exit(1)
+
+    # Create room via API
+    url = f"{cfg.url}/{ns}/rooms"
+    headers = {"X-Inbox-Secret": mb.secret}
+    payload: dict = {"display_name": name}
+    if encrypted:
+        payload["encryption_enabled"] = True
+
+        # True E2E: Generate secret locally, encrypt for self
+        from .crypto import (
+            generate_room_base_secret,
+            encrypt_base_secret_for_member,
+            KeyPair,
+        )
+
+        # Load keypair from local config
+        if not mb.private_key:
+            print("Error: No private key in local config.", file=sys.stderr)
+            sys.exit(1)
+        keypair = KeyPair.from_private_key_base64(mb.private_key)
+
+        # Generate base secret locally (server never sees this!)
+        base_secret = generate_room_base_secret()
+
+        # We need room_id for encryption, but we don't have it yet.
+        # Create room first without encryption, then initialize E2E
+        payload["encryption_enabled"] = False
+        response = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+
+        if response.status_code >= 400:
+            print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+        room = response.json()
+        room_id = room["room_id"]
+
+        # Now encrypt base_secret for ourselves
+        encrypted_for_self = encrypt_base_secret_for_member(
+            base_secret,
+            keypair.public_key,
+            keypair.private_key,
+            room_id,
+        )
+
+        # Initialize E2E encryption on the room
+        init_url = f"{cfg.url}/{ns}/rooms/{room_id}/initialize-e2e"
+        init_payload = {
+            "encrypted_base_secret": encrypted_for_self.hex(),
+            "creator_public_key": keypair.public_key_base64,
+        }
+        init_response = httpx.post(init_url, headers=headers, json=init_payload, timeout=30.0)
+
+        if init_response.status_code >= 400:
+            print(
+                f"Error initializing E2E: {init_response.status_code}: {init_response.text}",
+                file=sys.stderr,
+            )
+            # Clean up: delete the room
+            httpx.delete(f"{cfg.url}/{ns}/rooms/{room_id}", headers=headers, timeout=30.0)
+            sys.exit(1)
+
+        # Get updated room info
+        room_response = httpx.get(f"{cfg.url}/{ns}/rooms/{room_id}", headers=headers, timeout=30.0)
+        if room_response.status_code == 200:
+            room = room_response.json()
+
+        print("Room created!")
+        print(f"  ID: {room['room_id']}")
+        print(f"  Name: {room['display_name']}")
+        print("  🔒 Encryption: enabled (true E2E)")
+        print(f"  Epoch: {room.get('current_epoch_number', 0)}")
+        return
+
+    response = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    room = response.json()
+
+    print("Room created!")
+    print(f"  ID: {room['room_id']}")
+    print(f"  Name: {room['display_name']}")
+    if encrypted:
+        print("  🔒 Encryption: enabled")
+        print(f"  Epoch: {room.get('current_epoch_number', 0)}")
+    else:
+        print("  Encryption: disabled")
+
+
+@room_app.command
+def room_list(
+    ns: str,
+    *,
+    identity_id: str | None = None,
+):
+    """List rooms the identity is a member of."""
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    url = f"{cfg.url}/{ns}/rooms"
+    headers = {"X-Inbox-Secret": mb.secret}
+
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    rooms = response.json()
+
+    if not rooms:
+        print("Not a member of any rooms.")
+        return
+
+    print(f"Rooms for {mb.display_name or mb.id}:")
+    for room in rooms:
+        enc_icon = "🔒" if room.get("encryption_enabled") else ""
+        epoch = (
+            f" (epoch {room.get('current_epoch_number', 0)})"
+            if room.get("encryption_enabled")
+            else ""
+        )
+        print(f"  {room['room_id']}  {room['display_name']} {enc_icon}{epoch}")
+
+
+@room_app.command
+def room_show(
+    ns: str,
+    room_id: str,
+    *,
+    identity_id: str | None = None,
+):
+    """Show room details."""
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    url = f"{cfg.url}/{ns}/rooms/{room_id}"
+    headers = {"X-Inbox-Secret": mb.secret}
+
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    room = response.json()
+
+    print(f"Room: {room['display_name']}")
+    print(f"  ID: {room['room_id']}")
+    print(f"  Created by: {room['created_by']}")
+    print(f"  Created at: {room['created_at']}")
+    if room.get("encryption_enabled"):
+        print("  🔒 Encryption: enabled")
+        print(f"  Current epoch: {room.get('current_epoch_number', 0)}")
+    else:
+        print("  Encryption: disabled")
+
+
+@room_app.command
+def room_epoch(
+    ns: str,
+    room_id: str,
+    epoch_number: int | None = None,
+    *,
+    identity_id: str | None = None,
+):
+    """Show epoch information for an encrypted room.
+
+    Without epoch_number, shows current epoch.
+    With epoch_number, shows that specific epoch (for historical messages).
+    """
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    if epoch_number is None:
+        url = f"{cfg.url}/{ns}/rooms/{room_id}/epoch"
+    else:
+        url = f"{cfg.url}/{ns}/rooms/{room_id}/epoch/{epoch_number}"
+
+    headers = {"X-Inbox-Secret": mb.secret}
+
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = response.json()
+
+    print(f"Epoch {data['epoch']['epoch_number']}:")
+    print(f"  Epoch ID: {data['epoch']['epoch_id']}")
+    print(f"  Reason: {data['epoch']['reason']}")
+    print(f"  Membership hash: {data['epoch']['membership_hash'][:16]}...")
+    print(f"  Created at: {data['epoch']['created_at']}")
+    if data["epoch"].get("triggered_by"):
+        print(f"  Triggered by: {data['epoch']['triggered_by']}")
+    print(f"  Your encrypted key: {data['encrypted_epoch_key'][:32]}...")
+
+
+@room_app.command
+def room_rotate(
+    ns: str,
+    room_id: str,
+    *,
+    identity_id: str | None = None,
+):
+    """Manually rotate the encryption key for a room.
+
+    Only the room creator can perform manual rotation.
+    This is useful if you suspect key compromise.
+    """
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    url = f"{cfg.url}/{ns}/rooms/{room_id}/rotate"
+    headers = {"X-Inbox-Secret": mb.secret}
+
+    response = httpx.post(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = response.json()
+
+    print("Key rotated!")
+    print(f"  New epoch: {data['epoch']['epoch_number']}")
+    print(f"  Reason: {data['epoch']['reason']}")
+
+
+@room_app.command
+def room_members(
+    ns: str,
+    room_id: str,
+    *,
+    identity_id: str | None = None,
+):
+    """List members of a room."""
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
+    headers = {"X-Inbox-Secret": mb.secret}
+
+    response = httpx.get(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    members = response.json()
+
+    if not members:
+        print("No members (this shouldn't happen).")
+        return
+
+    print(f"Members ({len(members)}):")
+    for member in members:
+        print(f"  {member['identity_id']}  (joined {member['joined_at']})")
+
+
+@room_app.command
+def room_invite(
+    ns: str,
+    room_id: str,
+    member_id: str,
+    *,
+    identity_id: str | None = None,
+):
+    """Add a member to a room.
+
+    For encrypted rooms, the invitee must have a registered keypair.
+    For true E2E rooms, this command generates a new secret and
+    distributes it to all members (including the new one).
+    """
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    headers = {"X-Inbox-Secret": mb.secret}
+
+    # Check if this is a true E2E room (no server-side base_secret)
+    room_url = f"{cfg.url}/{ns}/rooms/{room_id}"
+    room_response = httpx.get(room_url, headers=headers, timeout=30.0)
+    if room_response.status_code >= 400:
+        print(f"Error getting room: {room_response.status_code}", file=sys.stderr)
+        sys.exit(1)
+
+    room_info = room_response.json()
+    is_encrypted = room_info.get("encryption_enabled", False)
+
+    # Add member first
+    url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
+    payload = {"identity_id": member_id}
+    response = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = response.json()
+
+    # For E2E encrypted rooms, we need to do client-side key distribution
+    # Check if the room is in true E2E mode by trying to get our member secret
+    if is_encrypted:
+        member_secret_url = f"{cfg.url}/{ns}/rooms/{room_id}/member-secret"
+        secret_response = httpx.get(member_secret_url, headers=headers, timeout=30.0)
+
+        if secret_response.status_code == 200:
+            # True E2E mode: we have an encrypted secret stored
+            from .crypto import (
+                generate_room_base_secret,
+                encrypt_base_secret_for_member,
+                base64url_to_bytes,
+                KeyPair,
+            )
+
+            # Load our keypair
+            if not mb.private_key:
+                print("Error: No private key in local config.", file=sys.stderr)
+                print("The member was added but secret distribution failed.", file=sys.stderr)
+                sys.exit(1)
+            keypair = KeyPair.from_private_key_base64(mb.private_key)
+
+            # Generate fresh secret for the new epoch (forward secrecy)
+            new_base_secret = generate_room_base_secret()
+
+            # Get all current members' public keys
+            members_url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
+            members_response = httpx.get(members_url, headers=headers, timeout=30.0)
+            if members_response.status_code >= 400:
+                print(f"Error getting members: {members_response.status_code}", file=sys.stderr)
+                sys.exit(1)
+
+            members = members_response.json()
+
+            # Build encrypted secrets for all members
+            member_secrets = []
+            for member in members:
+                mid = member["identity_id"]
+                # Get member's public key
+                identity_url = f"{cfg.url}/{ns}/identities/{mid}"
+                id_response = httpx.get(identity_url, headers=headers, timeout=30.0)
+                if id_response.status_code >= 400:
+                    print(
+                        f"Error getting identity {mid}: {id_response.status_code}", file=sys.stderr
+                    )
+                    continue
+
+                id_info = id_response.json()
+                member_pubkey_b64 = id_info.get("public_key")
+                if not member_pubkey_b64:
+                    print(f"Warning: Member {mid} has no public key, skipping", file=sys.stderr)
+                    continue
+
+                member_pubkey = base64url_to_bytes(member_pubkey_b64)
+
+                # Encrypt new secret for this member
+                encrypted = encrypt_base_secret_for_member(
+                    new_base_secret,
+                    member_pubkey,
+                    keypair.private_key,
+                    room_id,
+                )
+                member_secrets.append(
+                    {
+                        "identity_id": mid,
+                        "encrypted_base_secret": encrypted.hex(),
+                        "inviter_public_key": keypair.public_key_base64,
+                    }
+                )
+
+            # Get current secret version
+            current_version = room_info.get("current_epoch_number", 0)
+
+            # Rotate the secret
+            rotate_url = f"{cfg.url}/{ns}/rooms/{room_id}/rotate-secret"
+            rotate_payload = {
+                "new_secret_version": current_version + 1,
+                "member_secrets": member_secrets,
+            }
+            rotate_response = httpx.post(
+                rotate_url, headers=headers, json=rotate_payload, timeout=30.0
+            )
+
+            if rotate_response.status_code >= 400:
+                print(
+                    f"Error rotating secret: {rotate_response.status_code}: {rotate_response.text}",
+                    file=sys.stderr,
+                )
+                print("The member was added but secret distribution failed.", file=sys.stderr)
+                sys.exit(1)
+
+            rotate_data = rotate_response.json()
+            print(f"Added {member_id} to room.")
+            print(f"New epoch: {rotate_data.get('secret_version', current_version + 1)}")
+            return
+
+    # Server-mediated mode or non-encrypted room
+    print(f"Added {member_id} to room.")
+    if "current_epoch_number" in data:
+        print(f"New epoch: {data['current_epoch_number']}")
+
+
+@room_app.command
+def room_leave(
+    ns: str,
+    room_id: str,
+    *,
+    identity_id: str | None = None,
+):
+    """Leave a room."""
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    url = f"{cfg.url}/{ns}/rooms/{room_id}/members/{mb.id}"
+    headers = {"X-Inbox-Secret": mb.secret}
+
+    response = httpx.delete(url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Left room.")
+
+
+@room_app.command
+def room_send(
+    ns: str,
+    room_id: str,
+    body: str,
+    *,
+    identity_id: str | None = None,
+    encrypt: bool | None = None,
+):
+    """Send a message to a room.
+
+    For encrypted rooms, the message is automatically encrypted with the
+    current epoch key. If a 409 conflict is returned (epoch mismatch),
+    the command will automatically retry with the new epoch.
+
+    --encrypt: Force encryption on (requires encrypted room)
+    """
+    from deadrop.crypto import (
+        KeyPair,
+        base64url_to_bytes,
+        bytes_to_base64url,
+        encrypt_room_message,
+    )
+
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        # Get both identity_id and mailbox config from first available
+        identity_id, mb = next(iter(ns_cfg.mailboxes.items()))
+
+    # Check if room is encrypted
+    room_url = f"{cfg.url}/{ns}/rooms/{room_id}"
+    headers = {"X-Inbox-Secret": mb.secret}
+    room_resp = httpx.get(room_url, headers=headers, timeout=30.0)
+
+    if room_resp.status_code >= 400:
+        print(f"Error {room_resp.status_code}: {room_resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    room = room_resp.json()
+    is_encrypted = room.get("encryption_enabled", False)
+
+    if encrypt and not is_encrypted:
+        print("Error: Room is not encrypted. Cannot use --encrypt.", file=sys.stderr)
+        sys.exit(1)
+
+    if is_encrypted:
+        # Need keypair for signing/encryption
+        if not mb.private_key:
+            print("Error: Encrypted room requires a keypair.", file=sys.stderr)
+            print("Run 'deadrop identity generate-keys' first.", file=sys.stderr)
+            sys.exit(1)
+
+        keypair = KeyPair.from_private_key_base64(mb.private_key)
+
+        # Check if this is a true E2E room (has member-secret endpoint)
+        member_secret_url = f"{cfg.url}/{ns}/rooms/{room_id}/member-secret"
+        secret_resp = httpx.get(member_secret_url, headers=headers, timeout=30.0)
+
+        if secret_resp.status_code == 200:
+            # True E2E mode: derive epoch key from base secret
+            from .crypto import (
+                decrypt_base_secret_from_invite,
+                derive_epoch_key,
+                compute_membership_hash,
+            )
+
+            secret_data = secret_resp.json()
+            encrypted_base_secret = bytes.fromhex(secret_data["encrypted_base_secret"])
+            inviter_pubkey = base64url_to_bytes(secret_data["inviter_public_key"])
+            secret_version = secret_data["secret_version"]
+
+            # Decrypt our base secret
+            base_secret = decrypt_base_secret_from_invite(
+                encrypted_base_secret,
+                inviter_pubkey,
+                keypair.private_key,
+                room_id,
+            )
+
+            # Get current members to compute membership hash
+            members_url = f"{cfg.url}/{ns}/rooms/{room_id}/members"
+            members_resp = httpx.get(members_url, headers=headers, timeout=30.0)
+            if members_resp.status_code >= 400:
+                print(f"Error getting members: {members_resp.status_code}", file=sys.stderr)
+                sys.exit(1)
+
+            members = members_resp.json()
+            member_ids = sorted([m["identity_id"] for m in members])
+            membership_hash = compute_membership_hash(member_ids)
+
+            # Derive epoch key
+            epoch_number = secret_version
+            epoch_key = derive_epoch_key(base_secret, epoch_number, room_id, membership_hash)
+
+        else:
+            # Server-mediated mode: get epoch key from server
+            epoch_url = f"{cfg.url}/{ns}/rooms/{room_id}/epoch"
+            epoch_resp = httpx.get(epoch_url, headers=headers, timeout=30.0)
+
+            if epoch_resp.status_code >= 400:
+                print(f"Error getting epoch: {epoch_resp.status_code}", file=sys.stderr)
+                sys.exit(1)
+
+            epoch_data = epoch_resp.json()
+            epoch_number = epoch_data["epoch"]["epoch_number"]
+            encrypted_key = epoch_data["encrypted_epoch_key"]
+            distributor_pubkey = epoch_data.get("distributor_public_key")
+
+            # Decrypt the epoch key using our private key and server's public key
+            from .crypto import decrypt_epoch_key
+
+            encrypted_key_bytes = base64url_to_bytes(encrypted_key)
+            if distributor_pubkey and len(encrypted_key_bytes) > 32:
+                # Key is encrypted - decrypt it
+                distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
+                epoch_key = decrypt_epoch_key(
+                    encrypted_epoch_key=encrypted_key_bytes,
+                    distributor_public_key=distributor_pubkey_bytes,
+                    member_private_key=keypair.private_key,
+                )
+            else:
+                # Fallback for unencrypted keys (legacy/test mode)
+                epoch_key = encrypted_key_bytes
+
+        # Generate message ID and timestamp for replay protection
+        message_id = str(make_uuid7())
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Encrypt the message
+        encrypted_msg = encrypt_room_message(
+            plaintext=body,
+            epoch_key=epoch_key,
+            sender_signing_key=keypair.private_key,
+            room_id=room_id,
+            epoch_number=epoch_number,
+            sender_id=identity_id,
+            timestamp=timestamp,
+            message_id=message_id,
+        )
+
+        # Send encrypted message
+        send_url = f"{cfg.url}/{ns}/rooms/{room_id}/messages"
+        payload: dict = {
+            "body": bytes_to_base64url(encrypted_msg.ciphertext),
+            "epoch_number": epoch_number,
+            "encrypted": True,
+            "encryption_meta": json.dumps(
+                {
+                    "algorithm": "xsalsa20-poly1305+ed25519",
+                    "nonce": bytes_to_base64url(encrypted_msg.nonce),
+                    "sender_id": identity_id,
+                    "timestamp": timestamp,
+                    "message_id": message_id,
+                }
+            ),
+            "signature": bytes_to_base64url(encrypted_msg.signature),
+        }
+
+        response = httpx.post(send_url, headers=headers, json=payload, timeout=30.0)
+
+        # Handle epoch mismatch - retry with new epoch
+        if response.status_code == 409:
+            print("Epoch mismatch - fetching new key and retrying...")
+            error_data = response.json()
+            new_epoch = error_data.get("expected_epoch")
+
+            # Get new epoch key
+            epoch_url = f"{cfg.url}/{ns}/rooms/{room_id}/epoch/{new_epoch}"
+            epoch_resp = httpx.get(epoch_url, headers=headers, timeout=30.0)
+
+            if epoch_resp.status_code >= 400:
+                print(f"Error getting new epoch: {epoch_resp.status_code}", file=sys.stderr)
+                sys.exit(1)
+
+            epoch_data = epoch_resp.json()
+            epoch_number = new_epoch
+            encrypted_key = epoch_data["encrypted_epoch_key"]
+            distributor_pubkey = epoch_data.get("distributor_public_key")
+            encrypted_key_bytes = base64url_to_bytes(encrypted_key)
+            if distributor_pubkey and len(encrypted_key_bytes) > 32:
+                distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
+                epoch_key = decrypt_epoch_key(
+                    encrypted_epoch_key=encrypted_key_bytes,
+                    distributor_public_key=distributor_pubkey_bytes,
+                    member_private_key=keypair.private_key,
+                )
+            else:
+                epoch_key = encrypted_key_bytes
+
+            # Re-encrypt with new epoch (use same message_id and timestamp for consistency)
+            encrypted_msg = encrypt_room_message(
+                plaintext=body,
+                epoch_key=epoch_key,
+                sender_signing_key=keypair.private_key,
+                room_id=room_id,
+                epoch_number=epoch_number,
+                sender_id=identity_id,
+                timestamp=timestamp,
+                message_id=message_id,
+            )
+
+            payload = {
+                "body": bytes_to_base64url(encrypted_msg.ciphertext),
+                "epoch_number": epoch_number,
+                "encrypted": True,
+                "encryption_meta": json.dumps(
+                    {
+                        "algorithm": "xsalsa20-poly1305+ed25519",
+                        "nonce": bytes_to_base64url(encrypted_msg.nonce),
+                        "sender_id": identity_id,
+                        "timestamp": timestamp,
+                        "message_id": message_id,
+                    }
+                ),
+                "signature": bytes_to_base64url(encrypted_msg.signature),
+            }
+
+            response = httpx.post(send_url, headers=headers, json=payload, timeout=30.0)
+
+        if response.status_code >= 400:
+            print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+        msg = response.json()
+        print(f"🔒 Encrypted message sent: {msg['mid']}")
+
+    else:
+        # Unencrypted room - send plaintext
+        send_url = f"{cfg.url}/{ns}/rooms/{room_id}/messages"
+        payload = {"body": body}
+
+        response = httpx.post(send_url, headers=headers, json=payload, timeout=30.0)
+
+        if response.status_code >= 400:
+            print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+            sys.exit(1)
+
+        msg = response.json()
+        print(f"Message sent: {msg['mid']}")
+
+
+@room_app.command
+def room_messages(
+    ns: str,
+    room_id: str,
+    *,
+    identity_id: str | None = None,
+    limit: int = 50,
+    decrypt: bool = True,
+    raw: bool = False,
+):
+    """Read messages from a room.
+
+    For encrypted rooms, messages are automatically decrypted if you have
+    the epoch keys (fetched from server and decrypted with your private key).
+
+    --limit: Maximum number of messages to show
+    --decrypt: Decrypt messages (default: true)
+    --raw: Show raw message data
+    """
+    from deadrop.crypto import (
+        KeyPair,
+        base64url_to_bytes,
+        decrypt_room_message,
+        EncryptedRoomMessage,
+    )
+
+    ns_cfg = get_namespace_config(ns)
+    cfg = get_config()
+
+    # Find the identity
+    if identity_id:
+        if identity_id not in ns_cfg.mailboxes:
+            print(f"Error: Identity {identity_id} not found in local config.", file=sys.stderr)
+            sys.exit(1)
+        mb = ns_cfg.mailboxes[identity_id]
+    else:
+        if not ns_cfg.mailboxes:
+            print("Error: No mailboxes in namespace config.", file=sys.stderr)
+            sys.exit(1)
+        mb = next(iter(ns_cfg.mailboxes.values()))
+
+    # Get keypair if we have one
+    keypair = None
+    if mb.private_key:
+        keypair = KeyPair.from_private_key_base64(mb.private_key)
+
+    # Get room info
+    room_url = f"{cfg.url}/{ns}/rooms/{room_id}"
+    headers = {"X-Inbox-Secret": mb.secret}
+    room_resp = httpx.get(room_url, headers=headers, timeout=30.0)
+
+    if room_resp.status_code >= 400:
+        print(f"Error {room_resp.status_code}: {room_resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    room = room_resp.json()
+
+    # Get messages
+    messages_url = f"{cfg.url}/{ns}/rooms/{room_id}/messages?limit={limit}"
+    response = httpx.get(messages_url, headers=headers, timeout=30.0)
+
+    if response.status_code >= 400:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        sys.exit(1)
+
+    messages_data = response.json()
+    # Handle both {"messages": [...]} and direct list formats
+    if isinstance(messages_data, dict) and "messages" in messages_data:
+        messages = messages_data["messages"]
+    else:
+        messages = messages_data
+
+    if raw:
+        print_json(messages_data)
+        return
+
+    if not messages:
+        print("No messages.")
+        return
+
+    # Cache for epoch keys
+    epoch_keys: dict[int, bytes] = {}
+
+    # Cache for sender signing keys
+    sender_keys: dict[str, bytes | None] = {}
+
+    def get_sender_signing_key(sender_id: str) -> bytes | None:
+        """Get sender's signing public key from server."""
+        if sender_id in sender_keys:
+            return sender_keys[sender_id]
+
+        try:
+            url = f"{cfg.url}/{ns}/identities/{sender_id}"
+            resp = httpx.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                info = resp.json()
+                if info.get("signing_public_key"):
+                    key = base64url_to_bytes(info["signing_public_key"])
+                    sender_keys[sender_id] = key
+                    return key
+        except Exception:
+            pass
+        sender_keys[sender_id] = None
+        return None
+
+    def get_epoch_key(epoch_num: int) -> bytes | None:
+        """Get epoch key from cache or server."""
+        if epoch_num in epoch_keys:
+            return epoch_keys[epoch_num]
+
+        try:
+            url = f"{cfg.url}/{ns}/rooms/{room_id}/epoch/{epoch_num}"
+            resp = httpx.get(url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                encrypted_key = data["encrypted_epoch_key"]
+                distributor_pubkey = data.get("distributor_public_key")
+                encrypted_key_bytes = base64url_to_bytes(encrypted_key)
+
+                if distributor_pubkey and len(encrypted_key_bytes) > 32:
+                    # Key is encrypted - decrypt it
+                    from .crypto import decrypt_epoch_key
+
+                    if keypair is None:
+                        return None  # Can't decrypt without keypair
+
+                    distributor_pubkey_bytes = base64url_to_bytes(distributor_pubkey)
+                    key = decrypt_epoch_key(
+                        encrypted_epoch_key=encrypted_key_bytes,
+                        distributor_public_key=distributor_pubkey_bytes,
+                        member_private_key=keypair.private_key,
+                    )
+                else:
+                    key = encrypted_key_bytes
+
+                epoch_keys[epoch_num] = key
+                return key
+        except Exception:
+            pass
+        return None
+
+    print(f"Messages in {room['display_name']}:")
+    print()
+
+    for msg in messages:
+        from_id = msg["from_id"]
+        body = msg["body"]
+        enc_status = ""
+        sig_status = ""
+
+        if msg.get("encrypted") and decrypt and keypair:
+            epoch_num = msg.get("epoch_number")
+            if epoch_num is not None:
+                epoch_key = get_epoch_key(epoch_num)
+                if epoch_key:
+                    try:
+                        # Reconstruct EncryptedRoomMessage
+                        meta = json.loads(msg.get("encryption_meta", "{}"))
+                        encrypted_msg = EncryptedRoomMessage(
+                            ciphertext=base64url_to_bytes(msg["body"]),
+                            nonce=base64url_to_bytes(meta.get("nonce", "")),
+                            signature=base64url_to_bytes(msg.get("signature", "")),
+                        )
+
+                        # Get sender's signing key
+                        sender_key = get_sender_signing_key(from_id)
+                        if sender_key:
+                            # Get replay protection fields from metadata
+                            msg_sender_id = meta.get("sender_id", from_id)
+                            msg_timestamp = meta.get("timestamp", msg.get("created_at", ""))
+                            msg_message_id = meta.get("message_id", msg.get("mid", ""))
+
+                            body = decrypt_room_message(
+                                encrypted_msg,
+                                epoch_key,
+                                sender_key,
+                                room_id,
+                                epoch_num,
+                                sender_id=msg_sender_id,
+                                timestamp=msg_timestamp,
+                                message_id=msg_message_id,
+                            )
+                            enc_status = " 🔓"
+                            sig_status = " ✓"
+                        else:
+                            body = "[encrypted - sender key not found]"
+                            enc_status = " 🔒"
+                    except Exception as e:
+                        body = f"[decryption failed: {e}]"
+                        enc_status = " 🔒❌"
+                else:
+                    body = f"[encrypted - epoch {epoch_num} key not available]"
+                    enc_status = " 🔒"
+        elif msg.get("encrypted"):
+            body = "[encrypted - no keypair]"
+            enc_status = " 🔒"
+
+        print(f"[{msg['created_at']}] {from_id[:8]}...:{enc_status}{sig_status}")
+        print(f"  {body}")
+        print()
 
 
 # --- Jobs Commands ---

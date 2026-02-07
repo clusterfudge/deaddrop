@@ -867,7 +867,10 @@ class LocalBackend(Backend):
             if not db.is_room_member(room_id, caller_id, conn=self._conn):
                 raise PermissionError("Not authorized to remove members")
 
-        return db.remove_room_member(room_id, identity_id, conn=self._conn)
+        result = db.remove_room_member(room_id, identity_id, conn=self._conn)
+        # Backend interface expects bool for backward compatibility
+        # For E2E rooms with pending removal, return True (request accepted)
+        return result.get("removed", False) or result.get("pending", False)
 
     def list_room_members(
         self,
