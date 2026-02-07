@@ -1253,6 +1253,33 @@ class TestPendingRemoval:
         db.clear_pending_removal(room["room_id"])
         assert db.get_pending_removal(room["room_id"]) is None
 
+    def test_add_member_blocked_during_pending_removal(self):
+        """Cannot add members while a removal is pending (security)."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        carol = db.create_identity(ns["ns"])
+        db.create_pubkey(ns["ns"], alice["id"], "pk_a", "spk_a")
+        db.create_pubkey(ns["ns"], bob["id"], "pk_b", "spk_b")
+        db.create_pubkey(ns["ns"], carol["id"], "pk_c", "spk_c")
+        room = db.create_room(ns["ns"], alice["id"], "Test Room")
+        db.add_room_member(room["room_id"], bob["id"])
+
+        # Initialize as E2E room
+        db.initialize_room_encryption_e2e(room["room_id"], alice["id"], "encrypted", "pubkey")
+
+        # Start pending removal for Bob
+        db.set_pending_removal(room["room_id"], bob["id"])
+
+        # Try to add Carol while Bob's removal is pending
+        with pytest.raises(ValueError, match="Cannot add members while a removal is pending"):
+            db.add_room_member(room["room_id"], carol["id"])
+
+        # After clearing pending removal, Carol can be added
+        db.clear_pending_removal(room["room_id"])
+        db.add_room_member(room["room_id"], carol["id"])
+        assert db.is_room_member(room["room_id"], carol["id"])
+
     def test_finalize_pending_removal(self):
         """Can finalize pending removal."""
         ns = db.create_namespace()
