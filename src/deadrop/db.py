@@ -60,6 +60,42 @@ _db_config: dict[str, Any] = {
 _conn: sqlite3.Connection | None = None
 _is_libsql: bool = False
 
+# Lock for thread-safe libsql reconnection
+_libsql_lock = threading.Lock()
+
+
+def _reset_libsql_connection() -> None:
+    """Reset the global libsql connection.
+
+    Called when the connection is detected as stale (e.g., Hrana stream expired).
+    Thread-safe - uses a lock to prevent multiple threads from reconnecting simultaneously.
+    """
+    global _conn, _is_libsql
+
+    with _libsql_lock:
+        if _conn is not None:
+            try:
+                _conn.close()
+            except Exception:
+                pass  # Ignore close errors on stale connection
+            _conn = None
+            _is_libsql = False
+
+
+def _is_hrana_stream_error(error: Exception) -> bool:
+    """Check if an exception indicates a stale Hrana stream.
+
+    Turso/libsql uses HTTP/2 streams that can expire or disconnect.
+    When this happens, we need to reconnect.
+    """
+    error_str = str(error).lower()
+    return (
+        "stream not found" in error_str
+        or "hrana" in error_str
+        or "connection" in error_str
+        and "closed" in error_str
+    )
+
 
 # --- Connection Management ---
 
@@ -97,12 +133,35 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     # Check for Turso/libsql (uses single global connection, not thread-local)
     db_url = os.environ.get("TURSO_URL", "")
     if db_url.startswith("libsql://"):
-        if _conn is None:
-            import libsql_experimental as libsql  # type: ignore[import-not-found]
+        with _libsql_lock:
+            if _conn is None:
+                import libsql_experimental as libsql  # type: ignore[import-not-found]
+                import logging
 
-            _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
-            _is_libsql = True
-        return _conn
+                logging.info(f"Creating new libsql connection to {db_url[:50]}...")
+                _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
+                _is_libsql = True
+
+            # Test connection health with a simple query
+            # This catches stale Hrana streams before they cause operation failures
+            try:
+                _conn.execute("SELECT 1")
+            except Exception as e:
+                if _is_hrana_stream_error(e):
+                    import logging
+
+                    logging.warning(f"Libsql connection stale, reconnecting: {e}")
+                    try:
+                        _conn.close()
+                    except Exception:
+                        pass
+                    _conn = None
+                    _is_libsql = False
+                    # Recursive call to create fresh connection
+                    return get_connection(db_path)
+                raise
+
+            return _conn
 
     # Thread-local connection for SQLite
     # Each thread gets its own connection to avoid concurrency issues
@@ -196,6 +255,54 @@ def _get_conn(conn: sqlite3.Connection | None) -> sqlite3.Connection:
     if conn is not None:
         return conn
     return get_connection()
+
+
+def _execute_with_retry(
+    operation: Callable[[], Any],
+    max_retries: int = 2,
+) -> Any:
+    """Execute a database operation with automatic reconnection for libsql.
+
+    If the operation fails due to a stale Hrana stream, resets the connection
+    and retries the operation.
+
+    Args:
+        operation: A callable that performs the database operation
+        max_retries: Maximum number of retry attempts (default: 2)
+
+    Returns:
+        The result of the operation
+
+    Raises:
+        The original exception if all retries fail
+    """
+    global _is_libsql
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return operation()
+        except Exception as e:
+            last_error = e
+
+            # Only retry for libsql Hrana stream errors
+            if _is_libsql and _is_hrana_stream_error(e) and attempt < max_retries:
+                import logging
+
+                logging.warning(
+                    f"Libsql connection error (attempt {attempt + 1}/{max_retries + 1}), reconnecting: {e}"
+                )
+                _reset_libsql_connection()
+                # The next get_connection() call will create a fresh connection
+                continue
+
+            # For non-libsql or non-retryable errors, raise immediately
+            raise
+
+    # Should not reach here, but just in case
+    if last_error:
+        raise last_error
 
 
 def _row_to_dict(cursor_description: Any, row: tuple | sqlite3.Row | None) -> dict | None:

@@ -465,3 +465,124 @@ class TestBackendLongPolling:
         assert len(messages) == 0
         assert elapsed >= 0.9
         backend.close()
+
+
+class TestLocalBackendInvites:
+    """Tests for local backend invite functionality."""
+
+    def test_create_and_claim_invite(self, tmp_path):
+        """Should create and claim an invite successfully."""
+        backend = LocalBackend.create(tmp_path / ".deaddrop")
+
+        # Create namespace and identity
+        ns = backend.create_namespace(display_name="Test NS")
+        ns_id = ns["ns"]
+        ns_secret = ns["secret"]
+
+        identity = backend.create_identity(ns_id, display_name="Alice")
+        identity_id = identity["id"]
+        identity_secret = identity["secret"]
+
+        # Create invite
+        invite = backend.create_invite(
+            ns=ns_id,
+            identity_id=identity_id,
+            identity_secret=identity_secret,
+            ns_secret=ns_secret,
+            display_name="Alice's Invite",
+        )
+
+        assert "invite_id" in invite
+        assert "invite_url" in invite
+        assert invite["invite_url"].startswith("local://")
+        assert invite["invite_id"] in invite["invite_url"]
+
+        # Claim invite
+        claimed = backend.claim_invite(invite["invite_url"])
+
+        assert claimed["ns"] == ns_id
+        assert claimed["identity_id"] == identity_id
+        assert claimed["secret"] == identity_secret
+        assert claimed["display_name"] == "Alice's Invite"
+
+        backend.close()
+
+    def test_invite_can_only_be_claimed_once(self, tmp_path):
+        """Should fail to claim an invite twice."""
+        backend = LocalBackend.create(tmp_path / ".deaddrop")
+
+        ns = backend.create_namespace(display_name="Test NS")
+        identity = backend.create_identity(ns["ns"], display_name="Alice")
+
+        invite = backend.create_invite(
+            ns=ns["ns"],
+            identity_id=identity["id"],
+            identity_secret=identity["secret"],
+            ns_secret=ns["secret"],
+        )
+
+        # First claim should succeed
+        claimed = backend.claim_invite(invite["invite_url"])
+        assert claimed["identity_id"] == identity["id"]
+
+        # Second claim should fail
+        with pytest.raises(ValueError, match="not found or already claimed"):
+            backend.claim_invite(invite["invite_url"])
+
+        backend.close()
+
+    def test_invite_requires_valid_ns_secret(self, tmp_path):
+        """Should reject invite creation with wrong namespace secret."""
+        backend = LocalBackend.create(tmp_path / ".deaddrop")
+
+        ns = backend.create_namespace(display_name="Test NS")
+        identity = backend.create_identity(ns["ns"], display_name="Alice")
+
+        with pytest.raises(PermissionError, match="Invalid namespace secret"):
+            backend.create_invite(
+                ns=ns["ns"],
+                identity_id=identity["id"],
+                identity_secret=identity["secret"],
+                ns_secret="wrong_secret",
+            )
+
+        backend.close()
+
+    def test_claim_invalid_url_scheme(self, tmp_path):
+        """Should reject invite URLs with wrong scheme."""
+        backend = LocalBackend.create(tmp_path / ".deaddrop")
+
+        with pytest.raises(ValueError, match="Invalid invite URL scheme"):
+            backend.claim_invite("https://example.com/join/abc#key")
+
+        backend.close()
+
+    def test_claim_invalid_url_format(self, tmp_path):
+        """Should reject malformed invite URLs."""
+        backend = LocalBackend.create(tmp_path / ".deaddrop")
+
+        with pytest.raises(ValueError, match="Invalid invite URL format"):
+            backend.claim_invite("local:///some/path/without/join")
+
+        backend.close()
+
+    def test_in_memory_backend_invites(self):
+        """InMemoryBackend should also support invites."""
+        backend = InMemoryBackend()
+
+        ns = backend.create_namespace(display_name="Test NS")
+        identity = backend.create_identity(ns["ns"], display_name="Alice")
+
+        invite = backend.create_invite(
+            ns=ns["ns"],
+            identity_id=identity["id"],
+            identity_secret=identity["secret"],
+            ns_secret=ns["secret"],
+            display_name="Test Invite",
+        )
+
+        claimed = backend.claim_invite(invite["invite_url"])
+
+        assert claimed["ns"] == ns["ns"]
+        assert claimed["identity_id"] == identity["id"]
+        assert claimed["secret"] == identity["secret"]
