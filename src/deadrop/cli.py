@@ -1579,3 +1579,117 @@ def serve(
 
 if __name__ == "__main__":
     app()
+
+
+# ============================================================================
+# Room commands
+# ============================================================================
+
+room_app = cyclopts.App(name="room", help="Room (group chat) operations")
+app.command(room_app)
+
+
+@room_app.command
+def room_send(
+    ns: str,
+    room_id: str,
+    body: str,
+    *,
+    identity_id: str | None = None,
+):
+    """Send a message to a room.
+
+    Args:
+        ns: Namespace ID or slug
+        room_id: Room ID
+        body: Message body
+        identity_id: Identity to send as (uses first if not specified)
+    """
+    config = get_namespace_config(ns)
+    ns_id = config.ns  # Resolve slug to ID
+
+    # Get identity
+    if identity_id:
+        if identity_id not in config.mailboxes:
+            raise cyclopts.ValidationError(f"Identity {identity_id} not found in namespace")
+        identity = config.mailboxes[identity_id]
+    else:
+        if not config.mailboxes:
+            raise cyclopts.ValidationError("No identities in namespace")
+        identity_id = list(config.mailboxes.keys())[0]
+        identity = config.mailboxes[identity_id]
+
+    # Send message via direct httpx request (needs X-Inbox-Secret)
+    global_config = get_config()
+    url = f"{global_config.url}/{ns_id}/rooms/{room_id}/messages"
+
+    resp = httpx.post(
+        url,
+        json={"body": body, "content_type": "text/plain"},
+        headers={"X-Inbox-Secret": identity.secret},
+        timeout=30.0,
+    )
+
+    if resp.status_code >= 400:
+        print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+    print(f"Message sent: {data.get('mid', 'unknown')}")
+
+
+@room_app.command
+def room_messages(
+    ns: str,
+    room_id: str,
+    *,
+    identity_id: str | None = None,
+    limit: int = 20,
+):
+    """Read messages from a room.
+
+    Args:
+        ns: Namespace ID or slug
+        room_id: Room ID
+        identity_id: Identity to read as (uses first if not specified)
+        limit: Max messages to show
+    """
+    config = get_namespace_config(ns)
+    ns_id = config.ns
+
+    # Get identity
+    if identity_id:
+        if identity_id not in config.mailboxes:
+            raise cyclopts.ValidationError(f"Identity {identity_id} not found in namespace")
+        identity = config.mailboxes[identity_id]
+    else:
+        if not config.mailboxes:
+            raise cyclopts.ValidationError("No identities in namespace")
+        identity_id = list(config.mailboxes.keys())[0]
+        identity = config.mailboxes[identity_id]
+
+    # Get messages via direct httpx request
+    global_config = get_config()
+    url = f"{global_config.url}/{ns_id}/rooms/{room_id}/messages?limit={limit}"
+
+    resp = httpx.get(
+        url,
+        headers={"X-Inbox-Secret": identity.secret},
+        timeout=30.0,
+    )
+
+    if resp.status_code >= 400:
+        print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+    messages = data.get("messages", [])
+    if not messages:
+        print("No messages in room")
+        return
+
+    for msg in messages:
+        from_id = msg.get("from_id", "unknown")[:8]
+        body = msg.get("body", "")
+        created = msg.get("created_at", "")[:19]
+        print(f"[{created}] {from_id}: {body}")
