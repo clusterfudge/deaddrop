@@ -505,3 +505,180 @@ textarea.form-input {
         margin: 40px auto;
     }
 }
+
+/* ==================== ROOM STYLES ==================== */
+
+/* Tab Bar */
+.tab-bar {
+    display: flex;
+    gap: 0;
+    padding: 0 16px;
+    background: var(--card-bg);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.tab-bar .tab {
+    padding: 12px 20px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.tab-bar .tab:hover {
+    color: var(--text-color);
+    background: var(--bg-color);
+}
+
+.tab-bar .tab.active {
+    color: var(--primary-color);
+    border-bottom-color: var(--primary-color);
+}
+
+.tab-bar .tab .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 6px;
+    margin-left: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: white;
+    background: var(--primary-color);
+    border-radius: 9px;
+}
+
+/* Room List Item */
+.room-item {
+    display: flex;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.room-item:hover {
+    background: var(--bg-color);
+}
+
+.room-item .room-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--primary-color), #7c3aed);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    margin-right: 12px;
+    flex-shrink: 0;
+}
+
+.room-item .room-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.room-item .room-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 2px;
+}
+
+.room-item .room-name {
+    font-weight: 600;
+    color: var(--text-color);
+}
+
+.room-item .room-time {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.room-item .room-preview {
+    font-size: 14px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.room-item.has-unread .room-name {
+    color: var(--text-color);
+}
+
+.room-item .unread-badge {
+    background: var(--primary-color);
+    color: white;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 10px;
+    margin-left: 8px;
+}
+
+/* Room Message (with sender) */
+.room-message {
+    padding: 8px 20px;
+    margin: 4px 0;
+}
+
+.room-message .sender-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--primary-color);
+    margin-bottom: 2px;
+}
+
+.room-message.from-me .sender-name {
+    color: var(--text-muted);
+}
+
+.room-message .message-bubble {
+    display: inline-block;
+    max-width: 80%;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    background: var(--bg-color);
+    word-wrap: break-word;
+}
+
+.room-message.from-me {
+    text-align: right;
+}
+
+.room-message.from-me .message-bubble {
+    background: var(--primary-color);
+    color: white;
+}
+
+.room-message .message-time {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+.room-message.from-me .message-time {
+    color: rgba(255, 255, 255, 0.7);
+}
+
+/* Actions toolbar */
+.toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.toolbar-actions {
+    display: flex;
+    gap: 8px;
+}

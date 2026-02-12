@@ -45,9 +45,15 @@
             </div>
         </div>
         
-        <div style="padding: 16px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
-            <span style="font-weight: 600;">Inbox</span>
-            <div style="display: flex; gap: 8px;">
+        <!-- Tab Bar -->
+        <div class="tab-bar">
+            <a href="#" class="tab active" id="tab-inbox">📥 Inbox</a>
+            <a href="#" class="tab" id="tab-rooms">💬 Rooms <span class="badge hidden" id="rooms-badge">0</span></a>
+        </div>
+        
+        <div class="toolbar">
+            <span style="font-weight: 600;" id="inbox-section-title">Inbox</span>
+            <div class="toolbar-actions">
                 <a href="#" id="archived-link" class="btn btn-small btn-secondary">📦 Archived</a>
                 <button id="compose-btn" class="btn btn-small btn-primary">✏️ Compose</button>
             </div>
@@ -66,7 +72,44 @@
         </div>
     </div>
     
-    <!-- Conversation View -->
+    <!-- Rooms List View -->
+    <div id="view-rooms" class="view hidden">
+        <div class="header">
+            <a href="/app" class="back-link" id="rooms-back">←</a>
+            <div>
+                <h1 id="rooms-title">Namespace</h1>
+                <div class="subtitle" id="rooms-subtitle">as Identity</div>
+            </div>
+            <div style="margin-left: auto;">
+                <a href="#" id="rooms-settings" class="btn btn-icon">⚙️</a>
+            </div>
+        </div>
+        
+        <!-- Tab Bar -->
+        <div class="tab-bar">
+            <a href="#" class="tab" id="tab-inbox-2">📥 Inbox</a>
+            <a href="#" class="tab active" id="tab-rooms-2">💬 Rooms <span class="badge hidden" id="rooms-badge-2">0</span></a>
+        </div>
+        
+        <div class="toolbar">
+            <span style="font-weight: 600;">Rooms</span>
+            <div class="toolbar-actions"></div>
+        </div>
+        
+        <div id="rooms-loading" class="loading hidden">
+            <div class="spinner"></div>
+        </div>
+        
+        <div id="room-list"></div>
+        
+        <div id="rooms-empty" class="empty-state hidden">
+            <div class="empty-state-icon">💬</div>
+            <div class="empty-state-title">No rooms yet</div>
+            <p>You're not a member of any rooms.</p>
+        </div>
+    </div>
+    
+    <!-- Conversation View (1:1) -->
     <div id="view-conversation" class="view hidden">
         <div class="header">
             <a href="#" class="back-link" id="conversation-back">←</a>
@@ -79,6 +122,25 @@
             <textarea id="message-input" class="compose-input" 
                       placeholder="Type a message..." rows="1"></textarea>
             <button id="send-btn" class="btn btn-primary">Send ➤</button>
+        </div>
+    </div>
+    
+    <!-- Room Chat View -->
+    <div id="view-room-chat" class="view hidden">
+        <div class="header">
+            <a href="#" class="back-link" id="room-chat-back">←</a>
+            <div>
+                <h1 id="room-chat-title">Room</h1>
+                <div class="subtitle" id="room-chat-members"></div>
+            </div>
+        </div>
+        
+        <div id="room-message-list" class="message-list"></div>
+        
+        <div class="compose-area">
+            <textarea id="room-message-input" class="compose-input" 
+                      placeholder="Type a message..." rows="1"></textarea>
+            <button id="room-send-btn" class="btn btn-primary">Send ➤</button>
         </div>
     </div>
     
@@ -133,20 +195,33 @@
     let currentSlug = {{ slug | tojson if slug else 'null' }};
     let currentPeerId = {{ peer_id | tojson if peer_id is defined and peer_id else 'null' }};
     let currentView = {{ view | tojson if view is defined and view else 'null' }};
+    let currentRoomId = null;
     let credentials = null;
     let peers = [];
     let messages = [];
+    let rooms = [];
+    let roomMessages = [];
+    let roomMembers = {};
+    let roomPollController = null;  // For canceling long-polls
     
     // DOM elements
     const views = {
         namespaces: document.getElementById('view-namespaces'),
         inbox: document.getElementById('view-inbox'),
+        rooms: document.getElementById('view-rooms'),
         conversation: document.getElementById('view-conversation'),
+        roomChat: document.getElementById('view-room-chat'),
         archived: document.getElementById('view-archived'),
     };
     
     // Utility functions
     function showView(name) {
+        // Cancel any ongoing room polling when leaving room view
+        if (name !== 'roomChat' && roomPollController) {
+            roomPollController.abort();
+            roomPollController = null;
+        }
+        
         Object.values(views).forEach(v => v.classList.add('hidden'));
         views[name].classList.remove('hidden');
     }
@@ -167,8 +242,8 @@
     }
     
     function formatExpiry(expiresAt, ttlHours) {
-        if (ttlHours === 0) return null; // Persistent
-        if (!expiresAt) return null; // Unread
+        if (ttlHours === 0) return null;
+        if (!expiresAt) return null;
         
         const remaining = new Date(expiresAt) - new Date();
         if (remaining <= 0) return { text: 'expired', style: 'urgent' };
@@ -186,7 +261,14 @@
         return peer?.metadata?.display_name || id.substring(0, 8) + '...';
     }
     
-    // Namespace list
+    function getMemberName(id) {
+        if (id === credentials?.id) return 'You';
+        const member = roomMembers[id];
+        return member?.display_name || id.substring(0, 8) + '...';
+    }
+    
+    // ==================== NAMESPACE LIST ====================
+    
     function renderNamespaceList() {
         const list = document.getElementById('namespace-list');
         const empty = document.getElementById('no-namespaces');
@@ -214,7 +296,8 @@
         `).join('');
     }
     
-    // Open namespace
+    // ==================== OPEN NAMESPACE ====================
+    
     async function openNamespace(slug) {
         currentSlug = slug;
         credentials = CredentialStore.getCredentials(slug);
@@ -223,20 +306,21 @@
             return;
         }
         
-        // Update URL
         history.pushState({}, '', `/app/${slug}`);
         
-        // Show inbox view
-        document.getElementById('inbox-title').textContent = 
-            CredentialStore.getNamespace(slug)?.displayName || slug;
-        document.getElementById('inbox-subtitle').textContent = 
-            `as ${credentials.displayName || credentials.id.substring(0, 8)}`;
+        const nsDisplay = CredentialStore.getNamespace(slug)?.displayName || slug;
+        document.getElementById('inbox-title').textContent = nsDisplay;
+        document.getElementById('inbox-subtitle').textContent = `as ${credentials.displayName || credentials.id.substring(0, 8)}`;
+        document.getElementById('rooms-title').textContent = nsDisplay;
+        document.getElementById('rooms-subtitle').textContent = `as ${credentials.displayName || credentials.id.substring(0, 8)}`;
         
         showView('inbox');
         loadInbox();
+        loadRoomsInBackground();
     }
     
-    // Load inbox
+    // ==================== INBOX ====================
+    
     async function loadInbox() {
         const loading = document.getElementById('inbox-loading');
         const list = document.getElementById('conversation-list');
@@ -246,7 +330,6 @@
         list.innerHTML = '';
         
         try {
-            // Load peers and messages
             const [peersResult, inboxResult] = await Promise.all([
                 DeadropAPI.listPeers(credentials),
                 DeadropAPI.getInbox(credentials),
@@ -257,7 +340,6 @@
             
             loading.classList.add('hidden');
             
-            // Group by peer
             const conversations = {};
             messages.forEach(msg => {
                 const peerId = msg.from === credentials.id ? msg.to : msg.from;
@@ -270,7 +352,6 @@
                 }
             });
             
-            // Sort by latest message
             const sorted = Object.values(conversations).sort((a, b) => {
                 const aLatest = a.messages[a.messages.length - 1].created_at;
                 const bLatest = b.messages[b.messages.length - 1].created_at;
@@ -312,7 +393,6 @@
         }
     }
     
-    // Open conversation
     function openConversation(peerId) {
         currentPeerId = peerId;
         history.pushState({}, '', `/app/${currentSlug}/${peerId}`);
@@ -322,7 +402,6 @@
         renderConversation();
     }
     
-    // Render conversation
     function renderConversation() {
         const list = document.getElementById('message-list');
         const peerMessages = messages.filter(m => 
@@ -348,11 +427,9 @@
             `;
         }).join('');
         
-        // Scroll to bottom
         list.scrollTop = list.scrollHeight;
     }
     
-    // Send message
     async function sendMessage() {
         const input = document.getElementById('message-input');
         const body = input.value.trim();
@@ -362,7 +439,6 @@
             await DeadropAPI.sendMessage(credentials, currentPeerId, body);
             input.value = '';
             
-            // Refresh inbox
             const result = await DeadropAPI.getInbox(credentials);
             messages = result.messages;
             renderConversation();
@@ -371,7 +447,6 @@
         }
     }
     
-    // Archive message
     async function archiveMessage(mid) {
         if (!confirm('Archive this message?')) return;
         try {
@@ -383,7 +458,6 @@
         }
     }
     
-    // Delete message
     async function deleteMessage(mid) {
         if (!confirm('Delete this message permanently?')) return;
         try {
@@ -395,18 +469,197 @@
         }
     }
     
-    // Compose modal
+    // ==================== ROOMS ====================
+    
+    async function loadRoomsInBackground() {
+        try {
+            const result = await DeadropAPI.listRooms(credentials);
+            rooms = result || [];
+            
+            // Update badge if there are rooms
+            const badge = document.getElementById('rooms-badge');
+            const badge2 = document.getElementById('rooms-badge-2');
+            if (rooms.length > 0) {
+                // Count total unread (we'd need unread API for this)
+                // For now, just show count
+                badge.classList.add('hidden');
+                badge2.classList.add('hidden');
+            }
+        } catch (e) {
+            console.error('Failed to load rooms:', e);
+        }
+    }
+    
+    async function loadRooms() {
+        const loading = document.getElementById('rooms-loading');
+        const list = document.getElementById('room-list');
+        const empty = document.getElementById('rooms-empty');
+        
+        loading.classList.remove('hidden');
+        list.innerHTML = '';
+        
+        try {
+            const result = await DeadropAPI.listRooms(credentials);
+            rooms = result || [];
+            
+            loading.classList.add('hidden');
+            
+            if (rooms.length === 0) {
+                empty.classList.remove('hidden');
+                return;
+            }
+            
+            empty.classList.add('hidden');
+            list.innerHTML = rooms.map(room => `
+                <div class="room-item" onclick="openRoom('${room.room_id}')">
+                    <div class="room-icon">💬</div>
+                    <div class="room-content">
+                        <div class="room-header">
+                            <span class="room-name">${room.display_name || 'Unnamed Room'}</span>
+                            <span class="room-time">${room.created_at ? formatTime(room.created_at) : ''}</span>
+                        </div>
+                        <div class="room-preview">${room.member_count || '?'} members</div>
+                    </div>
+                </div>
+            `).join('');
+            
+        } catch (e) {
+            loading.classList.add('hidden');
+            list.innerHTML = `<div class="error-message">${e.message}</div>`;
+        }
+    }
+    
+    async function openRoom(roomId) {
+        currentRoomId = roomId;
+        history.pushState({}, '', `/app/${currentSlug}/room/${roomId}`);
+        
+        // Load room details and members
+        try {
+            const [roomDetails, members] = await Promise.all([
+                DeadropAPI.getRoom(credentials, roomId),
+                DeadropAPI.listRoomMembers(credentials, roomId),
+            ]);
+            
+            document.getElementById('room-chat-title').textContent = roomDetails.display_name || 'Room';
+            
+            // Build member map for name lookups
+            roomMembers = {};
+            (members || []).forEach(m => {
+                roomMembers[m.identity_id] = m;
+            });
+            
+            document.getElementById('room-chat-members').textContent = 
+                `${Object.keys(roomMembers).length} members`;
+            
+            showView('roomChat');
+            await loadRoomMessages();
+            startRoomPolling();
+            
+        } catch (e) {
+            alert('Failed to open room: ' + e.message);
+        }
+    }
+    
+    async function loadRoomMessages() {
+        const list = document.getElementById('room-message-list');
+        
+        try {
+            const result = await DeadropAPI.getRoomMessages(credentials, currentRoomId);
+            roomMessages = result || [];
+            renderRoomMessages();
+        } catch (e) {
+            list.innerHTML = `<div class="error-message">${e.message}</div>`;
+        }
+    }
+    
+    function renderRoomMessages() {
+        const list = document.getElementById('room-message-list');
+        
+        list.innerHTML = roomMessages.map(msg => {
+            const isMe = msg.from_id === credentials.id;
+            
+            return `
+                <div class="room-message ${isMe ? 'from-me' : ''}">
+                    <div class="sender-name">${getMemberName(msg.from_id)}</div>
+                    <div class="message-bubble">${msg.body}</div>
+                    <div class="message-time">${formatTime(msg.created_at)}</div>
+                </div>
+            `;
+        }).join('');
+        
+        list.scrollTop = list.scrollHeight;
+        
+        // Update read cursor
+        if (roomMessages.length > 0) {
+            const lastMid = roomMessages[roomMessages.length - 1].mid;
+            DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
+        }
+    }
+    
+    async function sendRoomMessage() {
+        const input = document.getElementById('room-message-input');
+        const body = input.value.trim();
+        if (!body) return;
+        
+        try {
+            await DeadropAPI.sendRoomMessage(credentials, currentRoomId, body);
+            input.value = '';
+            
+            // Reload messages
+            await loadRoomMessages();
+        } catch (e) {
+            alert('Failed to send: ' + e.message);
+        }
+    }
+    
+    function startRoomPolling() {
+        if (roomPollController) {
+            roomPollController.abort();
+        }
+        
+        roomPollController = new AbortController();
+        pollRoomMessages(roomPollController.signal);
+    }
+    
+    async function pollRoomMessages(signal) {
+        while (!signal.aborted) {
+            try {
+                const afterMid = roomMessages.length > 0 ? roomMessages[roomMessages.length - 1].mid : null;
+                
+                // Use long-polling (wait up to 30 seconds)
+                const result = await DeadropAPI.getRoomMessages(credentials, currentRoomId, {
+                    afterMid,
+                    wait: 30,
+                });
+                
+                if (signal.aborted) break;
+                
+                if (result && result.length > 0) {
+                    // Add new messages
+                    roomMessages = [...roomMessages, ...result];
+                    renderRoomMessages();
+                }
+                
+            } catch (e) {
+                if (signal.aborted) break;
+                console.error('Room poll error:', e);
+                // Wait a bit before retrying on error
+                await new Promise(r => setTimeout(r, 5000));
+            }
+        }
+    }
+    
+    // ==================== COMPOSE MODAL ====================
+    
     function showCompose() {
         const modal = document.getElementById('compose-modal');
         const select = document.getElementById('compose-to');
         
-        // Populate peer list
         select.innerHTML = peers
             .filter(p => p.id !== credentials.id)
             .map(p => `<option value="${p.id}">${p.metadata?.display_name || p.id}</option>`)
             .join('');
         
-        // Add self option for notes
         select.innerHTML += `<option value="${credentials.id}">Notes to Self</option>`;
         
         modal.classList.remove('hidden');
@@ -432,13 +685,43 @@
         }
     }
     
-    // Event listeners
+    // ==================== TAB NAVIGATION ====================
+    
+    function switchToInbox() {
+        document.getElementById('tab-inbox').classList.add('active');
+        document.getElementById('tab-inbox-2').classList.add('active');
+        document.getElementById('tab-rooms').classList.remove('active');
+        document.getElementById('tab-rooms-2').classList.remove('active');
+        showView('inbox');
+        history.pushState({}, '', `/app/${currentSlug}`);
+    }
+    
+    function switchToRooms() {
+        document.getElementById('tab-inbox').classList.remove('active');
+        document.getElementById('tab-inbox-2').classList.remove('active');
+        document.getElementById('tab-rooms').classList.add('active');
+        document.getElementById('tab-rooms-2').classList.add('active');
+        showView('rooms');
+        loadRooms();
+        history.pushState({}, '', `/app/${currentSlug}/rooms`);
+    }
+    
+    // ==================== EVENT LISTENERS ====================
+    
     document.getElementById('invite-go-btn').addEventListener('click', () => {
         const url = document.getElementById('invite-url-input').value.trim();
         if (url) window.location.href = url;
     });
     
     document.getElementById('inbox-back').addEventListener('click', (e) => {
+        e.preventDefault();
+        history.pushState({}, '', '/app');
+        currentSlug = null;
+        showView('namespaces');
+        renderNamespaceList();
+    });
+    
+    document.getElementById('rooms-back').addEventListener('click', (e) => {
         e.preventDefault();
         history.pushState({}, '', '/app');
         currentSlug = null;
@@ -453,6 +736,18 @@
         showView('inbox');
     });
     
+    document.getElementById('room-chat-back').addEventListener('click', (e) => {
+        e.preventDefault();
+        currentRoomId = null;
+        switchToRooms();
+    });
+    
+    // Tab navigation
+    document.getElementById('tab-inbox').addEventListener('click', (e) => { e.preventDefault(); switchToInbox(); });
+    document.getElementById('tab-inbox-2').addEventListener('click', (e) => { e.preventDefault(); switchToInbox(); });
+    document.getElementById('tab-rooms').addEventListener('click', (e) => { e.preventDefault(); switchToRooms(); });
+    document.getElementById('tab-rooms-2').addEventListener('click', (e) => { e.preventDefault(); switchToRooms(); });
+    
     document.getElementById('compose-btn').addEventListener('click', showCompose);
     document.getElementById('compose-cancel').addEventListener('click', hideCompose);
     document.getElementById('compose-close').addEventListener('click', hideCompose);
@@ -463,6 +758,14 @@
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendMessage();
+        }
+    });
+    
+    document.getElementById('room-send-btn').addEventListener('click', sendRoomMessage);
+    document.getElementById('room-message-input').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendRoomMessage();
         }
     });
     
@@ -513,14 +816,14 @@
     async function unarchiveMessage(mid) {
         try {
             await DeadropAPI.unarchiveMessage(credentials, mid);
-            // Refresh archived list
             document.getElementById('archived-link').click();
         } catch (e) {
             alert('Failed to restore: ' + e.message);
         }
     }
     
-    // Initialize
+    // ==================== INITIALIZE ====================
+    
     function init() {
         if (currentSlug) {
             credentials = CredentialStore.getCredentials(currentSlug);
