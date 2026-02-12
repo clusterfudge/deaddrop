@@ -48,3 +48,4 @@ htmlcov/
 src/deadrop/_version.py
 .agent-scratchpad/
 .agent/
+.agent-scratchpad

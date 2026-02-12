@@ -1589,7 +1589,7 @@ room_app = cyclopts.App(name="room", help="Room (group chat) operations")
 app.command(room_app)
 
 
-@room_app.command
+@room_app.command(name="send")
 def room_send(
     ns: str,
     room_id: str,
@@ -1638,7 +1638,7 @@ def room_send(
     print(f"Message sent: {data.get('mid', 'unknown')}")
 
 
-@room_app.command
+@room_app.command(name="messages")
 def room_messages(
     ns: str,
     room_id: str,
