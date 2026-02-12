@@ -195,7 +195,7 @@
     let currentSlug = {{ slug | tojson if slug else 'null' }};
     let currentPeerId = {{ peer_id | tojson if peer_id is defined and peer_id else 'null' }};
     let currentView = {{ view | tojson if view is defined and view else 'null' }};
-    let currentRoomId = null;
+    let currentRoomId = {{ room_id | tojson if room_id is defined and room_id else 'null' }};
     let credentials = null;
     let peers = [];
     let messages = [];
@@ -833,6 +833,9 @@
                         CredentialStore.getNamespace(currentSlug)?.displayName || currentSlug;
                     showView('archived');
                     document.getElementById('archived-link').click();
+                } else if (currentRoomId) {
+                    // Deep link to room
+                    openNamespace(currentSlug).then(() => openRoom(currentRoomId));
                 } else if (currentPeerId) {
                     openNamespace(currentSlug).then(() => openConversation(currentPeerId));
                 } else {

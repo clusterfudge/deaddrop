@@ -1301,6 +1301,21 @@ def app_conversation_page(request: Request, slug: str, peer_id: str):
     return HTMLResponse(f"<h1>Conversation</h1><p>With: {peer_id}</p>")
 
 
+@app.get("/app/{slug}/room/{room_id}", response_class=HTMLResponse)
+def app_room_page(request: Request, slug: str, room_id: str):
+    """Web app - room chat view."""
+    if templates:
+        return templates.TemplateResponse(
+            "app.html",
+            {
+                "request": request,
+                "slug": slug,
+                "room_id": room_id,
+            },
+        )
+    return HTMLResponse(f"<h1>Room</h1><p>Room: {room_id}</p>")
+
+
 @app.get("/app/{slug}/archived", response_class=HTMLResponse)
 def app_archived_page(request: Request, slug: str):
     """Web app - archived messages view."""
