@@ -108,6 +108,76 @@ const DeadropAPI = {
     async deleteMessage(credentials, mid) {
         return this.request('DELETE', `/${credentials.ns}/inbox/${credentials.id}/${mid}`, { credentials });
     },
+
+    // ==================== ROOM API ====================
+
+    /**
+     * List rooms the user is a member of.
+     */
+    async listRooms(credentials) {
+        return this.request('GET', `/${credentials.ns}/rooms`, { credentials });
+    },
+
+    /**
+     * Get room details.
+     */
+    async getRoom(credentials, roomId) {
+        return this.request('GET', `/${credentials.ns}/rooms/${roomId}`, { credentials });
+    },
+
+    /**
+     * Get room messages.
+     * @param {object} credentials - User credentials
+     * @param {string} roomId - Room ID
+     * @param {object} options - Optional parameters
+     * @param {string} options.afterMid - Get messages after this message ID
+     * @param {number} options.limit - Max messages to return
+     * @param {number} options.wait - Long-poll timeout in seconds
+     */
+    async getRoomMessages(credentials, roomId, { afterMid = null, limit = null, wait = null } = {}) {
+        let path = `/${credentials.ns}/rooms/${roomId}/messages`;
+        const params = new URLSearchParams();
+        if (afterMid) params.set('after', afterMid);
+        if (limit) params.set('limit', limit.toString());
+        if (wait) params.set('wait', wait.toString());
+        if (params.toString()) path += '?' + params.toString();
+        
+        return this.request('GET', path, { credentials });
+    },
+
+    /**
+     * Send a message to a room.
+     */
+    async sendRoomMessage(credentials, roomId, body, contentType = 'text/plain') {
+        return this.request('POST', `/${credentials.ns}/rooms/${roomId}/messages`, {
+            body: { body, content_type: contentType },
+            credentials,
+        });
+    },
+
+    /**
+     * Get unread count for a room.
+     */
+    async getRoomUnread(credentials, roomId) {
+        return this.request('GET', `/${credentials.ns}/rooms/${roomId}/unread`, { credentials });
+    },
+
+    /**
+     * Update read cursor for a room.
+     */
+    async updateRoomReadCursor(credentials, roomId, lastReadMid) {
+        return this.request('POST', `/${credentials.ns}/rooms/${roomId}/read`, {
+            body: { last_read_mid: lastReadMid },
+            credentials,
+        });
+    },
+
+    /**
+     * List room members.
+     */
+    async listRoomMembers(credentials, roomId) {
+        return this.request('GET', `/${credentials.ns}/rooms/${roomId}/members`, { credentials });
+    },
 };
 
 // Export for use in other modules
