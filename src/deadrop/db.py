@@ -63,16 +63,30 @@ _is_libsql: bool = False
 # Lock for thread-safe libsql reconnection
 _libsql_lock = threading.Lock()
 
+# Timeout for libsql connection operations (seconds)
+LIBSQL_CONNECT_TIMEOUT = 10.0
+LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
+
 
 def _reset_libsql_connection() -> None:
     """Reset the global libsql connection.
 
     Called when the connection is detected as stale (e.g., Hrana stream expired).
     Thread-safe - uses a lock to prevent multiple threads from reconnecting simultaneously.
+
+    Raises:
+        TimeoutError: If unable to acquire lock within timeout.
     """
     global _conn, _is_libsql
 
-    with _libsql_lock:
+    lock_acquired = _libsql_lock.acquire(timeout=LIBSQL_CONNECT_TIMEOUT)
+    if not lock_acquired:
+        import logging
+
+        logging.warning("Timeout acquiring lock to reset libsql connection")
+        return  # Can't reset, but don't block indefinitely
+
+    try:
         if _conn is not None:
             try:
                 _conn.close()
@@ -80,6 +94,8 @@ def _reset_libsql_connection() -> None:
                 pass  # Ignore close errors on stale connection
             _conn = None
             _is_libsql = False
+    finally:
+        _libsql_lock.release()
 
 
 def _is_hrana_stream_error(error: Exception) -> bool:
@@ -113,6 +129,10 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
     Returns:
         SQLite connection with row_factory set to sqlite3.Row.
+
+    Raises:
+        TimeoutError: If unable to acquire connection lock within timeout.
+        RuntimeError: If libsql connection fails after retries.
     """
     global _conn, _is_libsql, _db_config
 
@@ -133,14 +153,30 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     # Check for Turso/libsql (uses single global connection, not thread-local)
     db_url = os.environ.get("TURSO_URL", "")
     if db_url.startswith("libsql://"):
-        with _libsql_lock:
+        # Use non-blocking lock acquisition with timeout to prevent deadlocks
+        lock_acquired = _libsql_lock.acquire(timeout=LIBSQL_CONNECT_TIMEOUT)
+        if not lock_acquired:
+            raise TimeoutError(
+                f"Timeout acquiring database connection lock after {LIBSQL_CONNECT_TIMEOUT}s. "
+                "Another connection attempt may be hanging."
+            )
+
+        # Track whether we need to release the lock (for reconnection path)
+        should_release_lock = True
+        try:
             if _conn is None:
                 import libsql_experimental as libsql  # type: ignore[import-not-found]
                 import logging
 
                 logging.info(f"Creating new libsql connection to {db_url[:50]}...")
-                _conn = libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
-                _is_libsql = True
+                try:
+                    _conn = libsql.connect(
+                        db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")
+                    )
+                    _is_libsql = True
+                except Exception as e:
+                    logging.error(f"Failed to connect to libsql: {e}")
+                    raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
 
             # Test connection health with a simple query
             # This catches stale Hrana streams before they cause operation failures
@@ -157,11 +193,17 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                         pass
                     _conn = None
                     _is_libsql = False
+                    # Release lock before recursive call to avoid deadlock
+                    _libsql_lock.release()
+                    should_release_lock = False
                     # Recursive call to create fresh connection
                     return get_connection(db_path)
                 raise
 
             return _conn
+        finally:
+            if should_release_lock:
+                _libsql_lock.release()
 
     # Thread-local connection for SQLite
     # Each thread gets its own connection to avoid concurrency issues
