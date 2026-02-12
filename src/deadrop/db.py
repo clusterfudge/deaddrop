@@ -2141,3 +2141,230 @@ def get_room_member_info(
         row["metadata"] = json.loads(row.get("metadata") or "{}")
 
     return row
+
+
+# --- Optimized Combined Queries for Performance ---
+# These functions reduce round-trips by combining multiple queries into one
+# and leveraging caching for frequently-accessed data.
+
+
+def verify_room_access(
+    room_id: str,
+    identity_id: str,
+    secret: str,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[dict | None, str | None]:
+    """Verify room access in a single optimized query.
+
+    This combines:
+    - get_room (room exists check)
+    - is_room_member (membership check)
+    - verify_identity_secret (auth check)
+
+    Into a single database round-trip plus cached hash verification.
+
+    Args:
+        room_id: Room ID to access
+        identity_id: Identity ID (derived from secret)
+        secret: The inbox secret for verification
+        conn: Optional database connection
+
+    Returns:
+        (room, error_message) tuple:
+        - If successful: (room_dict, None)
+        - If failed: (None, error_message)
+    """
+    from .auth import derive_id, verify_secret
+    from .cache import identity_hash_cache, membership_cache, room_cache
+    from .metrics import timed_db_operation
+
+    # First verify the identity_id matches the secret (no DB needed)
+    if derive_id(secret) != identity_id:
+        return None, "Secret does not match identity"
+
+    # Check room cache first
+    cache_hit, cached_room = room_cache.get(f"room:{room_id}")
+    if cache_hit and cached_room is None:
+        return None, "Room not found"
+
+    # Check membership cache
+    membership_key = f"member:{room_id}:{identity_id}"
+    membership_hit, is_member = membership_cache.get(membership_key)
+
+    # Check identity hash cache
+    ns = cached_room["ns"] if cache_hit and cached_room else None
+    identity_key = f"identity:{ns}:{identity_id}" if ns else None
+    hash_hit, cached_hash = identity_hash_cache.get(identity_key) if identity_key else (False, None)
+
+    # If all cache hits, we can skip the database entirely
+    if cache_hit and cached_room and membership_hit and is_member and hash_hit and cached_hash:
+        # Just verify the password hash
+        if verify_secret(secret, cached_hash):
+            return cached_room, None
+        else:
+            return None, "Invalid inbox secret"
+
+    # Need to hit database - use optimized combined query
+    conn = _get_conn(conn)
+
+    with timed_db_operation("verify_room_access"):
+        cursor = conn.execute(
+            """
+            SELECT 
+                r.room_id, r.ns, r.display_name, r.created_by, r.created_at,
+                m.identity_id as member_id,
+                i.secret_hash
+            FROM rooms r
+            LEFT JOIN room_members m ON r.room_id = m.room_id AND m.identity_id = ?
+            LEFT JOIN identities i ON r.ns = i.ns AND i.id = ?
+            WHERE r.room_id = ?
+            """,
+            (identity_id, identity_id, room_id),
+        )
+        row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    if not row:
+        room_cache.set(f"room:{room_id}", None, ttl=60)  # Cache negative result briefly
+        return None, "Room not found"
+
+    # Build room dict
+    room = {
+        "room_id": row["room_id"],
+        "ns": row["ns"],
+        "display_name": row["display_name"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+    }
+
+    # Cache the room
+    room_cache.set(f"room:{room_id}", room)
+
+    # Check membership
+    if not row.get("member_id"):
+        membership_cache.set(membership_key, False)
+        return None, "Not a member of this room"
+    membership_cache.set(membership_key, True)
+
+    # Check identity exists and verify secret
+    secret_hash = row.get("secret_hash")
+    if not secret_hash:
+        return None, "Identity not found in namespace"
+
+    # Cache the hash
+    identity_hash_cache.set(f"identity:{room['ns']}:{identity_id}", secret_hash)
+
+    # Verify the secret
+    if not verify_secret(secret, secret_hash):
+        return None, "Invalid inbox secret"
+
+    return room, None
+
+
+def get_room_cached(
+    room_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Get room by ID with caching.
+
+    Args:
+        room_id: Room ID
+        conn: Optional database connection
+
+    Returns:
+        Room info dict or None if not found
+    """
+    from .cache import room_cache
+    from .metrics import timed_db_operation
+
+    # Check cache first
+    cache_hit, cached_room = room_cache.get(f"room:{room_id}")
+    if cache_hit:
+        return cached_room
+
+    # Cache miss - fetch from database
+    conn = _get_conn(conn)
+
+    with timed_db_operation("get_room_cached"):
+        cursor = conn.execute(
+            """SELECT room_id, ns, display_name, created_by, created_at
+               FROM rooms WHERE room_id = ?""",
+            (room_id,),
+        )
+        row = _row_to_dict(cursor.description, cursor.fetchone())
+
+    # Cache the result (even if None)
+    room_cache.set(f"room:{room_id}", row, ttl=60 if row is None else 300)
+    return row
+
+
+def get_identity_hash_cached(
+    ns: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> str | None:
+    """Get identity secret hash with caching.
+
+    Args:
+        ns: Namespace ID
+        identity_id: Identity ID
+        conn: Optional database connection
+
+    Returns:
+        Secret hash or None if identity not found
+    """
+    from .cache import identity_hash_cache
+    from .metrics import timed_db_operation
+
+    cache_key = f"identity:{ns}:{identity_id}"
+    cache_hit, cached_hash = identity_hash_cache.get(cache_key)
+    if cache_hit:
+        return cached_hash
+
+    conn = _get_conn(conn)
+
+    with timed_db_operation("get_identity_hash_cached"):
+        cursor = conn.execute(
+            "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
+            (ns, identity_id),
+        )
+        row = cursor.fetchone()
+
+    secret_hash = row[0] if row else None
+    identity_hash_cache.set(cache_key, secret_hash)
+    return secret_hash
+
+
+def is_room_member_cached(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Check if an identity is a member of a room with caching.
+
+    Args:
+        room_id: Room ID
+        identity_id: Identity ID
+        conn: Optional database connection
+
+    Returns:
+        True if member, False otherwise
+    """
+    from .cache import membership_cache
+    from .metrics import timed_db_operation
+
+    cache_key = f"member:{room_id}:{identity_id}"
+    cache_hit, is_member = membership_cache.get(cache_key)
+    if cache_hit:
+        return is_member
+
+    conn = _get_conn(conn)
+
+    with timed_db_operation("is_room_member_cached"):
+        cursor = conn.execute(
+            "SELECT 1 FROM room_members WHERE room_id = ? AND identity_id = ?",
+            (room_id, identity_id),
+        )
+        is_member = cursor.fetchone() is not None
+
+    membership_cache.set(cache_key, is_member)
+    return is_member
