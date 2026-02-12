@@ -682,3 +682,24 @@ textarea.form-input {
     display: flex;
     gap: 8px;
 }
+
+/* Pending message state */
+.room-message.pending {
+    opacity: 0.6;
+}
+
+.room-message.pending .message-bubble {
+    background: var(--bg-color);
+    border: 1px dashed var(--border-color);
+}
+
+.room-message.pending.from-me .message-bubble {
+    background: rgba(37, 99, 235, 0.5);
+    border: 1px dashed var(--primary-color);
+}
+
+/* Disabled send button */
+button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
