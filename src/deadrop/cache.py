@@ -45,6 +45,7 @@ IDENTITY_CACHE_SIZE = int(os.environ.get("DEADROP_IDENTITY_CACHE_SIZE", 5000))
 
 # Cache warming configuration
 CACHE_WARMING_ENABLED = os.environ.get("DEADROP_CACHE_WARMING", "1").lower() in ("1", "true", "yes")
+CACHE_REFRESH_INTERVAL = int(os.environ.get("DEADROP_CACHE_REFRESH_INTERVAL", 300))  # 5 min default
 
 
 @dataclass
@@ -385,31 +386,80 @@ async def _warm_identity_cache(conn: sqlite3.Connection) -> int:
     return identity_hash_cache.set_bulk(items)
 
 
-def schedule_cache_warming() -> None:
-    """Schedule cache warming as a background task.
+# Global flag to signal shutdown to background tasks
+_shutdown_event: asyncio.Event | None = None
 
-    This should be called during application startup. It runs the cache
-    warming in the background so it doesn't block the server from accepting
-    requests.
+
+def schedule_cache_warming() -> None:
+    """Schedule cache warming as a background task with periodic refresh.
+
+    This should be called during application startup. It:
+    1. Runs initial cache warming after a short delay (non-blocking)
+    2. Schedules periodic refresh to pick up new data
+
+    The refresh interval is controlled by DEADROP_CACHE_REFRESH_INTERVAL (default: 300s).
     """
+    global _shutdown_event
+
     if not CACHE_WARMING_ENABLED:
         logger.info("Cache warming disabled via DEADROP_CACHE_WARMING=0")
+        print("INFO:     Cache warming disabled via DEADROP_CACHE_WARMING=0")
         return
 
-    async def _warm():
+    async def _warm_and_refresh():
+        global _shutdown_event
+        _shutdown_event = asyncio.Event()
+
         # Small delay to let the server fully start
         await asyncio.sleep(0.5)
+
+        # Initial warming
         try:
             await warm_caches()
         except Exception as e:
-            logger.error(f"Background cache warming failed: {e}")
+            logger.error(f"Initial cache warming failed: {e}")
+            print(f"ERROR:    Initial cache warming failed: {e}")
+
+        # Periodic refresh loop
+        if CACHE_REFRESH_INTERVAL > 0:
+            print(f"INFO:     Cache refresh scheduled every {CACHE_REFRESH_INTERVAL}s")
+            while not _shutdown_event.is_set():
+                try:
+                    # Wait for the refresh interval or shutdown signal
+                    await asyncio.wait_for(
+                        _shutdown_event.wait(),
+                        timeout=CACHE_REFRESH_INTERVAL,
+                    )
+                    # If we get here, shutdown was signaled
+                    break
+                except asyncio.TimeoutError:
+                    # Timeout means it's time to refresh
+                    pass
+
+                # Refresh caches
+                try:
+                    results = await warm_caches()
+                    logger.debug(f"Cache refresh: {results}")
+                except Exception as e:
+                    logger.error(f"Cache refresh failed: {e}")
+                    # Continue running - don't let refresh failures stop the loop
 
     # Get or create event loop and schedule the task
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_warm())
+        loop.create_task(_warm_and_refresh())
         logger.info("Cache warming scheduled as background task")
     except RuntimeError:
         # No running loop - we're probably in a sync context
-        # This shouldn't happen during FastAPI startup, but handle it gracefully
         logger.warning("No event loop available for cache warming")
+        print("WARNING:  No event loop available for cache warming")
+
+
+def stop_cache_warming() -> None:
+    """Signal the cache warming background task to stop.
+
+    Should be called during application shutdown.
+    """
+    global _shutdown_event
+    if _shutdown_event is not None:
+        _shutdown_event.set()
