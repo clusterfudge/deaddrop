@@ -38,11 +38,14 @@ async def lifespan(app: FastAPI):
     db.init_db()
 
     # Schedule cache warming as background task (non-blocking)
-    from .cache import schedule_cache_warming
+    from .cache import schedule_cache_warming, stop_cache_warming
 
     schedule_cache_warming()
 
     yield
+
+    # Stop background cache refresh
+    stop_cache_warming()
     db.close_db()
 
 
@@ -1438,12 +1441,20 @@ def get_metrics(
     """Get application metrics. Requires admin authentication."""
     require_admin(authorization, x_admin_token)
 
-    from .cache import identity_hash_cache, membership_cache, room_cache
+    from .cache import (
+        CACHE_REFRESH_INTERVAL,
+        CACHE_WARMING_ENABLED,
+        identity_hash_cache,
+        membership_cache,
+        room_cache,
+    )
     from .metrics import metrics
 
     return {
         **metrics.to_dict(),
         "caches": {
+            "warming_enabled": CACHE_WARMING_ENABLED,
+            "refresh_interval_seconds": CACHE_REFRESH_INTERVAL,
             "room": room_cache.stats(),
             "membership": membership_cache.stats(),
             "identity_hash": identity_hash_cache.stats(),
