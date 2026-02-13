@@ -1,6 +1,6 @@
 # Subscriptions
 
-Deadrop supports a **subscription system** that lets clients efficiently monitor multiple topics (inboxes and rooms) for new messages through a single connection, rather than making separate long-poll requests per topic.
+Deadrop supports a **subscription system** that lets clients efficiently monitor multiple topics (inboxes and rooms) for new messages through a single connection, through a single connection.
 
 ## Concepts
 
@@ -279,4 +279,4 @@ Subscriber waiting on subscribe()
 - **O(1)** for publish (update latest mid, notify condition)
 - **O(topics)** for subscribe check (compare each topic's cursor)
 - **No busy-polling**: uses `asyncio.Condition` for efficient waiting
-- Replaces N separate long-poll connections with 1 subscription connection
+- Single connection monitors all topics simultaneously
