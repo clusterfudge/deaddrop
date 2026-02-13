@@ -304,14 +304,18 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
         results["identities"] = identities_cached
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(
+        msg = (
             f"Cache warming complete in {elapsed_ms:.0f}ms: "
             f"{results['rooms']} rooms, {results['memberships']} memberships, "
             f"{results['identities']} identities"
         )
+        logger.info(msg)
+        # Also print to ensure visibility in uvicorn logs
+        print(f"INFO:     {msg}")
 
     except Exception as e:
         logger.error(f"Cache warming failed: {e}")
+        print(f"ERROR:    Cache warming failed: {e}")
         raise
 
     return results
