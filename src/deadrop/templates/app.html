@@ -202,7 +202,8 @@
     let rooms = [];
     let roomMessages = [];
     let roomMembers = {};
-    let roomPollController = null;  // For canceling long-polls
+    let roomPollController = null;  // For canceling long-polls (legacy, kept for compat)
+    let subscriptionManager = null;  // Unified subscription manager
     
     // DOM elements
     const views = {
@@ -322,7 +323,10 @@
         
         showView('inbox');
         loadInbox();
-        loadRoomsInBackground();
+        loadRoomsInBackground().then(() => {
+            // Start unified subscription after we know which rooms we're in
+            startSubscription();
+        });
     }
     
     // ==================== INBOX ====================
@@ -343,6 +347,12 @@
             
             peers = peersResult;
             messages = inboxResult.messages;
+            
+            // Update subscription cursor for inbox
+            if (subscriptionManager && messages.length > 0) {
+                const lastMid = messages[messages.length - 1].mid;
+                subscriptionManager.updateCursor(`inbox:${credentials.id}`, lastMid);
+            }
             
             loading.classList.add('hidden');
             
@@ -595,6 +605,12 @@
             // Save to cache
             localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
             
+            // Update subscription cursor
+            if (subscriptionManager && roomMessages.length > 0) {
+                const lastMid = roomMessages[roomMessages.length - 1].mid;
+                subscriptionManager.updateCursor(`room:${currentRoomId}`, lastMid);
+            }
+            
             renderRoomMessages();
         } catch (e) {
             if (!cached) {
@@ -681,6 +697,8 @@
     }
     
     function startRoomPolling() {
+        // Legacy function — now handled by subscription manager.
+        // Still start polling as fallback for the active room view.
         if (roomPollController) {
             roomPollController.abort();
         }
@@ -709,6 +727,12 @@
                     const cacheKey = `room_messages_${currentRoomId}`;
                     localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
                     renderRoomMessages();
+                    
+                    // Update subscription cursor for this room
+                    if (subscriptionManager) {
+                        const lastMid = result.messages[result.messages.length - 1].mid;
+                        subscriptionManager.updateCursor(`room:${currentRoomId}`, lastMid);
+                    }
                 }
                 
             } catch (e) {
@@ -717,6 +741,93 @@
                 // Wait a bit before retrying on error
                 await new Promise(r => setTimeout(r, 5000));
             }
+        }
+    }
+    
+    // ==================== UNIFIED SUBSCRIPTION ====================
+    
+    /**
+     * Start the unified subscription manager for the current namespace.
+     * Subscribes to inbox + all rooms. Dispatches events to refresh
+     * the appropriate views.
+     */
+    async function startSubscription() {
+        stopSubscription();
+        
+        if (!credentials) return;
+        
+        subscriptionManager = new SubscriptionManager(credentials);
+        
+        subscriptionManager.onEvent = async (topic, latestMid) => {
+            console.log(`[subscription] event on ${topic}: ${latestMid}`);
+            
+            if (topic === `inbox:${credentials.id}`) {
+                // Inbox has new messages — refresh if viewing inbox
+                const inboxView = document.getElementById('view-inbox');
+                if (!inboxView.classList.contains('hidden')) {
+                    loadInbox();
+                }
+                // Could show a badge on inbox tab if viewing rooms
+                const tabInbox = document.getElementById('tab-inbox');
+                if (tabInbox && inboxView.classList.contains('hidden')) {
+                    tabInbox.style.fontWeight = 'bold';
+                }
+            } else if (topic.startsWith('room:')) {
+                const roomId = topic.substring(5);
+                // If we're viewing this room, fetch new messages
+                if (currentRoomId === roomId) {
+                    await fetchNewRoomMessages(roomId);
+                }
+                // Could show badge on rooms tab
+            }
+        };
+        
+        subscriptionManager.onStatusChange = (status) => {
+            console.log(`[subscription] status: ${status}`);
+        };
+        
+        // Build topics: inbox + all rooms
+        const roomIds = rooms.map(r => r.room_id);
+        const topics = subscriptionManager.buildTopics(roomIds, true);
+        
+        // Start in background
+        subscriptionManager.start(topics).catch(e => {
+            console.error('Subscription manager error:', e);
+        });
+    }
+    
+    function stopSubscription() {
+        if (subscriptionManager) {
+            subscriptionManager.stop();
+            subscriptionManager = null;
+        }
+    }
+    
+    /**
+     * Fetch only new room messages (incremental update).
+     */
+    async function fetchNewRoomMessages(roomId) {
+        try {
+            const afterMid = roomMessages.length > 0 
+                ? roomMessages[roomMessages.length - 1].mid 
+                : null;
+            
+            const result = await DeadropAPI.getRoomMessages(credentials, roomId, { afterMid });
+            
+            if (result?.messages?.length > 0) {
+                roomMessages = [...roomMessages, ...result.messages];
+                const cacheKey = `room_messages_${roomId}`;
+                localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
+                renderRoomMessages();
+                
+                // Update subscription cursor
+                if (subscriptionManager) {
+                    const lastMid = result.messages[result.messages.length - 1].mid;
+                    subscriptionManager.updateCursor(`room:${roomId}`, lastMid);
+                }
+            }
+        } catch (e) {
+            console.error('Failed to fetch new room messages:', e);
         }
     }
     
@@ -788,6 +899,7 @@
         e.preventDefault();
         history.pushState({}, '', '/app');
         currentSlug = null;
+        stopSubscription();
         showView('namespaces');
         renderNamespaceList();
     });
@@ -796,6 +908,7 @@
         e.preventDefault();
         history.pushState({}, '', '/app');
         currentSlug = null;
+        stopSubscription();
         showView('namespaces');
         renderNamespaceList();
     });
