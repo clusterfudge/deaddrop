@@ -846,6 +846,112 @@ class Deaddrop:
                 last_mid = msg["mid"]
                 yield msg
 
+    # --- Subscription Methods ---
+
+    def subscribe(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes (poll mode).
+
+        Blocks until any subscribed topic has new messages, or timeout.
+
+        Args:
+            ns: Namespace ID.
+            secret: Caller's inbox secret.
+            topics: Map of topic_key -> last_seen_mid (None = never seen).
+                Topic keys: "inbox:{identity_id}" or "room:{room_id}"
+            timeout: Max seconds to wait (1-60).
+
+        Returns:
+            dict with:
+                events: Map of changed topic_key -> latest_mid
+                timeout: True if no events before timeout
+
+        Example:
+            result = client.subscribe(ns, secret, {
+                f"inbox:{my_id}": last_inbox_mid,
+                f"room:{room_id}": last_room_mid,
+            })
+            for topic, mid in result["events"].items():
+                print(f"New activity on {topic}")
+        """
+        return self._backend.subscribe(ns, secret, topics, timeout)
+
+    def subscribe_stream(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+    ):
+        """Subscribe to topic changes (streaming mode).
+
+        Returns an iterator that yields event dicts as they occur.
+
+        Args:
+            ns: Namespace ID.
+            secret: Caller's inbox secret.
+            topics: Map of topic_key -> last_seen_mid (None = never seen).
+
+        Yields:
+            dicts with 'topic' and 'latest_mid' keys.
+
+        Example:
+            for event in client.subscribe_stream(ns, secret, topics):
+                print(f"Change on {event['topic']}: {event['latest_mid']}")
+        """
+        yield from self._backend.subscribe_stream(ns, secret, topics)
+
+    def listen_all(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ):
+        """Generator that yields topic change events across multiple topics.
+
+        Uses poll-mode subscribe in a loop, yielding (topic, latest_mid) tuples.
+        Automatically updates cursors to avoid re-reporting the same change.
+
+        This is the recommended way to monitor multiple topics (inbox + rooms)
+        simultaneously.
+
+        Args:
+            ns: Namespace ID.
+            secret: Caller's inbox secret.
+            topics: Map of topic_key -> last_seen_mid (None = never seen).
+            timeout: Long-poll timeout per iteration (1-60 seconds).
+
+        Yields:
+            Tuples of (topic_key, latest_mid).
+
+        Example:
+            topics = {
+                f"inbox:{my_id}": None,
+                f"room:{room1_id}": None,
+                f"room:{room2_id}": None,
+            }
+            for topic, mid in client.listen_all(ns, secret, topics):
+                print(f"New activity on {topic} (latest: {mid})")
+                if topic.startswith("inbox:"):
+                    messages = client.get_inbox(ns, my_id, secret, after_mid=mid)
+                elif topic.startswith("room:"):
+                    room_id = topic.split(":", 1)[1]
+                    messages = client.get_room_messages(ns, room_id, secret, after_mid=mid)
+        """
+        cursors = dict(topics)
+
+        while True:
+            result = self.subscribe(ns, secret, cursors, timeout)
+
+            for topic, mid in result.get("events", {}).items():
+                cursors[topic] = mid
+                yield topic, mid
+
     # --- Context Manager ---
 
     def close(self) -> None:

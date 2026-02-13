@@ -280,6 +280,28 @@ client.send_room_message(
 # No need to CC the moderator on every message!
 ```
 
+## Subscribing to Room Changes
+
+For monitoring multiple rooms (and your inbox) simultaneously, use the **subscription system** instead of per-room long-polling. See [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) for full details.
+
+```python
+# Subscribe to inbox + all rooms at once
+topics = {
+    f"inbox:{my_id}": None,
+    f"room:{room1_id}": None,
+    f"room:{room2_id}": None,
+}
+
+for topic, mid in client.listen_all(ns, secret, topics):
+    if topic.startswith("room:"):
+        room_id = topic.split(":", 1)[1]
+        messages = client.get_room_messages(ns, room_id, secret, after_mid=mid)
+        for msg in messages:
+            print(f"[{room_id}] {msg['from_id']}: {msg['body']}")
+```
+
+This is more efficient than running separate `listen_room()` calls per room, as it uses a single connection for all topics.
+
 ## Rooms vs 1:1 Messaging
 
 | Feature | 1:1 Messaging | Rooms |

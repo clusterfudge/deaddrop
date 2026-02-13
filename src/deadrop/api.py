@@ -1,15 +1,18 @@
 """FastAPI application for deadrop."""
 
+import asyncio
+import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import db
 from .auth import derive_id
@@ -589,7 +592,7 @@ def delete_identity(
 
 
 @app.post("/{ns}/send")
-def send_message(
+async def send_message(
     ns: str,
     request: SendMessageRequest,
     x_inbox_secret: Annotated[str | None, Header()] = None,
@@ -599,6 +602,8 @@ def send_message(
     Messages are delivered instantly. Optionally set ttl_hours for ephemeral
     messages that expire from creation time (instead of read time).
     """
+    from .events import get_event_bus
+
     require_active_namespace(ns)
 
     if not x_inbox_secret:
@@ -619,6 +624,12 @@ def send_message(
         )
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+    # Notify subscribers that the recipient's inbox has a new message
+    try:
+        await get_event_bus().publish(ns, f"inbox:{request.to}", result["mid"])
+    except Exception:
+        logger.warning("Failed to publish inbox event", exc_info=True)
 
     return result
 
@@ -1250,13 +1261,15 @@ async def get_room_messages(
 
 
 @app.post("/{ns}/rooms/{room_id}/messages", response_model=RoomMessageInfo)
-def send_room_message(
+async def send_room_message(
     ns: str,
     room_id: str,
     request: SendRoomMessageRequest,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Send a message to a room. Requires membership."""
+    from .events import get_event_bus
+
     room, from_id = require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
@@ -1271,6 +1284,12 @@ def send_room_message(
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    # Notify subscribers that this room has a new message
+    try:
+        await get_event_bus().publish(ns, f"room:{room_id}", message["mid"])
+    except Exception:
+        logger.warning("Failed to publish room event", exc_info=True)
 
     return RoomMessageInfo.from_db(message)
 
@@ -1312,6 +1331,143 @@ def get_unread_count(
 
     count = db.get_room_unread_count(room_id, identity_id)
     return {"unread_count": count, "room_id": room_id}
+
+
+# --- Subscription Endpoint ---
+
+logger = logging.getLogger(__name__)
+
+
+class SubscribeRequest(BaseModel):
+    """Request body for topic subscription."""
+
+    topics: dict[str, str | None]
+    """Map of topic_key -> last_seen_mid. Use None for 'never seen'."""
+
+    mode: Literal["poll", "stream"] = "poll"
+    """Subscription mode: 'poll' blocks and returns, 'stream' uses SSE."""
+
+    timeout: int = Field(default=30, ge=1, le=60)
+    """Timeout in seconds for poll mode (ignored for stream mode)."""
+
+
+def _validate_subscription_topics(
+    ns: str,
+    topics: dict[str, str | None],
+    caller_id: str,
+) -> None:
+    """Validate that the caller has access to all requested topics.
+
+    Args:
+        ns: Namespace ID
+        topics: Map of topic_key -> last_seen_mid
+        caller_id: The authenticated caller's identity ID
+
+    Raises:
+        HTTPException: 400 for malformed topics, 403 for access denied
+    """
+    for topic_key in topics:
+        if ":" not in topic_key:
+            raise HTTPException(
+                400,
+                f"Invalid topic format: {topic_key!r}. "
+                "Expected 'inbox:{id}' or 'room:{room_id}'",
+            )
+
+        topic_type, topic_id = topic_key.split(":", 1)
+
+        if topic_type == "inbox":
+            # Can only subscribe to your own inbox
+            if topic_id != caller_id:
+                raise HTTPException(
+                    403,
+                    f"Cannot subscribe to another identity's inbox: {topic_key}",
+                )
+        elif topic_type == "room":
+            # Must be a member of the room
+            if not db.is_room_member(topic_id, caller_id):
+                raise HTTPException(
+                    403,
+                    f"Not a member of room: {topic_id}",
+                )
+            # Also verify room belongs to this namespace
+            room = db.get_room(topic_id)
+            if room is None or room.get("ns") != ns:
+                raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
+        else:
+            raise HTTPException(
+                400,
+                f"Unknown topic type: {topic_type!r}. Supported: 'inbox', 'room'",
+            )
+
+
+@app.post("/{ns}/subscribe")
+async def subscribe(
+    ns: str,
+    request: SubscribeRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Subscribe to changes on topics within a namespace.
+
+    Clients provide a vector clock (map of topic -> last_seen_mid) and
+    receive notifications when any subscribed topic has new messages.
+
+    **Events, not payloads**: The response tells you *which* topics changed,
+    not the message contents. Use the existing inbox/room endpoints to
+    fetch content, passing the cursor from the event.
+
+    **Modes**:
+    - `poll`: Blocks until an event occurs or timeout. Returns changed topics.
+    - `stream`: Returns Server-Sent Events (SSE) for continuous streaming.
+
+    **Topic format**:
+    - `inbox:{identity_id}` — subscribe to your own inbox
+    - `room:{room_id}` — subscribe to a room you're a member of
+
+    **Auth**: X-Inbox-Secret header required. Must be a valid identity
+    in the namespace.
+    """
+    from .events import get_event_bus
+
+    require_active_namespace(ns)
+    caller_id = require_inbox_secret_any(ns, x_inbox_secret)
+
+    if not request.topics:
+        raise HTTPException(400, "At least one topic is required")
+
+    _validate_subscription_topics(ns, request.topics, caller_id)
+
+    event_bus = get_event_bus()
+
+    if request.mode == "stream":
+        # SSE streaming mode
+        async def event_generator():
+            # Send initial connected event
+            yield "event: connected\ndata: {}\n\n"
+
+            try:
+                async for event in event_bus.stream(ns, request.topics):
+                    yield f"event: change\ndata: {json.dumps(event)}\n\n"
+            except asyncio.CancelledError:
+                return
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Poll mode — block until event or timeout
+    changes = await event_bus.subscribe(ns, request.topics, timeout=request.timeout)
+
+    return {
+        "events": changes,
+        "timeout": len(changes) == 0,
+    }
 
 
 # --- Web App Routes ---

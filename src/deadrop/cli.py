@@ -374,6 +374,188 @@ def claim(invite_url: str):
     _do_claim(invite_url)
 
 
+@app.command
+def listen(
+    ns: str,
+    *,
+    identity_id: str | None = None,
+    inbox: bool = False,
+    rooms: bool = False,
+    all: bool = True,
+    json_output: bool = False,
+    timeout: int = 30,
+):
+    """Listen for new messages across inbox and rooms.
+
+    Subscribes to topic changes and prints events as they arrive.
+    Press Ctrl+C to stop.
+
+    Args:
+        ns: Namespace ID or slug
+        identity_id: Identity to listen as (uses first if not specified)
+        inbox: Subscribe to inbox only
+        rooms: Subscribe to rooms only
+        all: Subscribe to both inbox and rooms (default)
+        json_output: Output events as JSON lines
+        timeout: Poll timeout in seconds (1-60)
+    """
+    import json
+
+    config = get_namespace_config(ns)
+    ns_id = config.ns
+
+    # Get identity
+    if identity_id:
+        if identity_id not in config.mailboxes:
+            raise cyclopts.ValidationError(f"Identity {identity_id} not found in namespace")
+        identity = config.mailboxes[identity_id]
+        identity_id = identity_id
+    else:
+        if not config.mailboxes:
+            raise cyclopts.ValidationError("No identities in namespace")
+        identity_id = list(config.mailboxes.keys())[0]
+        identity = config.mailboxes[identity_id]
+
+    # Determine what to subscribe to
+    if inbox and not rooms:
+        subscribe_inbox = True
+        subscribe_rooms = False
+    elif rooms and not inbox:
+        subscribe_inbox = False
+        subscribe_rooms = True
+    else:
+        subscribe_inbox = True
+        subscribe_rooms = True
+
+    # Build topics
+    global_config = get_config()
+    topics = {}
+
+    if subscribe_inbox:
+        topics[f"inbox:{identity_id}"] = None
+
+    if subscribe_rooms:
+        # Fetch rooms via API
+        try:
+            url = f"{global_config.url}/{ns_id}/rooms"
+            resp = httpx.get(
+                url,
+                headers={"X-Inbox-Secret": identity.secret},
+                timeout=30.0,
+            )
+            if resp.status_code == 200:
+                room_list = resp.json()
+                for room in room_list:
+                    topics[f"room:{room['room_id']}"] = None
+        except Exception as e:
+            print(f"Warning: Failed to list rooms: {e}", file=sys.stderr)
+
+    if not topics:
+        print("No topics to subscribe to.", file=sys.stderr)
+        sys.exit(1)
+
+    topic_names = ", ".join(topics.keys())
+    if not json_output:
+        print(f"Subscribing to: {topic_names}")
+        print("Waiting for events... (Ctrl+C to stop)")
+        print()
+
+    # Subscribe loop
+    try:
+        while True:
+            try:
+                url = f"{global_config.url}/{ns_id}/subscribe"
+                resp = httpx.post(
+                    url,
+                    headers={"X-Inbox-Secret": identity.secret},
+                    json={"topics": topics, "mode": "poll", "timeout": timeout},
+                    timeout=timeout + 10,
+                )
+
+                if resp.status_code != 200:
+                    print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+                    import time
+
+                    time.sleep(5)
+                    continue
+
+                data = resp.json()
+                events = data.get("events", {})
+
+                if not events:
+                    continue  # Timeout, loop again
+
+                for topic, mid in events.items():
+                    # Update cursor
+                    topics[topic] = mid
+
+                    if json_output:
+                        print(json.dumps({"topic": topic, "latest_mid": mid}))
+                    else:
+                        # Fetch and display the actual message
+                        _display_event(global_config.url, ns_id, identity.secret, topic, mid)
+
+            except httpx.TimeoutException:
+                continue  # Normal timeout, loop again
+            except httpx.ConnectError as e:
+                print(f"Connection error: {e}", file=sys.stderr)
+                import time
+
+                time.sleep(5)
+    except KeyboardInterrupt:
+        if not json_output:
+            print("\nStopped.")
+
+
+def _display_event(base_url: str, ns: str, secret: str, topic: str, mid: str):
+    """Fetch and display a subscription event."""
+    topic_type, topic_id = topic.split(":", 1)
+
+    if topic_type == "inbox":
+        try:
+            resp = httpx.get(
+                f"{base_url}/{ns}/inbox/{topic_id}",
+                headers={"X-Inbox-Secret": secret},
+                params={"after": mid},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                messages = resp.json().get("messages", [])
+                if messages:
+                    for msg in messages:
+                        from_id = msg.get("from", "unknown")[:8]
+                        body = msg.get("body", "")
+                        print(f"[inbox] {from_id}: {body}")
+                else:
+                    print(f"[inbox] New activity (mid: {mid[:12]}...)")
+            else:
+                print(f"[inbox] New activity (mid: {mid[:12]}...)")
+        except Exception:
+            print(f"[inbox] New activity (mid: {mid[:12]}...)")
+
+    elif topic_type == "room":
+        try:
+            resp = httpx.get(
+                f"{base_url}/{ns}/rooms/{topic_id}/messages",
+                headers={"X-Inbox-Secret": secret},
+                params={"after": mid, "limit": "10"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                messages = resp.json().get("messages", [])
+                if messages:
+                    for msg in messages:
+                        from_id = msg.get("from_id", "unknown")[:8]
+                        body = msg.get("body", "")
+                        print(f"[room:{topic_id[:8]}] {from_id}: {body}")
+                else:
+                    print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)")
+            else:
+                print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)")
+        except Exception:
+            print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)")
+
+
 # --- Namespace Commands ---
 
 

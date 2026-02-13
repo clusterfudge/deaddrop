@@ -348,6 +348,58 @@ print(f'Alice invite: http://localhost:8000/join/{secrets.invite_id}#{secrets.ke
 
 ---
 
+## Listening for Messages (Subscriptions)
+
+Instead of polling individual inboxes and rooms, you can use the **subscription system** to monitor everything at once.
+
+### Via CLI
+
+```bash
+# Listen to all topics (inbox + rooms)
+deadrop listen <namespace>
+
+# Output:
+# Subscribing to: inbox:abc123, room:def456, room:ghi789
+# Waiting for events... (Ctrl+C to stop)
+#
+# [room:def45678] alice123: Hello everyone!
+# [inbox] bob98765: Hey, got your message
+
+# JSON output for piping to other tools
+deadrop listen <namespace> --json-output
+```
+
+### Via Python
+
+```python
+from deadrop import Deaddrop
+
+client = Deaddrop.remote(url="https://deaddrop.example.com")
+
+# Monitor multiple topics simultaneously
+topics = {
+    f"inbox:{my_id}": None,       # Subscribe to my inbox
+    f"room:{room_id}": None,      # Subscribe to a room
+}
+
+for topic, mid in client.listen_all(ns, secret, topics):
+    print(f"New activity on {topic}")
+```
+
+### Via REST API
+
+```bash
+# Poll mode (blocks until event or timeout)
+curl -X POST "http://localhost:8000/{ns}/subscribe" \
+  -H "Content-Type: application/json" \
+  -H "X-Inbox-Secret: {secret}" \
+  -d '{"topics": {"inbox:{id}": null, "room:{room_id}": null}, "timeout": 30}'
+```
+
+See [docs/SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) for full details on the subscription system.
+
+---
+
 ## Security Considerations
 
 - **Invite links are single-use**: Once claimed, they cannot be reused
