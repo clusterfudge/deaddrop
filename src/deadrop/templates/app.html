@@ -697,8 +697,14 @@
     }
     
     function startRoomPolling() {
-        // Legacy function — now handled by subscription manager.
-        // Still start polling as fallback for the active room view.
+        // Skip legacy polling when subscription manager is active —
+        // the subscription onEvent handler already calls fetchNewRoomMessages().
+        if (subscriptionManager) {
+            console.log('[polling] skipped — subscription manager active');
+            return;
+        }
+        
+        // Fallback: use long-polling when subscriptions are unavailable
         if (roomPollController) {
             roomPollController.abort();
         }
