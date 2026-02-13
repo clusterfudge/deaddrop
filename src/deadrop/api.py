@@ -1146,9 +1146,9 @@ def add_room_member(
     try:
         db.add_room_member(room_id, request.identity_id)
         # Invalidate membership cache for the new member
-        from .cache import membership_cache
+        from .cache import invalidate_membership
 
-        membership_cache.delete(f"member:{room_id}:{request.identity_id}")
+        invalidate_membership(room_id, request.identity_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -1190,9 +1190,9 @@ def remove_room_member(
         raise HTTPException(404, "Member not found")
 
     # Invalidate membership cache
-    from .cache import membership_cache
+    from .cache import invalidate_membership
 
-    membership_cache.delete(f"member:{room_id}:{identity_id}")
+    invalidate_membership(room_id, identity_id)
 
     return {"ok": True}
 

@@ -4,11 +4,18 @@ This module provides a simple TTL-based cache that doesn't require external
 dependencies. It's designed for caching auth-related data to reduce database
 round-trips.
 
+For single-instance deployments, we use long TTLs since:
+- Identity hashes NEVER change (identity must be deleted/recreated)
+- Room info rarely changes (only display_name updates)
+- Membership changes are explicitly invalidated on add/remove
+
 Cache keys are designed to be invalidated when the underlying data changes.
+LRU eviction prevents unbounded memory growth.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,6 +24,17 @@ from typing import Any, TypeVar
 from .metrics import metrics
 
 T = TypeVar("T")
+
+# Cache TTL configuration (can be overridden via environment)
+# For single-instance deployments, these can be very long
+ROOM_CACHE_TTL = float(os.environ.get("DEADROP_ROOM_CACHE_TTL", 3600))  # 1 hour default
+MEMBERSHIP_CACHE_TTL = float(os.environ.get("DEADROP_MEMBERSHIP_CACHE_TTL", 3600))  # 1 hour default
+IDENTITY_CACHE_TTL = float(os.environ.get("DEADROP_IDENTITY_CACHE_TTL", 86400))  # 24 hours default
+
+# Cache size limits
+ROOM_CACHE_SIZE = int(os.environ.get("DEADROP_ROOM_CACHE_SIZE", 1000))
+MEMBERSHIP_CACHE_SIZE = int(os.environ.get("DEADROP_MEMBERSHIP_CACHE_SIZE", 5000))
+IDENTITY_CACHE_SIZE = int(os.environ.get("DEADROP_IDENTITY_CACHE_SIZE", 2000))
 
 
 @dataclass
@@ -32,16 +50,16 @@ class CacheEntry:
 
 @dataclass
 class TTLCache:
-    """Thread-safe TTL cache.
+    """Thread-safe TTL cache with LRU eviction.
 
     Args:
         name: Name of the cache (for metrics)
-        default_ttl: Default TTL in seconds
+        default_ttl: Default TTL in seconds (0 = no expiration, rely on LRU)
         max_size: Maximum number of entries (LRU eviction when exceeded)
     """
 
     name: str
-    default_ttl: float = 60.0
+    default_ttl: float = 3600.0
     max_size: int = 1000
     _data: dict[str, CacheEntry] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -59,7 +77,8 @@ class TTLCache:
                 metrics.record_cache_miss(self.name)
                 return False, None
 
-            if entry.is_expired():
+            # Check expiration (skip if TTL is 0 - no expiration)
+            if self.default_ttl > 0 and entry.is_expired():
                 del self._data[key]
                 if key in self._access_order:
                     self._access_order.remove(key)
@@ -80,7 +99,7 @@ class TTLCache:
         Args:
             key: Cache key
             value: Value to cache
-            ttl: TTL in seconds (uses default_ttl if not specified)
+            ttl: TTL in seconds (uses default_ttl if not specified, 0 = no expiration)
         """
         if ttl is None:
             ttl = self.default_ttl
@@ -95,9 +114,12 @@ class TTLCache:
                 oldest_key = self._access_order.pop(0)
                 self._data.pop(oldest_key, None)
 
+            # For TTL of 0, set expiration far in the future (effectively no expiration)
+            expires_at = time.time() + ttl if ttl > 0 else float("inf")
+
             self._data[key] = CacheEntry(
                 value=value,
-                expires_at=time.time() + ttl,
+                expires_at=expires_at,
             )
             if key in self._access_order:
                 self._access_order.remove(key)
@@ -152,18 +174,34 @@ class TTLCache:
             return {
                 "size": len(self._data),
                 "max_size": self.max_size,
+                "ttl_seconds": self.default_ttl,
             }
 
 
-# Global cache instances
-# Room info cache - rooms rarely change
-room_cache = TTLCache(name="room", default_ttl=300.0, max_size=500)  # 5 min TTL
+# Global cache instances with configurable TTLs
+#
+# For single-instance deployments:
+# - Identity hashes NEVER change, so 24hr TTL (or set DEADROP_IDENTITY_CACHE_TTL=0 for infinite)
+# - Room info rarely changes, 1hr TTL is plenty
+# - Membership is explicitly invalidated on changes, 1hr TTL as safety net
 
-# Room membership cache - memberships change occasionally
-membership_cache = TTLCache(name="membership", default_ttl=60.0, max_size=2000)  # 1 min TTL
+room_cache = TTLCache(
+    name="room",
+    default_ttl=ROOM_CACHE_TTL,
+    max_size=ROOM_CACHE_SIZE,
+)
 
-# Identity hash cache - secret hashes never change (identity would be deleted and recreated)
-identity_hash_cache = TTLCache(name="identity_hash", default_ttl=600.0, max_size=1000)  # 10 min TTL
+membership_cache = TTLCache(
+    name="membership",
+    default_ttl=MEMBERSHIP_CACHE_TTL,
+    max_size=MEMBERSHIP_CACHE_SIZE,
+)
+
+identity_hash_cache = TTLCache(
+    name="identity_hash",
+    default_ttl=IDENTITY_CACHE_TTL,
+    max_size=IDENTITY_CACHE_SIZE,
+)
 
 
 def invalidate_room(room_id: str) -> None:
@@ -172,10 +210,16 @@ def invalidate_room(room_id: str) -> None:
     membership_cache.invalidate_prefix(f"member:{room_id}:")
 
 
+def invalidate_membership(room_id: str, identity_id: str) -> None:
+    """Invalidate membership cache for a specific room/identity pair."""
+    membership_cache.delete(f"member:{room_id}:{identity_id}")
+
+
 def invalidate_identity(ns: str, identity_id: str) -> None:
     """Invalidate all caches related to an identity."""
     identity_hash_cache.delete(f"identity:{ns}:{identity_id}")
-    membership_cache.invalidate_prefix("member:")  # Broad invalidation
+    # Invalidate all memberships for this identity (they reference the identity)
+    membership_cache.invalidate_prefix("member:")  # Broad invalidation - could optimize
 
 
 def clear_all_caches() -> None:
