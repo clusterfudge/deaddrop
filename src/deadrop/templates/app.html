@@ -139,7 +139,7 @@
         
         <div class="compose-area">
             <textarea id="room-message-input" class="compose-input" 
-                      placeholder="Type a message..." rows="1"></textarea>
+                      placeholder="Type a message..." rows="1" enterkeyhint="send"></textarea>
             <button id="room-send-btn" class="btn btn-primary">Send ➤</button>
         </div>
     </div>
@@ -254,6 +254,12 @@
         if (hours > 3) return { text: `⏱ ${hours}h`, style: '' };
         if (hours > 0) return { text: `⏱ ${hours}h`, style: 'warning' };
         return { text: `⏱ ${mins}m`, style: 'urgent' };
+    }
+    
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
     }
     
     function getPeerName(id) {
@@ -600,20 +606,23 @@
     function renderRoomMessages() {
         const list = document.getElementById('room-message-list');
         
-        list.innerHTML = roomMessages.map(msg => {
+        // Reverse for column-reverse display (newest at bottom visually)
+        const reversed = [...roomMessages].reverse();
+        
+        list.innerHTML = reversed.map(msg => {
             const isMe = msg.from_id === credentials.id;
             const isPending = msg.pending;
             
             return `
                 <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}">
                     <div class="sender-name">${getMemberName(msg.from_id)}</div>
-                    <div class="message-bubble">${msg.body}</div>
+                    <div class="message-body">${escapeHtml(msg.body)}</div>
                     <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
                 </div>
             `;
         }).join('');
         
-        list.scrollTop = list.scrollHeight;
+        // No need to scroll - column-reverse keeps us at bottom
         
         // Update read cursor (skip pending messages)
         const realMessages = roomMessages.filter(m => !m.pending);
