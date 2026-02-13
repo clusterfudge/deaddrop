@@ -170,7 +170,6 @@ class Backend(ABC):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         """Get messages for an identity.
 
@@ -181,8 +180,6 @@ class Backend(ABC):
             unread_only: Only return unread messages
             after_mid: Cursor for pagination
             mark_as_read: Whether to mark messages as read
-            wait: Long-poll timeout in seconds (0-60). If no messages,
-                  wait up to this many seconds for new messages.
         """
         ...
 
@@ -392,7 +389,6 @@ class Backend(ABC):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         """Get messages from a room.
 
@@ -402,7 +398,6 @@ class Backend(ABC):
             secret: Caller's inbox secret (must be a member)
             after_mid: Only get messages after this ID
             limit: Maximum messages to return
-            wait: Long-poll timeout in seconds
 
         Returns:
             List of message dicts
@@ -790,27 +785,10 @@ class LocalBackend(Backend):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
-        import time
-
         # Verify owner
         if not db.verify_identity_secret(ns, identity_id, secret, conn=self._conn):
             raise PermissionError("Invalid inbox secret")
-
-        # Long-polling: wait for messages if none exist and wait > 0
-        if wait > 0:
-            poll_interval = 0.5  # Check every 500ms
-            elapsed = 0.0
-            max_wait = min(wait, 60)  # Cap at 60 seconds
-
-            while elapsed < max_wait:
-                if db.has_new_messages(
-                    ns, identity_id, after_mid=after_mid, unread_only=unread_only, conn=self._conn
-                ):
-                    break
-                time.sleep(poll_interval)
-                elapsed += poll_interval
 
         return db.get_messages(
             ns=ns,
@@ -986,10 +964,7 @@ class LocalBackend(Backend):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
-        import time
-
         identity_id = derive_id(secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
@@ -997,18 +972,6 @@ class LocalBackend(Backend):
         room = db.get_room(room_id, conn=self._conn)
         if not room or room.get("ns") != ns:
             raise ValueError("Room not found in this namespace")
-
-        # Long-polling
-        if wait > 0:
-            poll_interval = 0.5
-            elapsed = 0.0
-            max_wait = min(wait, 60)
-
-            while elapsed < max_wait:
-                if db.has_new_room_messages(room_id, after_mid=after_mid, conn=self._conn):
-                    break
-                time.sleep(poll_interval)
-                elapsed += poll_interval
 
         return db.get_room_messages(room_id, after_mid=after_mid, limit=limit, conn=self._conn)
 
@@ -1456,28 +1419,21 @@ class RemoteBackend(Backend):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         params = []
         if unread_only:
             params.append("unread=true")
         if after_mid:
             params.append(f"after={after_mid}")
-        if wait > 0:
-            params.append(f"wait={min(wait, 60)}")
 
         path = f"/{ns}/inbox/{identity_id}"
         if params:
             path += "?" + "&".join(params)
 
-        # For long-polling, we need a longer timeout
-        timeout = max(30.0, wait + 5) if wait > 0 else 30.0
-
         result = self._request(
             "GET",
             path,
             headers=self._inbox_headers(secret),
-            timeout=timeout,
         )
         return result.get("messages", [])
 
@@ -1656,27 +1612,21 @@ class RemoteBackend(Backend):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         params = []
         if after_mid:
             params.append(f"after={after_mid}")
         if limit != 100:
             params.append(f"limit={limit}")
-        if wait > 0:
-            params.append(f"wait={min(wait, 60)}")
 
         path = f"/{ns}/rooms/{room_id}/messages"
         if params:
             path += "?" + "&".join(params)
 
-        timeout = max(30.0, wait + 5) if wait > 0 else 30.0
-
         result = self._request(
             "GET",
             path,
             headers=self._inbox_headers(secret),
-            timeout=timeout,
         )
         return result.get("messages", [])
 
