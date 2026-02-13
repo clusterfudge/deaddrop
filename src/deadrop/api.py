@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 from . import db
 from .auth import derive_id
 from .auth_provider import (
-
     extract_bearer_token,
     get_auth_method_name,
     is_auth_enabled,
