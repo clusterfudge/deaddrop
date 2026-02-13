@@ -481,6 +481,50 @@ class Backend(ABC):
         """Claim an invite URL and return decrypted credentials."""
         ...
 
+    # --- Subscription Methods ---
+
+    def subscribe(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes (poll mode).
+
+        Blocks until any subscribed topic has changes or timeout.
+
+        Args:
+            ns: Namespace ID
+            secret: Caller's inbox secret (for auth)
+            topics: Map of topic_key -> last_seen_mid (None = never seen)
+            timeout: Max seconds to wait
+
+        Returns:
+            dict with 'events' (changed topics) and 'timeout' (bool)
+        """
+        raise NotImplementedError("subscribe not implemented for this backend")
+
+    def subscribe_stream(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+    ):
+        """Subscribe to topic changes (streaming mode).
+
+        Returns an iterator that yields event dicts as they occur.
+
+        Args:
+            ns: Namespace ID
+            secret: Caller's inbox secret (for auth)
+            topics: Map of topic_key -> last_seen_mid (None = never seen)
+
+        Yields:
+            dicts with 'topic' and 'latest_mid' keys
+        """
+        raise NotImplementedError("subscribe_stream not implemented for this backend")
+
     # --- Utility Methods ---
 
     def verify_identity_secret(self, ns: str, identity_id: str, secret: str) -> bool:
@@ -1100,6 +1144,81 @@ class LocalBackend(Backend):
             "display_name": result.get("display_name"),
         }
 
+    def subscribe(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes using the in-memory event bus.
+
+        For local backends, we use the event bus directly since
+        publish events from send_message/send_room_message go through
+        the same process.
+        """
+        import asyncio
+
+        from .events import get_event_bus
+
+        # Validate identity
+        identity_id = db.verify_identity_in_namespace(ns, secret, conn=self._conn)
+        if not identity_id:
+            raise ValueError("Invalid inbox secret or not in namespace")
+
+        # Validate topics
+        for topic_key in topics:
+            if ":" not in topic_key:
+                raise ValueError(f"Invalid topic format: {topic_key}")
+            topic_type, topic_id = topic_key.split(":", 1)
+            if topic_type == "inbox" and topic_id != identity_id:
+                raise ValueError("Cannot subscribe to another identity's inbox")
+            elif topic_type == "room":
+                if not db.is_room_member(topic_id, identity_id, conn=self._conn):
+                    raise ValueError(f"Not a member of room: {topic_id}")
+
+        event_bus = get_event_bus()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            changes = loop.run_until_complete(event_bus.subscribe(ns, topics, timeout=timeout))
+            loop.close()
+        else:
+            changes = loop.run_until_complete(event_bus.subscribe(ns, topics, timeout=timeout))
+
+        return {"events": changes, "timeout": len(changes) == 0}
+
+    def subscribe_stream(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+    ):
+        """Subscribe to topic changes using in-memory event bus (streaming)."""
+        import asyncio
+
+        from .events import get_event_bus
+
+        # Validate identity
+        identity_id = db.verify_identity_in_namespace(ns, secret, conn=self._conn)
+        if not identity_id:
+            raise ValueError("Invalid inbox secret or not in namespace")
+
+        event_bus = get_event_bus()
+
+        # Use a synchronous wrapper around the async stream
+        loop = asyncio.new_event_loop()
+        try:
+            stream = event_bus.stream(ns, topics)
+            while True:
+                event = loop.run_until_complete(stream.__anext__())
+                yield event
+        except StopAsyncIteration:
+            pass
+        finally:
+            loop.close()
+
 
 class RemoteBackend(Backend):
     """Remote HTTP API backend.
@@ -1663,6 +1782,72 @@ class RemoteBackend(Backend):
             "secret": identity_secret,
             "display_name": result.get("identity_display_name"),
         }
+
+    def subscribe(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes via the HTTP API (poll mode)."""
+        response = self._client.post(
+            f"{self._url}/{ns}/subscribe",
+            headers={"X-Inbox-Secret": secret},
+            json={"topics": topics, "mode": "poll", "timeout": timeout},
+            timeout=max(30.0, timeout + 5),
+        )
+
+        if response.status_code != 200:
+            error = response.json().get("detail", response.text)
+            raise ValueError(f"Subscribe failed: {error}")
+
+        return response.json()
+
+    def subscribe_stream(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+    ):
+        """Subscribe to topic changes via SSE stream.
+
+        Yields event dicts with 'topic' and 'latest_mid' keys.
+        """
+        import json
+
+        with self._client.stream(
+            "POST",
+            f"{self._url}/{ns}/subscribe",
+            headers={"X-Inbox-Secret": secret},
+            json={"topics": topics, "mode": "stream"},
+            timeout=None,  # SSE streams are long-lived
+        ) as response:
+            if response.status_code != 200:
+                raise ValueError(f"Subscribe stream failed: {response.status_code}")
+
+            buffer = ""
+            for chunk in response.iter_text():
+                buffer += chunk
+                # Parse SSE events from buffer
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    if not block.strip():
+                        continue
+
+                    event_type = "message"
+                    event_data = ""
+                    for line in block.split("\n"):
+                        if line.startswith("event: "):
+                            event_type = line[7:].strip()
+                        elif line.startswith("data: "):
+                            event_data = line[6:]
+
+                    if event_type == "change" and event_data:
+                        try:
+                            yield json.loads(event_data)
+                        except json.JSONDecodeError:
+                            pass
 
 
 class InMemoryBackend(LocalBackend):
