@@ -595,11 +595,26 @@
         
         try {
             const startTime = performance.now();
-            const result = await DeadropAPI.getRoomMessages(credentials, currentRoomId);
-            const elapsed = Math.round(performance.now() - startTime);
-            console.log(`Room messages loaded in ${elapsed}ms`);
             
-            roomMessages = result?.messages || [];
+            // Paginate to fetch ALL messages (server default limit is 100)
+            const PAGE_SIZE = 500;
+            let allMessages = [];
+            let afterMid = null;
+            
+            while (true) {
+                const result = await DeadropAPI.getRoomMessages(
+                    credentials, currentRoomId, { afterMid, limit: PAGE_SIZE });
+                const page = result?.messages || [];
+                allMessages = [...allMessages, ...page];
+                
+                if (page.length < PAGE_SIZE) break;  // Last page
+                afterMid = page[page.length - 1].mid;
+            }
+            
+            const elapsed = Math.round(performance.now() - startTime);
+            console.log(`Room messages loaded in ${elapsed}ms (${allMessages.length} msgs)`);
+            
+            roomMessages = allMessages;
             
             // Save to cache
             localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
