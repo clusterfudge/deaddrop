@@ -170,7 +170,6 @@ class Backend(ABC):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         """Get messages for an identity.
 
@@ -181,8 +180,6 @@ class Backend(ABC):
             unread_only: Only return unread messages
             after_mid: Cursor for pagination
             mark_as_read: Whether to mark messages as read
-            wait: Long-poll timeout in seconds (0-60). If no messages,
-                  wait up to this many seconds for new messages.
         """
         ...
 
@@ -392,7 +389,6 @@ class Backend(ABC):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         """Get messages from a room.
 
@@ -402,7 +398,6 @@ class Backend(ABC):
             secret: Caller's inbox secret (must be a member)
             after_mid: Only get messages after this ID
             limit: Maximum messages to return
-            wait: Long-poll timeout in seconds
 
         Returns:
             List of message dicts
@@ -480,6 +475,50 @@ class Backend(ABC):
     def claim_invite(self, invite_url: str) -> dict[str, Any]:
         """Claim an invite URL and return decrypted credentials."""
         ...
+
+    # --- Subscription Methods ---
+
+    def subscribe(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes (poll mode).
+
+        Blocks until any subscribed topic has changes or timeout.
+
+        Args:
+            ns: Namespace ID
+            secret: Caller's inbox secret (for auth)
+            topics: Map of topic_key -> last_seen_mid (None = never seen)
+            timeout: Max seconds to wait
+
+        Returns:
+            dict with 'events' (changed topics) and 'timeout' (bool)
+        """
+        raise NotImplementedError("subscribe not implemented for this backend")
+
+    def subscribe_stream(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+    ):
+        """Subscribe to topic changes (streaming mode).
+
+        Returns an iterator that yields event dicts as they occur.
+
+        Args:
+            ns: Namespace ID
+            secret: Caller's inbox secret (for auth)
+            topics: Map of topic_key -> last_seen_mid (None = never seen)
+
+        Yields:
+            dicts with 'topic' and 'latest_mid' keys
+        """
+        raise NotImplementedError("subscribe_stream not implemented for this backend")
 
     # --- Utility Methods ---
 
@@ -746,27 +785,10 @@ class LocalBackend(Backend):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
-        import time
-
         # Verify owner
         if not db.verify_identity_secret(ns, identity_id, secret, conn=self._conn):
             raise PermissionError("Invalid inbox secret")
-
-        # Long-polling: wait for messages if none exist and wait > 0
-        if wait > 0:
-            poll_interval = 0.5  # Check every 500ms
-            elapsed = 0.0
-            max_wait = min(wait, 60)  # Cap at 60 seconds
-
-            while elapsed < max_wait:
-                if db.has_new_messages(
-                    ns, identity_id, after_mid=after_mid, unread_only=unread_only, conn=self._conn
-                ):
-                    break
-                time.sleep(poll_interval)
-                elapsed += poll_interval
 
         return db.get_messages(
             ns=ns,
@@ -942,10 +964,7 @@ class LocalBackend(Backend):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
-        import time
-
         identity_id = derive_id(secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
@@ -953,18 +972,6 @@ class LocalBackend(Backend):
         room = db.get_room(room_id, conn=self._conn)
         if not room or room.get("ns") != ns:
             raise ValueError("Room not found in this namespace")
-
-        # Long-polling
-        if wait > 0:
-            poll_interval = 0.5
-            elapsed = 0.0
-            max_wait = min(wait, 60)
-
-            while elapsed < max_wait:
-                if db.has_new_room_messages(room_id, after_mid=after_mid, conn=self._conn):
-                    break
-                time.sleep(poll_interval)
-                elapsed += poll_interval
 
         return db.get_room_messages(room_id, after_mid=after_mid, limit=limit, conn=self._conn)
 
@@ -1099,6 +1106,81 @@ class LocalBackend(Backend):
             "secret": identity_secret,
             "display_name": result.get("display_name"),
         }
+
+    def subscribe(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes using the in-memory event bus.
+
+        For local backends, we use the event bus directly since
+        publish events from send_message/send_room_message go through
+        the same process.
+        """
+        import asyncio
+
+        from .events import get_event_bus
+
+        # Validate identity
+        identity_id = db.verify_identity_in_namespace(ns, secret, conn=self._conn)
+        if not identity_id:
+            raise ValueError("Invalid inbox secret or not in namespace")
+
+        # Validate topics
+        for topic_key in topics:
+            if ":" not in topic_key:
+                raise ValueError(f"Invalid topic format: {topic_key}")
+            topic_type, topic_id = topic_key.split(":", 1)
+            if topic_type == "inbox" and topic_id != identity_id:
+                raise ValueError("Cannot subscribe to another identity's inbox")
+            elif topic_type == "room":
+                if not db.is_room_member(topic_id, identity_id, conn=self._conn):
+                    raise ValueError(f"Not a member of room: {topic_id}")
+
+        event_bus = get_event_bus()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            changes = loop.run_until_complete(event_bus.subscribe(ns, topics, timeout=timeout))
+            loop.close()
+        else:
+            changes = loop.run_until_complete(event_bus.subscribe(ns, topics, timeout=timeout))
+
+        return {"events": changes, "timeout": len(changes) == 0}
+
+    def subscribe_stream(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+    ):
+        """Subscribe to topic changes using in-memory event bus (streaming)."""
+        import asyncio
+
+        from .events import get_event_bus
+
+        # Validate identity
+        identity_id = db.verify_identity_in_namespace(ns, secret, conn=self._conn)
+        if not identity_id:
+            raise ValueError("Invalid inbox secret or not in namespace")
+
+        event_bus = get_event_bus()
+
+        # Use a synchronous wrapper around the async stream
+        loop = asyncio.new_event_loop()
+        try:
+            stream = event_bus.stream(ns, topics)
+            while True:
+                event = loop.run_until_complete(stream.__anext__())
+                yield event
+        except StopAsyncIteration:
+            pass
+        finally:
+            loop.close()
 
 
 class RemoteBackend(Backend):
@@ -1337,28 +1419,21 @@ class RemoteBackend(Backend):
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         params = []
         if unread_only:
             params.append("unread=true")
         if after_mid:
             params.append(f"after={after_mid}")
-        if wait > 0:
-            params.append(f"wait={min(wait, 60)}")
 
         path = f"/{ns}/inbox/{identity_id}"
         if params:
             path += "?" + "&".join(params)
 
-        # For long-polling, we need a longer timeout
-        timeout = max(30.0, wait + 5) if wait > 0 else 30.0
-
         result = self._request(
             "GET",
             path,
             headers=self._inbox_headers(secret),
-            timeout=timeout,
         )
         return result.get("messages", [])
 
@@ -1537,27 +1612,21 @@ class RemoteBackend(Backend):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         params = []
         if after_mid:
             params.append(f"after={after_mid}")
         if limit != 100:
             params.append(f"limit={limit}")
-        if wait > 0:
-            params.append(f"wait={min(wait, 60)}")
 
         path = f"/{ns}/rooms/{room_id}/messages"
         if params:
             path += "?" + "&".join(params)
 
-        timeout = max(30.0, wait + 5) if wait > 0 else 30.0
-
         result = self._request(
             "GET",
             path,
             headers=self._inbox_headers(secret),
-            timeout=timeout,
         )
         return result.get("messages", [])
 
@@ -1663,6 +1732,72 @@ class RemoteBackend(Backend):
             "secret": identity_secret,
             "display_name": result.get("identity_display_name"),
         }
+
+    def subscribe(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes via the HTTP API (poll mode)."""
+        response = self._client.post(
+            f"{self._url}/{ns}/subscribe",
+            headers={"X-Inbox-Secret": secret},
+            json={"topics": topics, "mode": "poll", "timeout": timeout},
+            timeout=max(30.0, timeout + 5),
+        )
+
+        if response.status_code != 200:
+            error = response.json().get("detail", response.text)
+            raise ValueError(f"Subscribe failed: {error}")
+
+        return response.json()
+
+    def subscribe_stream(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+    ):
+        """Subscribe to topic changes via SSE stream.
+
+        Yields event dicts with 'topic' and 'latest_mid' keys.
+        """
+        import json
+
+        with self._client.stream(
+            "POST",
+            f"{self._url}/{ns}/subscribe",
+            headers={"X-Inbox-Secret": secret},
+            json={"topics": topics, "mode": "stream"},
+            timeout=None,  # SSE streams are long-lived
+        ) as response:
+            if response.status_code != 200:
+                raise ValueError(f"Subscribe stream failed: {response.status_code}")
+
+            buffer = ""
+            for chunk in response.iter_text():
+                buffer += chunk
+                # Parse SSE events from buffer
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    if not block.strip():
+                        continue
+
+                    event_type = "message"
+                    event_data = ""
+                    for line in block.split("\n"):
+                        if line.startswith("event: "):
+                            event_type = line[7:].strip()
+                        elif line.startswith("data: "):
+                            event_data = line[6:]
+
+                    if event_type == "change" and event_data:
+                        try:
+                            yield json.loads(event_data)
+                        except json.JSONDecodeError:
+                            pass
 
 
 class InMemoryBackend(LocalBackend):

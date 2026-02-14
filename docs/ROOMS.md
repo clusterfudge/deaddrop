@@ -11,7 +11,7 @@ While 1:1 messaging keeps messages strictly in recipient inboxes (only the owner
 - Room creator automatically becomes first member
 - Any member can invite others from the same namespace
 - Per-user read tracking (like Slack threads)
-- Long-polling support for real-time updates
+- Real-time updates via the [subscription system](SUBSCRIPTIONS.md)
 
 ## Security Model
 
@@ -86,7 +86,7 @@ for msg in messages:
     print(f"{msg['from_id']}: {msg['body']}")
 ```
 
-### Pagination and Long-Polling
+### Pagination
 
 ```python
 # Pagination with after_mid
@@ -98,27 +98,9 @@ next_batch = client.get_room_messages(
     after_mid=last_mid,
     limit=10
 )
-
-# Long-polling: wait for new messages
-messages = client.get_room_messages(
-    ns["ns"], room["room_id"], secret,
-    after_mid=last_mid,
-    wait=30  # Wait up to 30 seconds
-)
-
-# Convenience method
-messages = client.wait_for_room_messages(
-    ns["ns"], room["room_id"], secret,
-    timeout=30,
-    after_mid=last_mid
-)
-
-# Generator for continuous listening
-for msg in client.listen_room(ns["ns"], room["room_id"], secret, timeout=30):
-    print(f"New message from {msg['from_id']}: {msg['body']}")
-    if msg["body"] == "quit":
-        break
 ```
+
+For real-time updates, use the [subscription system](SUBSCRIPTIONS.md) instead of polling.
 
 ### Read Tracking
 
@@ -212,11 +194,10 @@ DELETE /{ns}/rooms/{room_id}/members/{identity_id}
 POST /{ns}/rooms/{room_id}/messages
 {"body": "Hello!", "content_type": "text/plain"}
 
-# Get messages (with optional pagination and long-polling)
+# Get messages (with optional pagination)
 GET /{ns}/rooms/{room_id}/messages
 GET /{ns}/rooms/{room_id}/messages?after={mid}
 GET /{ns}/rooms/{room_id}/messages?limit=50
-GET /{ns}/rooms/{room_id}/messages?wait=30
 ```
 
 ### Read Tracking
@@ -249,15 +230,20 @@ client.send_room_message(
     content_type="application/json"
 )
 
-# Workers listen and respond
-for msg in client.listen_room(ns["ns"], room["room_id"], worker["secret"]):
-    if msg["from_id"] == coordinator["id"]:
-        result = process_task(json.loads(msg["body"]))
-        client.send_room_message(
-            ns["ns"], room["room_id"], worker["secret"],
-            body=json.dumps(result),
-            content_type="application/json"
-        )
+# Workers listen via subscriptions and respond
+for event in client.listen_all(
+    ns["ns"], worker["secret"],
+    topics={f"room:{room['room_id']}": None}
+):
+    messages = client.get_room_messages(ns["ns"], room["room_id"], worker["secret"])
+    for msg in messages:
+        if msg["from_id"] == coordinator["id"]:
+            result = process_task(json.loads(msg["body"]))
+            client.send_room_message(
+                ns["ns"], room["room_id"], worker["secret"],
+                body=json.dumps(result),
+                content_type="application/json"
+            )
 ```
 
 ### Debate/Discussion
@@ -279,6 +265,106 @@ client.send_room_message(
 # Debaters respond - everyone sees all messages
 # No need to CC the moderator on every message!
 ```
+
+## Subscribing to Room Changes
+
+For monitoring multiple rooms (and your inbox) simultaneously, use the **subscription system**. See [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) for full details.
+
+```python
+# Subscribe to inbox + all rooms at once
+topics = {
+    f"inbox:{my_id}": None,
+    f"room:{room1_id}": None,
+    f"room:{room2_id}": None,
+}
+
+for topic, mid in client.listen_all(ns, secret, topics):
+    if topic.startswith("room:"):
+        room_id = topic.split(":", 1)[1]
+        messages = client.get_room_messages(ns, room_id, secret, after_mid=mid)
+        for msg in messages:
+            print(f"[{room_id}] {msg['from_id']}: {msg['body']}")
+```
+
+This uses a single subscription connection to monitor all topics efficiently.
+
+## Reactions
+
+Reactions are lightweight emoji responses attached to room messages. They use the existing message system — a reaction is just a room message with `content_type: "reaction"` and a `reference_mid` pointing to the target message.
+
+### Sending Reactions
+
+```bash
+# React to a message with 👍
+POST /{ns}/rooms/{room_id}/messages
+{
+  "body": "👍",
+  "content_type": "reaction",
+  "reference_mid": "target_message_mid"
+}
+```
+
+```python
+# Python client
+client.send_room_message(
+    ns["ns"], room["room_id"], alice["secret"],
+    body="👍",
+    content_type="reaction",
+    reference_mid=target_msg["mid"]
+)
+```
+
+### Reading Reactions
+
+Reactions appear in the normal message stream with `content_type: "reaction"`. Clients should:
+1. Filter reactions out of the main message list
+2. Group reactions by `reference_mid` and emoji
+3. Display as badges on the target message
+
+```python
+messages = client.get_room_messages(ns["ns"], room["room_id"], secret)
+
+# Separate reactions from regular messages
+regular = [m for m in messages if m["content_type"] != "reaction"]
+reactions = [m for m in messages if m["content_type"] == "reaction"]
+
+# Build reaction map: {target_mid: {emoji: [sender_ids]}}
+reaction_map = {}
+for r in reactions:
+    target = r["reference_mid"]
+    emoji = r["body"]
+    if target not in reaction_map:
+        reaction_map[target] = {}
+    if emoji not in reaction_map[target]:
+        reaction_map[target][emoji] = []
+    reaction_map[target][emoji].append(r["from_id"])
+
+# Display
+for msg in regular:
+    print(f"{msg['from_id']}: {msg['body']}")
+    if msg["mid"] in reaction_map:
+        badges = " ".join(
+            f"{emoji}×{len(senders)}"
+            for emoji, senders in reaction_map[msg["mid"]].items()
+        )
+        print(f"  Reactions: {badges}")
+```
+
+### Message Format
+
+| Field | Value |
+|-------|-------|
+| `body` | Emoji character (e.g., "👍", "❤️", "🎉") |
+| `content_type` | `"reaction"` |
+| `reference_mid` | Message ID of the target message |
+
+### Design Notes
+
+- **No new tables or endpoints** — reactions reuse the room messages system
+- **Reactions are permanent** — once sent, they cannot be retracted (same as any room message)
+- **No duplicate enforcement** — the same user can send the same emoji reaction multiple times; clients should deduplicate at display time
+- **Real-time** — reactions arrive via the same subscription channel as regular messages
+- The web client supports six emoji reactions: 👍 ❤️ 😂 🎉 👀 🙏
 
 ## Rooms vs 1:1 Messaging
 

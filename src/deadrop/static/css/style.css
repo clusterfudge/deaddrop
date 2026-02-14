@@ -645,24 +645,232 @@ textarea.form-input {
     font-size: 15px;
     line-height: 1.5;
     word-wrap: break-word;
+}
+
+/* Plain text messages preserve whitespace */
+.room-message .message-body:not(.markdown-body) {
     white-space: pre-wrap;
 }
 
-/* Markdown-like styling for messages */
-.room-message .message-body code {
-    background: var(--border-color);
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-family: monospace;
-    font-size: 13px;
+/* ========== MARKDOWN CONTENT STYLES ========== */
+
+/* Reset markdown-body spacing inside chat bubbles */
+.message-body.markdown-body {
+    font-family: inherit;
+    font-size: inherit;
 }
 
-.room-message .message-body pre {
-    background: var(--border-color);
-    padding: 12px;
+.message-body.markdown-body > *:first-child {
+    margin-top: 0;
+}
+
+.message-body.markdown-body > *:last-child {
+    margin-bottom: 0;
+}
+
+.message-body.markdown-body p {
+    margin: 0.4em 0;
+}
+
+/* Inline code */
+.message-body.markdown-body code {
+    background: rgba(0, 0, 0, 0.06);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
+    font-size: 0.88em;
+}
+
+/* Code blocks */
+.message-body.markdown-body pre {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    padding: 14px 16px;
     border-radius: var(--radius);
     overflow-x: auto;
     margin: 8px 0;
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-overflow-scrolling: touch;
+}
+
+.message-body.markdown-body pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+    color: inherit;
+}
+
+/* Override highlight.js background inside our dark pre */
+.message-body.markdown-body pre code.hljs {
+    background: transparent;
+    padding: 0;
+}
+
+/* Blockquotes */
+.message-body.markdown-body blockquote {
+    border-left: 3px solid var(--primary-color);
+    margin: 8px 0;
+    padding: 4px 12px;
+    color: var(--text-muted);
+}
+
+.message-body.markdown-body blockquote p {
+    margin: 0.2em 0;
+}
+
+/* Lists */
+.message-body.markdown-body ul,
+.message-body.markdown-body ol {
+    margin: 4px 0;
+    padding-left: 24px;
+}
+
+.message-body.markdown-body li {
+    margin: 2px 0;
+}
+
+/* Tables */
+.message-body.markdown-body table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 14px;
+    width: 100%;
+    overflow-x: auto;
+    display: block;
+}
+
+.message-body.markdown-body th,
+.message-body.markdown-body td {
+    border: 1px solid var(--border-color);
+    padding: 6px 12px;
+    text-align: left;
+}
+
+.message-body.markdown-body th {
+    background: rgba(0, 0, 0, 0.04);
+    font-weight: 600;
+}
+
+/* Headings inside messages — scale down */
+.message-body.markdown-body h1 { font-size: 1.3em; margin: 0.5em 0 0.3em; }
+.message-body.markdown-body h2 { font-size: 1.15em; margin: 0.5em 0 0.3em; }
+.message-body.markdown-body h3 { font-size: 1.05em; margin: 0.4em 0 0.2em; }
+.message-body.markdown-body h4,
+.message-body.markdown-body h5,
+.message-body.markdown-body h6 { font-size: 1em; margin: 0.4em 0 0.2em; }
+
+/* Links */
+.message-body.markdown-body a {
+    color: var(--primary-color);
+    text-decoration: underline;
+}
+
+/* Horizontal rules */
+.message-body.markdown-body hr {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 8px 0;
+}
+
+/* Images — clickable thumbnails */
+.message-body.markdown-body img.md-image {
+    max-width: 100%;
+    max-height: 300px;
+    border-radius: var(--radius);
+    cursor: zoom-in;
+    margin: 6px 0;
+    display: block;
+}
+
+/* Strikethrough */
+.message-body.markdown-body del {
+    text-decoration: line-through;
+    opacity: 0.7;
+}
+
+/* From-me messages are plain text, no markdown overrides needed */
+
+/* ========== REACTION BADGES ========== */
+
+.reaction-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 4px;
+}
+
+.reaction-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-color);
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    line-height: 1.4;
+}
+
+.reaction-badge:hover {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+.reaction-badge.mine {
+    background: rgba(37, 99, 235, 0.1);
+    border-color: var(--primary-color);
+}
+
+.reaction-badge .reaction-count {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.reaction-badge.add-reaction {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 2px 6px;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.room-message:hover .reaction-badge.add-reaction {
+    opacity: 1;
+}
+
+/* From-me reactions: adjust for blue bubble context */
+.room-message.from-me .reaction-badges {
+    justify-content: flex-end;
+}
+
+/* Reaction picker popup */
+.reaction-picker {
+    display: flex;
+    gap: 2px;
+    padding: 6px 8px;
+    background: white;
+    border-radius: 24px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+    border: 1px solid var(--border-color);
+}
+
+.reaction-picker-btn {
+    font-size: 22px;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.1s;
+    line-height: 1;
+}
+
+.reaction-picker-btn:hover {
+    background: var(--hover-bg);
 }
 
 .room-message .message-time {

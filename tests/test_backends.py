@@ -374,97 +374,9 @@ class TestBackendInterface:
 
 
 class TestBackendLongPolling:
-    """Test long-polling support in backends."""
+    """Long-poll tests removed — replaced by subscription system."""
 
-    def test_local_wait_immediate_return(self, tmp_path):
-        """LocalBackend should return immediately if messages exist."""
-        import time
-
-        backend = LocalBackend.create(tmp_path / ".deaddrop")
-        ns = backend.create_namespace(display_name="Test")
-        alice = backend.create_identity(ns["ns"], display_name="Alice")
-        bob = backend.create_identity(ns["ns"], display_name="Bob")
-
-        # Send a message first
-        backend.send_message(ns["ns"], alice["secret"], bob["id"], "Hello!")
-
-        # Long-poll should return immediately
-        start = time.time()
-        messages = backend.get_inbox(ns["ns"], bob["id"], bob["secret"], wait=5)
-        elapsed = time.time() - start
-
-        assert len(messages) == 1
-        assert elapsed < 1.0  # Should return almost immediately
-        backend.close()
-
-    def test_local_wait_timeout(self, tmp_path):
-        """LocalBackend should timeout when no messages."""
-        import time
-
-        backend = LocalBackend.create(tmp_path / ".deaddrop")
-        ns = backend.create_namespace(display_name="Test")
-        bob = backend.create_identity(ns["ns"], display_name="Bob")
-
-        # Long-poll with short timeout
-        start = time.time()
-        messages = backend.get_inbox(ns["ns"], bob["id"], bob["secret"], wait=1)
-        elapsed = time.time() - start
-
-        assert len(messages) == 0
-        assert elapsed >= 0.9  # Should wait close to full second
-        backend.close()
-
-    def test_in_memory_wait(self):
-        """InMemoryBackend should support wait parameter."""
-        import time
-
-        backend = InMemoryBackend()
-        ns = backend.create_namespace(display_name="Test")
-        alice = backend.create_identity(ns["ns"], display_name="Alice")
-        bob = backend.create_identity(ns["ns"], display_name="Bob")
-
-        # No messages - should wait
-        start = time.time()
-        messages = backend.get_inbox(ns["ns"], bob["id"], bob["secret"], wait=1)
-        elapsed = time.time() - start
-
-        assert len(messages) == 0
-        assert elapsed >= 0.9
-
-        # Send a message
-        backend.send_message(ns["ns"], alice["secret"], bob["id"], "Hello!")
-
-        # Should return immediately now
-        start = time.time()
-        messages = backend.get_inbox(ns["ns"], bob["id"], bob["secret"], wait=5)
-        elapsed = time.time() - start
-
-        assert len(messages) == 1
-        assert elapsed < 1.0
-
-    def test_wait_with_after_cursor(self, tmp_path):
-        """Wait should respect after_mid cursor."""
-        import time
-
-        backend = LocalBackend.create(tmp_path / ".deaddrop")
-        ns = backend.create_namespace(display_name="Test")
-        alice = backend.create_identity(ns["ns"], display_name="Alice")
-        bob = backend.create_identity(ns["ns"], display_name="Bob")
-
-        # Send first message
-        msg1 = backend.send_message(ns["ns"], alice["secret"], bob["id"], "First")
-        backend.get_inbox(ns["ns"], bob["id"], bob["secret"])  # Read it
-
-        # Wait for messages after msg1 - should timeout
-        start = time.time()
-        messages = backend.get_inbox(
-            ns["ns"], bob["id"], bob["secret"], after_mid=msg1["mid"], wait=1
-        )
-        elapsed = time.time() - start
-
-        assert len(messages) == 0
-        assert elapsed >= 0.9
-        backend.close()
+    pass
 
 
 class TestLocalBackendInvites:

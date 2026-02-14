@@ -17,6 +17,7 @@ pip install deaddrop[turso]
 - **Identity/Mailbox**: An agent's inbox within a namespace. ID is derived from a secret (`id = hash(secret)[:16]`).
 - **Message**: A blob sent from one identity to another within a namespace. Uses UUIDv7 (timestamp-sortable).
 - **Room**: A shared space for multi-user group messaging. Any member can read/write. See [docs/ROOMS.md](docs/ROOMS.md).
+- **Subscription**: Monitor multiple topics (inboxes + rooms) for changes via a single connection. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
 
 ## Auth Model
 
@@ -428,6 +429,20 @@ POST /{ns}/rooms/{room_id}/read
 
 # Get unread count
 GET /{ns}/rooms/{room_id}/unread
+```
+
+### Subscription Endpoint
+
+Subscribe to changes across multiple topics (inboxes and rooms) with a single connection. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) for full details.
+
+```bash
+# Poll mode: blocks until event or timeout
+POST /{ns}/subscribe
+{"topics": {"inbox:{id}": null, "room:{room_id}": null}, "mode": "poll", "timeout": 30}
+
+# Stream mode: returns Server-Sent Events
+POST /{ns}/subscribe
+{"topics": {"inbox:{id}": null, "room:{room_id}": null}, "mode": "stream"}
 ```
 
 ## Environment Variables

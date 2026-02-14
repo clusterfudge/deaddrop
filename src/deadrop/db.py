@@ -43,7 +43,7 @@ from .auth import derive_id, generate_secret, hash_secret
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -59,6 +59,16 @@ _db_config: dict[str, Any] = {
 # Legacy global connection (only used for explicit single-connection scenarios)
 _conn: sqlite3.Connection | None = None
 _is_libsql: bool = False
+
+
+def is_using_libsql() -> bool:
+    """Check if the database backend is libsql/Turso.
+
+    This is used by the API layer to determine whether DB operations need
+    to be serialized (libsql uses a single shared connection).
+    """
+    return _is_libsql or os.environ.get("TURSO_URL", "").startswith("libsql://")
+
 
 # Lock for thread-safe libsql reconnection
 _libsql_lock = threading.Lock()
@@ -473,10 +483,20 @@ def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_003_add_reference_mid(conn: sqlite3.Connection) -> None:
+    """Migration 003: Add reference_mid column to room_messages for reactions."""
+    conn.execute("ALTER TABLE room_messages ADD COLUMN reference_mid TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_reference ON room_messages(reference_mid)"
+    )
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
     (2, "Add rooms tables for group communication", _migrate_002_add_rooms),
+    (3, "Add reference_mid to room_messages for reactions", _migrate_003_add_reference_mid),
 ]
 
 
@@ -1688,7 +1708,9 @@ def list_rooms_for_identity(
     conn = _get_conn(conn)
     cursor = conn.execute(
         """SELECT r.room_id, r.ns, r.display_name, r.created_by, r.created_at,
-                  m.joined_at, m.last_read_mid
+                  m.joined_at, m.last_read_mid,
+                  (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.room_id)
+                      AS member_count
            FROM rooms r
            JOIN room_members m ON r.room_id = m.room_id
            WHERE r.ns = ? AND m.identity_id = ?
@@ -1860,6 +1882,7 @@ def send_room_message(
     from_id: str,
     body: str,
     content_type: str = "text/plain",
+    reference_mid: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> dict:
     """Send a message to a room.
@@ -1869,6 +1892,7 @@ def send_room_message(
         from_id: Sender identity ID (must be a member)
         body: Message body
         content_type: Content type (default: text/plain)
+        reference_mid: Optional message ID this message references (e.g. for reactions)
         conn: Optional database connection
 
     Returns:
@@ -1892,9 +1916,10 @@ def send_room_message(
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
-        """INSERT INTO room_messages (mid, room_id, from_id, body, content_type, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (mid, room_id, from_id, body, content_type, now),
+        """INSERT INTO room_messages
+               (mid, room_id, from_id, body, content_type, reference_mid, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (mid, room_id, from_id, body, content_type, reference_mid, now),
     )
     conn.commit()
 
@@ -1904,6 +1929,7 @@ def send_room_message(
         "from": from_id,
         "body": body,
         "content_type": content_type,
+        "reference_mid": reference_mid,
         "created_at": now,
     }
 
@@ -1959,7 +1985,7 @@ def get_room_messages(
     conn = _get_conn(conn)
 
     query = """
-        SELECT mid, room_id, from_id, body, content_type, created_at
+        SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
         FROM room_messages
         WHERE room_id = ?
     """
@@ -1982,6 +2008,7 @@ def get_room_messages(
             "from": row["from_id"],
             "body": row["body"],
             "content_type": row.get("content_type") or "text/plain",
+            "reference_mid": row.get("reference_mid"),
             "created_at": row["created_at"],
         }
         for row in rows
@@ -2005,7 +2032,7 @@ def get_room_message(
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
-        """SELECT mid, room_id, from_id, body, content_type, created_at
+        """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
            FROM room_messages WHERE room_id = ? AND mid = ?""",
         (room_id, mid),
     )
@@ -2018,6 +2045,7 @@ def get_room_message(
             "from": row["from_id"],
             "body": row["body"],
             "content_type": row.get("content_type") or "text/plain",
+            "reference_mid": row.get("reference_mid"),
             "created_at": row["created_at"],
         }
     return None

@@ -1,15 +1,18 @@
 """FastAPI application for deadrop."""
 
+import asyncio
+import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import db
 from .auth import derive_id
@@ -34,9 +37,18 @@ TEMPLATES_DIR = PACKAGE_DIR / "templates"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize and cleanup database."""
+    """Initialize and cleanup database, and warm caches."""
     db.init_db()
+
+    # Schedule cache warming as background task (non-blocking)
+    from .cache import schedule_cache_warming, stop_cache_warming
+
+    schedule_cache_warming()
+
     yield
+
+    # Stop background cache refresh
+    stop_cache_warming()
     db.close_db()
 
 
@@ -312,6 +324,149 @@ def require_active_namespace(ns: str) -> None:
         raise HTTPException(410, "Namespace is archived")
 
 
+# --- Async helpers (for use in async def handlers) ---
+# These wrap synchronous db/auth calls in run_in_executor so they don't
+# block the event loop.  Sync handlers already run in a threadpool, so
+# they keep using the sync versions above directly.
+
+
+def _get_db_executor():
+    """Get the appropriate executor for DB operations.
+
+    Returns a single-threaded executor when using libsql/Turso (which uses
+    a single shared connection that isn't thread-safe), or None to use the
+    default threadpool for local SQLite (which uses thread-local connections).
+    """
+    global _db_executor
+    if _db_executor is not None:
+        return _db_executor
+
+    if db.is_using_libsql():
+        from concurrent.futures import ThreadPoolExecutor
+
+        _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+        logger.info("Using serialized DB executor for libsql/Turso")
+    else:
+        _db_executor = None  # Use default threadpool for local SQLite
+        logger.info("Using default threadpool for local SQLite")
+
+    return _db_executor
+
+
+_db_executor = None  # Initialized lazily
+
+
+async def _run_sync(fn, *args):
+    """Run a synchronous function off the event loop.
+
+    Uses a single-threaded executor for libsql/Turso (shared connection)
+    or the default threadpool for local SQLite (thread-local connections).
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_get_db_executor(), fn, *args)
+
+
+async def _require_active_namespace(ns: str) -> None:
+    """Async variant of require_active_namespace."""
+    archived = await _run_sync(db.is_namespace_archived, ns)
+    if archived:
+        raise HTTPException(410, "Namespace is archived")
+
+
+async def _require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str | None) -> str:
+    """Async variant of require_inbox_secret."""
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    derived_id = derive_id(x_inbox_secret)
+    if derived_id != identity_id:
+        raise HTTPException(403, "Secret does not match identity")
+
+    verified = await _run_sync(db.verify_identity_secret, ns, identity_id, x_inbox_secret)
+    if not verified:
+        raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
+
+    return identity_id
+
+
+async def _require_inbox_secret_any(ns: str, x_inbox_secret: str | None) -> str:
+    """Async variant of require_inbox_secret_any."""
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    identity_id = await _run_sync(db.verify_identity_in_namespace, ns, x_inbox_secret)
+    if not identity_id:
+        raise HTTPException(403, "Invalid inbox secret or not in namespace")
+
+    return identity_id
+
+
+async def _require_room_member(room_id: str, x_inbox_secret: str | None) -> tuple[dict, str]:
+    """Async variant of require_room_member."""
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    identity_id = derive_id(x_inbox_secret)
+
+    import functools
+
+    room, error = await _run_sync(
+        functools.partial(db.verify_room_access, room_id, identity_id, x_inbox_secret)
+    )
+
+    if error or room is None:
+        error_msg = error or "Unknown error"
+        if "not found" in error_msg.lower():
+            raise HTTPException(404, error_msg)
+        elif "not a member" in error_msg.lower():
+            raise HTTPException(403, error_msg)
+        elif "invalid" in error_msg.lower() or "does not match" in error_msg.lower():
+            raise HTTPException(403, error_msg)
+        else:
+            raise HTTPException(400, error_msg)
+
+    return room, identity_id
+
+
+async def _validate_subscription_topics(
+    ns: str,
+    topics: dict[str, str | None],
+    caller_id: str,
+) -> None:
+    """Async variant of _validate_subscription_topics_sync."""
+    for topic_key in topics:
+        if ":" not in topic_key:
+            raise HTTPException(
+                400,
+                f"Invalid topic format: {topic_key!r}. "
+                "Expected 'inbox:{id}' or 'room:{room_id}'",
+            )
+
+        topic_type, topic_id = topic_key.split(":", 1)
+
+        if topic_type == "inbox":
+            if topic_id != caller_id:
+                raise HTTPException(
+                    403,
+                    f"Cannot subscribe to another identity's inbox: {topic_key}",
+                )
+        elif topic_type == "room":
+            is_member = await _run_sync(db.is_room_member, topic_id, caller_id)
+            if not is_member:
+                raise HTTPException(
+                    403,
+                    f"Not a member of room: {topic_id}",
+                )
+            room = await _run_sync(db.get_room, topic_id)
+            if room is None or room.get("ns") != ns:
+                raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
+        else:
+            raise HTTPException(
+                400,
+                f"Unknown topic type: {topic_type!r}. Supported: 'inbox', 'room'",
+            )
+
+
 # --- Admin Endpoints ---
 # Admin can: CRUD namespaces, CRUD mailbox metadata (not contents)
 
@@ -580,7 +735,7 @@ def delete_identity(
 
 
 @app.post("/{ns}/send")
-def send_message(
+async def send_message(
     ns: str,
     request: SendMessageRequest,
     x_inbox_secret: Annotated[str | None, Header()] = None,
@@ -590,26 +745,33 @@ def send_message(
     Messages are delivered instantly. Optionally set ttl_hours for ephemeral
     messages that expire from creation time (instead of read time).
     """
-    require_active_namespace(ns)
+    import functools
 
-    if not x_inbox_secret:
-        raise HTTPException(401, "X-Inbox-Secret header required")
+    from .events import get_event_bus
 
-    from_id = db.verify_identity_in_namespace(ns, x_inbox_secret)
-    if not from_id:
-        raise HTTPException(403, "Invalid inbox secret or not in namespace")
+    await _require_active_namespace(ns)
+    from_id = await _require_inbox_secret_any(ns, x_inbox_secret)
 
     try:
-        result = db.send_message(
-            ns=ns,
-            from_id=from_id,
-            to_id=request.to,
-            body=request.body,
-            content_type=request.content_type,
-            ttl_hours=request.ttl_hours,
+        result = await _run_sync(
+            functools.partial(
+                db.send_message,
+                ns=ns,
+                from_id=from_id,
+                to_id=request.to,
+                body=request.body,
+                content_type=request.content_type,
+                ttl_hours=request.ttl_hours,
+            )
         )
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+    # Notify subscribers that the recipient's inbox has a new message
+    try:
+        await get_event_bus().publish(ns, f"inbox:{request.to}", result["mid"])
+    except Exception:
+        logger.warning("Failed to publish inbox event", exc_info=True)
 
     return result
 
@@ -620,7 +782,6 @@ async def get_inbox(
     identity_id: str,
     unread: Annotated[bool, Query()] = False,
     after: Annotated[str | None, Query()] = None,
-    wait: Annotated[int, Query(ge=0, le=60)] = 0,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages for own inbox.
@@ -630,32 +791,23 @@ async def get_inbox(
     Query parameters:
     - unread: Only return unread messages
     - after: Only return messages after this message ID (cursor for pagination)
-    - wait: Long-poll timeout in seconds (0-60). If no messages, wait up to this
-            many seconds for new messages before returning empty response.
+
+    For real-time updates, use the POST /{ns}/subscribe endpoint instead.
     """
-    import asyncio
+    import functools
 
     # Only mailbox owner can read their inbox
-    require_inbox_secret(ns, identity_id, x_inbox_secret)
-
-    # Long-polling: wait for messages if none exist and wait > 0
-    if wait > 0:
-        poll_interval = 0.5  # Check every 500ms
-        elapsed = 0.0
-
-        while elapsed < wait:
-            # Check if messages exist (lightweight query)
-            if db.has_new_messages(ns, identity_id, after_mid=after, unread_only=unread):
-                break
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+    await _require_inbox_secret(ns, identity_id, x_inbox_secret)
 
     # Fetch and return messages
-    messages = db.get_messages(
-        ns=ns,
-        identity_id=identity_id,
-        unread_only=unread,
-        after_mid=after,
+    messages = await _run_sync(
+        functools.partial(
+            db.get_messages,
+            ns=ns,
+            identity_id=identity_id,
+            unread_only=unread,
+            after_mid=after,
+        )
     )
 
     return {
@@ -947,6 +1099,7 @@ class RoomWithMemberInfo(BaseModel):
     created_at: str
     joined_at: str
     last_read_mid: str | None
+    member_count: int | None = None
 
 
 class AddRoomMemberRequest(BaseModel):
@@ -965,6 +1118,7 @@ class RoomMemberInfo(BaseModel):
 class SendRoomMessageRequest(BaseModel):
     body: str
     content_type: str = "text/plain"
+    reference_mid: str | None = None
 
 
 class RoomMessageInfo(BaseModel):
@@ -973,6 +1127,7 @@ class RoomMessageInfo(BaseModel):
     from_id: str  # The sender's identity ID
     body: str
     content_type: str
+    reference_mid: str | None = None
     created_at: str
 
     @classmethod
@@ -984,6 +1139,7 @@ class RoomMessageInfo(BaseModel):
             from_id=data["from"],
             body=data["body"],
             content_type=data.get("content_type", "text/plain"),
+            reference_mid=data.get("reference_mid"),
             created_at=data["created_at"],
         )
 
@@ -1203,7 +1359,6 @@ async def get_room_messages(
     room_id: str,
     after: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
-    wait: Annotated[int, Query(ge=0, le=60)] = 0,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages from a room.
@@ -1211,28 +1366,19 @@ async def get_room_messages(
     Query parameters:
     - after: Only return messages after this message ID (for pagination/polling)
     - limit: Maximum number of messages to return (default: 100, max: 1000)
-    - wait: Long-poll timeout in seconds (0-60). If no messages, wait up to this
-            many seconds for new messages before returning empty response.
-    """
-    import asyncio
 
-    room, identity_id = require_room_member(room_id, x_inbox_secret)
+    For real-time updates, use the POST /{ns}/subscribe endpoint instead.
+    """
+    import functools
+
+    room, identity_id = await _require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    # Long-polling: wait for messages if none exist and wait > 0
-    if wait > 0:
-        poll_interval = 0.5
-        elapsed = 0.0
-
-        while elapsed < wait:
-            if db.has_new_room_messages(room_id, after_mid=after):
-                break
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-
-    messages = db.get_room_messages(room_id, after_mid=after, limit=limit)
+    messages = await _run_sync(
+        functools.partial(db.get_room_messages, room_id, after_mid=after, limit=limit)
+    )
 
     return {
         "messages": [RoomMessageInfo.from_db(m).model_dump() for m in messages],
@@ -1241,27 +1387,41 @@ async def get_room_messages(
 
 
 @app.post("/{ns}/rooms/{room_id}/messages", response_model=RoomMessageInfo)
-def send_room_message(
+async def send_room_message(
     ns: str,
     room_id: str,
     request: SendRoomMessageRequest,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Send a message to a room. Requires membership."""
-    room, from_id = require_room_member(room_id, x_inbox_secret)
+    import functools
+
+    from .events import get_event_bus
+
+    room, from_id = await _require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
     try:
-        message = db.send_room_message(
-            room_id=room_id,
-            from_id=from_id,
-            body=request.body,
-            content_type=request.content_type,
+        message = await _run_sync(
+            functools.partial(
+                db.send_room_message,
+                room_id=room_id,
+                from_id=from_id,
+                body=request.body,
+                content_type=request.content_type,
+                reference_mid=request.reference_mid,
+            )
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    # Notify subscribers that this room has a new message
+    try:
+        await get_event_bus().publish(ns, f"room:{room_id}", message["mid"])
+    except Exception:
+        logger.warning("Failed to publish room event", exc_info=True)
 
     return RoomMessageInfo.from_db(message)
 
@@ -1303,6 +1463,137 @@ def get_unread_count(
 
     count = db.get_room_unread_count(room_id, identity_id)
     return {"unread_count": count, "room_id": room_id}
+
+
+# --- Subscription Endpoint ---
+
+logger = logging.getLogger(__name__)
+
+
+class SubscribeRequest(BaseModel):
+    """Request body for topic subscription."""
+
+    topics: dict[str, str | None]
+    """Map of topic_key -> last_seen_mid. Use None for 'never seen'."""
+
+    mode: Literal["poll", "stream"] = "poll"
+    """Subscription mode: 'poll' blocks and returns, 'stream' uses SSE."""
+
+    timeout: int = Field(default=30, ge=1, le=60)
+    """Timeout in seconds for poll mode (ignored for stream mode)."""
+
+
+def _validate_subscription_topics_sync(
+    ns: str,
+    topics: dict[str, str | None],
+    caller_id: str,
+) -> None:
+    """Validate that the caller has access to all requested topics (sync version).
+
+    Used only by tests. The subscribe endpoint uses the async variant above.
+    """
+    for topic_key in topics:
+        if ":" not in topic_key:
+            raise HTTPException(
+                400,
+                f"Invalid topic format: {topic_key!r}. "
+                "Expected 'inbox:{id}' or 'room:{room_id}'",
+            )
+
+        topic_type, topic_id = topic_key.split(":", 1)
+
+        if topic_type == "inbox":
+            # Can only subscribe to your own inbox
+            if topic_id != caller_id:
+                raise HTTPException(
+                    403,
+                    f"Cannot subscribe to another identity's inbox: {topic_key}",
+                )
+        elif topic_type == "room":
+            # Must be a member of the room
+            if not db.is_room_member(topic_id, caller_id):
+                raise HTTPException(
+                    403,
+                    f"Not a member of room: {topic_id}",
+                )
+            # Also verify room belongs to this namespace
+            room = db.get_room(topic_id)
+            if room is None or room.get("ns") != ns:
+                raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
+        else:
+            raise HTTPException(
+                400,
+                f"Unknown topic type: {topic_type!r}. Supported: 'inbox', 'room'",
+            )
+
+
+@app.post("/{ns}/subscribe")
+async def subscribe(
+    ns: str,
+    request: SubscribeRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Subscribe to changes on topics within a namespace.
+
+    Clients provide a vector clock (map of topic -> last_seen_mid) and
+    receive notifications when any subscribed topic has new messages.
+
+    **Events, not payloads**: The response tells you *which* topics changed,
+    not the message contents. Use the existing inbox/room endpoints to
+    fetch content, passing the cursor from the event.
+
+    **Modes**:
+    - `poll`: Blocks until an event occurs or timeout. Returns changed topics.
+    - `stream`: Returns Server-Sent Events (SSE) for continuous streaming.
+
+    **Topic format**:
+    - `inbox:{identity_id}` — subscribe to your own inbox
+    - `room:{room_id}` — subscribe to a room you're a member of
+
+    **Auth**: X-Inbox-Secret header required. Must be a valid identity
+    in the namespace.
+    """
+    from .events import get_event_bus
+
+    await _require_active_namespace(ns)
+    caller_id = await _require_inbox_secret_any(ns, x_inbox_secret)
+
+    if not request.topics:
+        raise HTTPException(400, "At least one topic is required")
+
+    await _validate_subscription_topics(ns, request.topics, caller_id)
+
+    event_bus = get_event_bus()
+
+    if request.mode == "stream":
+        # SSE streaming mode
+        async def event_generator():
+            # Send initial connected event
+            yield "event: connected\ndata: {}\n\n"
+
+            try:
+                async for event in event_bus.stream(ns, request.topics):
+                    yield f"event: change\ndata: {json.dumps(event)}\n\n"
+            except asyncio.CancelledError:
+                return
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Poll mode — block until event or timeout
+    changes = await event_bus.subscribe(ns, request.topics, timeout=request.timeout)
+
+    return {
+        "events": changes,
+        "timeout": len(changes) == 0,
+    }
 
 
 # --- Web App Routes ---
@@ -1432,12 +1723,20 @@ def get_metrics(
     """Get application metrics. Requires admin authentication."""
     require_admin(authorization, x_admin_token)
 
-    from .cache import identity_hash_cache, membership_cache, room_cache
+    from .cache import (
+        CACHE_REFRESH_INTERVAL,
+        CACHE_WARMING_ENABLED,
+        identity_hash_cache,
+        membership_cache,
+        room_cache,
+    )
     from .metrics import metrics
 
     return {
         **metrics.to_dict(),
         "caches": {
+            "warming_enabled": CACHE_WARMING_ENABLED,
+            "refresh_interval_seconds": CACHE_REFRESH_INTERVAL,
             "room": room_cache.stats(),
             "membership": membership_cache.stats(),
             "identity_hash": identity_hash_cache.stats(),

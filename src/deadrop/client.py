@@ -324,7 +324,6 @@ class Deaddrop:
         unread_only: bool = False,
         after_mid: str | None = None,
         mark_as_read: bool = True,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         """Get messages for an identity.
 
@@ -335,8 +334,6 @@ class Deaddrop:
             unread_only: Only return unread messages.
             after_mid: Cursor for pagination.
             mark_as_read: Whether to mark messages as read.
-            wait: Long-poll timeout in seconds (0-60). If no messages,
-                  wait up to this many seconds for new messages.
 
         Returns:
             List of messages.
@@ -348,7 +345,6 @@ class Deaddrop:
             unread_only=unread_only,
             after_mid=after_mid,
             mark_as_read=mark_as_read,
-            wait=wait,
         )
 
     def delete_message(
@@ -545,7 +541,6 @@ class Deaddrop:
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
-        wait: int = 0,
     ) -> list[dict[str, Any]]:
         """Get messages from a room.
 
@@ -555,13 +550,12 @@ class Deaddrop:
             secret: Caller's inbox secret (must be a member).
             after_mid: Only get messages after this ID.
             limit: Maximum messages to return.
-            wait: Long-poll timeout in seconds (0-60).
 
         Returns:
             List of message dicts.
         """
         return self._backend.get_room_messages(
-            ns, room_id, secret, after_mid=after_mid, limit=limit, wait=wait
+            ns, room_id, secret, after_mid=after_mid, limit=limit
         )
 
     def update_room_read_cursor(
@@ -602,74 +596,9 @@ class Deaddrop:
         """
         return self._backend.get_room_unread_count(ns, room_id, secret)
 
-    def wait_for_room_messages(
-        self,
-        ns: str,
-        room_id: str,
-        secret: str,
-        timeout: int = 30,
-        after_mid: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Wait for new room messages with long-polling.
+    # wait_for_room_messages removed — use subscribe() for real-time updates
 
-        Convenience wrapper around get_room_messages with wait parameter.
-
-        Args:
-            ns: Namespace ID.
-            room_id: Room ID.
-            secret: Caller's inbox secret.
-            timeout: How long to wait for messages (1-60 seconds).
-            after_mid: Only return messages after this ID.
-
-        Returns:
-            List of messages (may be empty if timeout reached).
-        """
-        return self.get_room_messages(
-            ns=ns,
-            room_id=room_id,
-            secret=secret,
-            after_mid=after_mid,
-            wait=max(1, min(timeout, 60)),
-        )
-
-    def listen_room(
-        self,
-        ns: str,
-        room_id: str,
-        secret: str,
-        timeout: int = 30,
-    ):
-        """Generator that yields room messages as they arrive.
-
-        Uses long-polling to efficiently wait for new messages.
-
-        Args:
-            ns: Namespace ID.
-            room_id: Room ID.
-            secret: Caller's inbox secret.
-            timeout: Long-poll timeout per iteration (1-60 seconds).
-
-        Yields:
-            Messages as they arrive.
-
-        Example:
-            for message in client.listen_room(ns, room_id, secret):
-                print(f"From {message['from_id']}: {message['body']}")
-        """
-        last_mid: str | None = None
-
-        while True:
-            messages = self.wait_for_room_messages(
-                ns=ns,
-                room_id=room_id,
-                secret=secret,
-                timeout=timeout,
-                after_mid=last_mid,
-            )
-
-            for msg in messages:
-                last_mid = msg.get("mid")
-                yield msg
+    # listen_room removed — use subscribe() for real-time updates
 
     # --- Convenience Methods ---
 
@@ -757,94 +686,115 @@ class Deaddrop:
 
     # --- Long-Polling Convenience Methods ---
 
-    def wait_for_messages(
+    # wait_for_messages removed — use subscribe() for real-time updates
+
+    # listen removed — use subscribe() for real-time updates
+
+    # --- Subscription Methods ---
+
+    def subscribe(
         self,
         ns: str,
-        identity_id: str,
         secret: str,
+        topics: dict[str, str | None],
         timeout: int = 30,
-        unread_only: bool = False,
-        after_mid: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Wait for new messages with long-polling.
+    ) -> dict[str, Any]:
+        """Subscribe to topic changes (poll mode).
 
-        Convenience wrapper around get_inbox with wait parameter.
+        Blocks until any subscribed topic has new messages, or timeout.
 
         Args:
             ns: Namespace ID.
-            identity_id: Identity ID.
-            secret: Inbox secret.
-            timeout: How long to wait for messages (1-60 seconds).
-            unread_only: Only return unread messages.
-            after_mid: Only return messages after this ID.
+            secret: Caller's inbox secret.
+            topics: Map of topic_key -> last_seen_mid (None = never seen).
+                Topic keys: "inbox:{identity_id}" or "room:{room_id}"
+            timeout: Max seconds to wait (1-60).
 
         Returns:
-            List of messages (may be empty if timeout reached).
+            dict with:
+                events: Map of changed topic_key -> latest_mid
+                timeout: True if no events before timeout
 
         Example:
-            # Wait up to 30 seconds for new messages
-            messages = client.wait_for_messages(ns, bob["id"], bob["secret"])
-
-            # Wait for unread messages only
-            messages = client.wait_for_messages(ns, bob["id"], bob["secret"], unread_only=True)
-
-            # Wait for messages after a specific ID (useful for streaming)
-            last_mid = messages[-1]["mid"] if messages else None
-            new_messages = client.wait_for_messages(ns, bob["id"], bob["secret"], after_mid=last_mid)
+            result = client.subscribe(ns, secret, {
+                f"inbox:{my_id}": last_inbox_mid,
+                f"room:{room_id}": last_room_mid,
+            })
+            for topic, mid in result["events"].items():
+                print(f"New activity on {topic}")
         """
-        return self.get_inbox(
-            ns=ns,
-            identity_id=identity_id,
-            secret=secret,
-            unread_only=unread_only,
-            after_mid=after_mid,
-            wait=max(1, min(timeout, 60)),
-        )
+        return self._backend.subscribe(ns, secret, topics, timeout)
 
-    def listen(
+    def subscribe_stream(
         self,
         ns: str,
-        identity_id: str,
         secret: str,
-        timeout: int = 30,
-        unread_only: bool = False,
+        topics: dict[str, str | None],
     ):
-        """Generator that yields messages as they arrive.
+        """Subscribe to topic changes (streaming mode).
 
-        Uses long-polling to efficiently wait for new messages.
-        Yields messages one at a time as they arrive.
+        Returns an iterator that yields event dicts as they occur.
 
         Args:
             ns: Namespace ID.
-            identity_id: Identity ID.
-            secret: Inbox secret.
-            timeout: Long-poll timeout per iteration (1-60 seconds).
-            unread_only: Only yield unread messages.
+            secret: Caller's inbox secret.
+            topics: Map of topic_key -> last_seen_mid (None = never seen).
 
         Yields:
-            Messages as they arrive.
+            dicts with 'topic' and 'latest_mid' keys.
 
         Example:
-            for message in client.listen(ns, bob["id"], bob["secret"]):
-                print(f"Got message: {message['body']}")
-                if message["body"] == "quit":
-                    break
+            for event in client.subscribe_stream(ns, secret, topics):
+                print(f"Change on {event['topic']}: {event['latest_mid']}")
         """
-        last_mid: str | None = None
+        yield from self._backend.subscribe_stream(ns, secret, topics)
+
+    def listen_all(
+        self,
+        ns: str,
+        secret: str,
+        topics: dict[str, str | None],
+        timeout: int = 30,
+    ):
+        """Generator that yields topic change events across multiple topics.
+
+        Uses poll-mode subscribe in a loop, yielding (topic, latest_mid) tuples.
+        Automatically updates cursors to avoid re-reporting the same change.
+
+        This is the recommended way to monitor multiple topics (inbox + rooms)
+        simultaneously.
+
+        Args:
+            ns: Namespace ID.
+            secret: Caller's inbox secret.
+            topics: Map of topic_key -> last_seen_mid (None = never seen).
+            timeout: Long-poll timeout per iteration (1-60 seconds).
+
+        Yields:
+            Tuples of (topic_key, latest_mid).
+
+        Example:
+            topics = {
+                f"inbox:{my_id}": None,
+                f"room:{room1_id}": None,
+                f"room:{room2_id}": None,
+            }
+            for topic, mid in client.listen_all(ns, secret, topics):
+                print(f"New activity on {topic} (latest: {mid})")
+                if topic.startswith("inbox:"):
+                    messages = client.get_inbox(ns, my_id, secret, after_mid=mid)
+                elif topic.startswith("room:"):
+                    room_id = topic.split(":", 1)[1]
+                    messages = client.get_room_messages(ns, room_id, secret, after_mid=mid)
+        """
+        cursors = dict(topics)
 
         while True:
-            messages = self.wait_for_messages(
-                ns=ns,
-                identity_id=identity_id,
-                secret=secret,
-                timeout=timeout,
-                unread_only=unread_only,
-                after_mid=last_mid,
-            )
+            result = self.subscribe(ns, secret, cursors, timeout)
 
-            for msg in messages:
-                last_mid = msg["mid"]
-                yield msg
+            for topic, mid in result.get("events", {}).items():
+                cursors[topic] = mid
+                yield topic, mid
 
     # --- Context Manager ---
 
