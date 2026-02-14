@@ -32,7 +32,7 @@
         </div>
     </div>
     
-    <!-- Inbox View -->
+    <!-- Unified Inbox View (1:1 + Rooms) -->
     <div id="view-inbox" class="view hidden">
         <div class="header">
             <a href="/app" class="back-link" id="inbox-back">←</a>
@@ -45,14 +45,8 @@
             </div>
         </div>
         
-        <!-- Tab Bar -->
-        <div class="tab-bar">
-            <a href="#" class="tab active" id="tab-inbox">📥 Inbox</a>
-            <a href="#" class="tab" id="tab-rooms">💬 Rooms <span class="badge hidden" id="rooms-badge">0</span></a>
-        </div>
-        
         <div class="toolbar">
-            <span style="font-weight: 600;" id="inbox-section-title">Inbox</span>
+            <span style="font-weight: 600;" id="inbox-section-title">Messages</span>
             <div class="toolbar-actions">
                 <a href="#" id="archived-link" class="btn btn-small btn-secondary">📦 Archived</a>
                 <button id="compose-btn" class="btn btn-small btn-primary">✏️ Compose</button>
@@ -63,49 +57,12 @@
             <div class="spinner"></div>
         </div>
         
-        <div id="conversation-list"></div>
+        <div id="thread-list"></div>
         
         <div id="inbox-empty" class="empty-state hidden">
             <div class="empty-state-icon">📭</div>
             <div class="empty-state-title">No messages yet</div>
-            <p>Start a conversation with a peer.</p>
-        </div>
-    </div>
-    
-    <!-- Rooms List View -->
-    <div id="view-rooms" class="view hidden">
-        <div class="header">
-            <a href="/app" class="back-link" id="rooms-back">←</a>
-            <div>
-                <h1 id="rooms-title">Namespace</h1>
-                <div class="subtitle" id="rooms-subtitle">as Identity</div>
-            </div>
-            <div style="margin-left: auto;">
-                <a href="#" id="rooms-settings" class="btn btn-icon">⚙️</a>
-            </div>
-        </div>
-        
-        <!-- Tab Bar -->
-        <div class="tab-bar">
-            <a href="#" class="tab" id="tab-inbox-2">📥 Inbox</a>
-            <a href="#" class="tab active" id="tab-rooms-2">💬 Rooms <span class="badge hidden" id="rooms-badge-2">0</span></a>
-        </div>
-        
-        <div class="toolbar">
-            <span style="font-weight: 600;">Rooms</span>
-            <div class="toolbar-actions"></div>
-        </div>
-        
-        <div id="rooms-loading" class="loading hidden">
-            <div class="spinner"></div>
-        </div>
-        
-        <div id="room-list"></div>
-        
-        <div id="rooms-empty" class="empty-state hidden">
-            <div class="empty-state-icon">💬</div>
-            <div class="empty-state-title">No rooms yet</div>
-            <p>You're not a member of any rooms.</p>
+            <p>Start a conversation or join a room.</p>
         </div>
     </div>
     
@@ -232,7 +189,6 @@
     const views = {
         namespaces: document.getElementById('view-namespaces'),
         inbox: document.getElementById('view-inbox'),
-        rooms: document.getElementById('view-rooms'),
         conversation: document.getElementById('view-conversation'),
         roomChat: document.getElementById('view-room-chat'),
         archived: document.getElementById('view-archived'),
@@ -429,34 +385,33 @@
         const nsDisplay = CredentialStore.getNamespace(slug)?.displayName || slug;
         document.getElementById('inbox-title').textContent = nsDisplay;
         document.getElementById('inbox-subtitle').textContent = `as ${credentials.displayName || credentials.id.substring(0, 8)}`;
-        document.getElementById('rooms-title').textContent = nsDisplay;
-        document.getElementById('rooms-subtitle').textContent = `as ${credentials.displayName || credentials.id.substring(0, 8)}`;
         
         showView('inbox');
-        loadInbox();
-        await loadRoomsInBackground();
+        await loadUnifiedInbox();
         // Start unified subscription after we know which rooms we're in
         startSubscription();
     }
     
-    // ==================== INBOX ====================
+    // ==================== UNIFIED INBOX ====================
     
-    async function loadInbox() {
+    async function loadUnifiedInbox() {
         const loading = document.getElementById('inbox-loading');
-        const list = document.getElementById('conversation-list');
+        const list = document.getElementById('thread-list');
         const empty = document.getElementById('inbox-empty');
         
         loading.classList.remove('hidden');
         list.innerHTML = '';
         
         try {
-            const [peersResult, inboxResult] = await Promise.all([
+            const [peersResult, inboxResult, roomsResult] = await Promise.all([
                 DeadropAPI.listPeers(credentials),
                 DeadropAPI.getInbox(credentials),
+                DeadropAPI.listRooms(credentials),
             ]);
             
             peers = peersResult;
             messages = inboxResult.messages;
+            rooms = roomsResult || [];
             
             // Update subscription cursor for inbox
             if (subscriptionManager && messages.length > 0) {
@@ -466,6 +421,7 @@
             
             loading.classList.add('hidden');
             
+            // Build 1:1 conversation threads
             const conversations = {};
             messages.forEach(msg => {
                 const peerId = msg.from === credentials.id ? msg.to : msg.from;
@@ -478,39 +434,84 @@
                 }
             });
             
-            const sorted = Object.values(conversations).sort((a, b) => {
-                const aLatest = a.messages[a.messages.length - 1].created_at;
-                const bLatest = b.messages[b.messages.length - 1].created_at;
-                return new Date(bLatest) - new Date(aLatest);
+            // Build unified thread list
+            const threads = [];
+            
+            // Add 1:1 conversations
+            Object.values(conversations).forEach(conv => {
+                const latest = conv.messages[conv.messages.length - 1];
+                const isSent = latest.from === credentials.id;
+                const preview = isSent ? `You: ${latest.body}` : latest.body;
+                threads.push({
+                    type: 'conversation',
+                    id: conv.peerId,
+                    name: getPeerName(conv.peerId),
+                    preview: preview,
+                    time: latest.created_at,
+                    hasUnread: conv.hasUnread,
+                    expiry: formatExpiry(latest.expires_at, credentials.ttlHours),
+                });
             });
             
-            if (sorted.length === 0) {
+            // Add rooms
+            rooms.forEach(room => {
+                const lastTime = room.last_activity_at || room.created_at;
+                let preview = `${room.member_count || '?'} members`;
+                if (room.last_message_body) {
+                    const senderName = room.last_message_from === credentials.id
+                        ? 'You' : (room.last_message_from?.substring(0, 8) || '?');
+                    preview = `${senderName}: ${room.last_message_body}`;
+                }
+                threads.push({
+                    type: 'room',
+                    id: room.room_id,
+                    name: room.display_name || 'Unnamed Room',
+                    preview: preview,
+                    time: lastTime,
+                    memberCount: room.member_count,
+                });
+            });
+            
+            // Sort by most recent activity
+            threads.sort((a, b) => new Date(b.time) - new Date(a.time));
+            
+            if (threads.length === 0) {
                 empty.classList.remove('hidden');
                 return;
             }
             
             empty.classList.add('hidden');
-            list.innerHTML = sorted.map(conv => {
-                const latest = conv.messages[conv.messages.length - 1];
-                const isSent = latest.from === credentials.id;
-                const preview = isSent ? `You: ${latest.body}` : latest.body;
-                const expiry = formatExpiry(latest.expires_at, credentials.ttlHours);
-                
-                return `
-                    <div class="conversation-item ${conv.hasUnread ? 'unread' : ''}" 
-                         onclick="openConversation('${conv.peerId}')">
-                        ${conv.hasUnread ? '<div class="unread-dot"></div>' : ''}
-                        <div class="conversation-avatar">${getPeerName(conv.peerId)[0].toUpperCase()}</div>
-                        <div class="conversation-content">
-                            <div class="conversation-header">
-                                <span class="conversation-name">${getPeerName(conv.peerId)}</span>
-                                <span class="conversation-time">${formatTime(latest.created_at)}</span>
+            list.innerHTML = threads.map(thread => {
+                if (thread.type === 'conversation') {
+                    return `
+                        <div class="thread-item ${thread.hasUnread ? 'unread' : ''}" 
+                             onclick="openConversation('${thread.id}')">
+                            ${thread.hasUnread ? '<div class="unread-dot"></div>' : ''}
+                            <div class="thread-avatar thread-avatar-peer">${thread.name[0].toUpperCase()}</div>
+                            <div class="thread-content">
+                                <div class="thread-header">
+                                    <span class="thread-name">${thread.name}</span>
+                                    <span class="thread-time">${formatTime(thread.time)}</span>
+                                </div>
+                                <div class="thread-preview">${escapeHtml(thread.preview).substring(0, 60)}${thread.preview.length > 60 ? '...' : ''}</div>
+                                ${thread.expiry ? `<span class="ttl-indicator ttl-${thread.expiry.style}">${thread.expiry.text}</span>` : ''}
                             </div>
-                            <div class="conversation-preview">${preview.substring(0, 50)}${preview.length > 50 ? '...' : ''}</div>
-                            ${expiry ? `<span class="ttl-indicator ttl-${expiry.style}">${expiry.text}</span>` : ''}
                         </div>
-                    </div>
-                `;
+                    `;
+                } else {
+                    return `
+                        <div class="thread-item" onclick="openRoom('${thread.id}')">
+                            <div class="thread-avatar thread-avatar-room">💬</div>
+                            <div class="thread-content">
+                                <div class="thread-header">
+                                    <span class="thread-name">${escapeHtml(thread.name)}</span>
+                                    <span class="thread-time">${formatTime(thread.time)}</span>
+                                </div>
+                                <div class="thread-preview">${escapeHtml(thread.preview).substring(0, 60)}${thread.preview.length > 60 ? '...' : ''}</div>
+                            </div>
+                        </div>
+                    `;
+                }
             }).join('');
             
         } catch (e) {
@@ -597,64 +598,6 @@
     }
     
     // ==================== ROOMS ====================
-    
-    async function loadRoomsInBackground() {
-        try {
-            const result = await DeadropAPI.listRooms(credentials);
-            rooms = result || [];
-            
-            // Update badge if there are rooms
-            const badge = document.getElementById('rooms-badge');
-            const badge2 = document.getElementById('rooms-badge-2');
-            if (rooms.length > 0) {
-                // Count total unread (we'd need unread API for this)
-                // For now, just show count
-                badge.classList.add('hidden');
-                badge2.classList.add('hidden');
-            }
-        } catch (e) {
-            console.error('Failed to load rooms:', e);
-        }
-    }
-    
-    async function loadRooms() {
-        const loading = document.getElementById('rooms-loading');
-        const list = document.getElementById('room-list');
-        const empty = document.getElementById('rooms-empty');
-        
-        loading.classList.remove('hidden');
-        list.innerHTML = '';
-        
-        try {
-            const result = await DeadropAPI.listRooms(credentials);
-            rooms = result || [];
-            
-            loading.classList.add('hidden');
-            
-            if (rooms.length === 0) {
-                empty.classList.remove('hidden');
-                return;
-            }
-            
-            empty.classList.add('hidden');
-            list.innerHTML = rooms.map(room => `
-                <div class="room-item" onclick="openRoom('${room.room_id}')">
-                    <div class="room-icon">💬</div>
-                    <div class="room-content">
-                        <div class="room-header">
-                            <span class="room-name">${room.display_name || 'Unnamed Room'}</span>
-                            <span class="room-time">${room.created_at ? formatTime(room.created_at) : ''}</span>
-                        </div>
-                        <div class="room-preview">${room.member_count || '?'} members</div>
-                    </div>
-                </div>
-            `).join('');
-            
-        } catch (e) {
-            loading.classList.add('hidden');
-            list.innerHTML = `<div class="error-message">${e.message}</div>`;
-        }
-    }
     
     async function openRoom(roomId) {
         currentRoomId = roomId;
@@ -949,15 +892,10 @@
             console.log(`[subscription] event on ${topic}: ${latestMid}`);
             
             if (topic === `inbox:${credentials.id}`) {
-                // Inbox has new messages — refresh if viewing inbox
+                // Inbox has new messages — refresh if viewing unified inbox
                 const inboxView = document.getElementById('view-inbox');
                 if (!inboxView.classList.contains('hidden')) {
-                    loadInbox();
-                }
-                // Could show a badge on inbox tab if viewing rooms
-                const tabInbox = document.getElementById('tab-inbox');
-                if (tabInbox && inboxView.classList.contains('hidden')) {
-                    tabInbox.style.fontWeight = 'bold';
+                    loadUnifiedInbox();
                 }
             } else if (topic.startsWith('room:')) {
                 const roomId = topic.substring(5);
@@ -1060,31 +998,10 @@
         try {
             await DeadropAPI.sendMessage(credentials, to, body);
             hideCompose();
-            loadInbox();
+            loadUnifiedInbox();
         } catch (e) {
             alert('Failed to send: ' + e.message);
         }
-    }
-    
-    // ==================== TAB NAVIGATION ====================
-    
-    function switchToInbox({ pushState = true } = {}) {
-        document.getElementById('tab-inbox').classList.add('active');
-        document.getElementById('tab-inbox-2').classList.add('active');
-        document.getElementById('tab-rooms').classList.remove('active');
-        document.getElementById('tab-rooms-2').classList.remove('active');
-        showView('inbox');
-        if (pushState) history.pushState({}, '', `/app/${currentSlug}`);
-    }
-    
-    function switchToRooms({ pushState = true } = {}) {
-        document.getElementById('tab-inbox').classList.remove('active');
-        document.getElementById('tab-inbox-2').classList.remove('active');
-        document.getElementById('tab-rooms').classList.add('active');
-        document.getElementById('tab-rooms-2').classList.add('active');
-        showView('rooms');
-        loadRooms();
-        if (pushState) history.pushState({}, '', `/app/${currentSlug}/rooms`);
     }
     
     // ==================== EVENT LISTENERS ====================
@@ -1095,15 +1012,6 @@
     });
     
     document.getElementById('inbox-back').addEventListener('click', (e) => {
-        e.preventDefault();
-        history.pushState({}, '', '/app');
-        currentSlug = null;
-        stopSubscription();
-        showView('namespaces');
-        renderNamespaceList();
-    });
-    
-    document.getElementById('rooms-back').addEventListener('click', (e) => {
         e.preventDefault();
         history.pushState({}, '', '/app');
         currentSlug = null;
@@ -1124,14 +1032,9 @@
         currentRoomId = null;
         roomMessages = [];
         roomMembers = {};
-        switchToRooms();
+        history.pushState({}, '', `/app/${currentSlug}`);
+        showView('inbox');
     });
-    
-    // Tab navigation
-    document.getElementById('tab-inbox').addEventListener('click', (e) => { e.preventDefault(); switchToInbox(); });
-    document.getElementById('tab-inbox-2').addEventListener('click', (e) => { e.preventDefault(); switchToInbox(); });
-    document.getElementById('tab-rooms').addEventListener('click', (e) => { e.preventDefault(); switchToRooms(); });
-    document.getElementById('tab-rooms-2').addEventListener('click', (e) => { e.preventDefault(); switchToRooms(); });
     
     document.getElementById('compose-btn').addEventListener('click', showCompose);
     document.getElementById('compose-cancel').addEventListener('click', hideCompose);
@@ -1254,27 +1157,15 @@
             }
             document.getElementById('archived-link').click();
         } else if (path.match(/^\/app\/([^/]+)\/([^/]+)$/)) {
-            // Could be peer conversation or rooms view
-            const [, slug, second] = path.match(/^\/app\/([^/]+)\/([^/]+)$/);
-            if (second === 'rooms') {
-                if (slug !== currentSlug) {
-                    openNamespace(slug).then(() => switchToRooms({ pushState: false }));
-                } else {
-                    currentRoomId = null;
-                    roomMessages = [];
-                    roomMembers = {};
-                    switchToRooms({ pushState: false });
-                }
+            // Peer conversation
+            const [, slug, peerId] = path.match(/^\/app\/([^/]+)\/([^/]+)$/);
+            if (slug !== currentSlug) {
+                openNamespace(slug).then(() => openConversation(peerId));
             } else {
-                // Peer conversation
-                if (slug !== currentSlug) {
-                    openNamespace(slug).then(() => openConversation(second));
-                } else {
-                    openConversation(second);
-                }
+                openConversation(peerId);
             }
         } else if (path.match(/^\/app\/([^/]+)$/)) {
-            // Namespace inbox view
+            // Namespace unified inbox view
             const [, slug] = path.match(/^\/app\/([^/]+)$/);
             currentRoomId = null;
             currentPeerId = null;
