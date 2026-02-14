@@ -1710,7 +1710,15 @@ def list_rooms_for_identity(
         """SELECT r.room_id, r.ns, r.display_name, r.created_by, r.created_at,
                   m.joined_at, m.last_read_mid,
                   (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.room_id)
-                      AS member_count
+                      AS member_count,
+                  (SELECT MAX(rm2.created_at) FROM room_messages rm2
+                   WHERE rm2.room_id = r.room_id) AS last_activity_at,
+                  (SELECT rm3.body FROM room_messages rm3
+                   WHERE rm3.room_id = r.room_id
+                   ORDER BY rm3.mid DESC LIMIT 1) AS last_message_body,
+                  (SELECT rm4.from_id FROM room_messages rm4
+                   WHERE rm4.room_id = r.room_id
+                   ORDER BY rm4.mid DESC LIMIT 1) AS last_message_from
            FROM rooms r
            JOIN room_members m ON r.room_id = m.room_id
            WHERE r.ns = ? AND m.identity_id = ?

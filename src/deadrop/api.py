@@ -1100,6 +1100,9 @@ class RoomWithMemberInfo(BaseModel):
     joined_at: str
     last_read_mid: str | None
     member_count: int | None = None
+    last_activity_at: str | None = None
+    last_message_body: str | None = None
+    last_message_from: str | None = None
 
 
 class AddRoomMemberRequest(BaseModel):
