@@ -60,6 +60,16 @@ _db_config: dict[str, Any] = {
 _conn: sqlite3.Connection | None = None
 _is_libsql: bool = False
 
+
+def is_using_libsql() -> bool:
+    """Check if the database backend is libsql/Turso.
+
+    This is used by the API layer to determine whether DB operations need
+    to be serialized (libsql uses a single shared connection).
+    """
+    return _is_libsql or os.environ.get("TURSO_URL", "").startswith("libsql://")
+
+
 # Lock for thread-safe libsql reconnection
 _libsql_lock = threading.Lock()
 

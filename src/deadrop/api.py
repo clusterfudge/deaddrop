@@ -330,10 +330,40 @@ def require_active_namespace(ns: str) -> None:
 # they keep using the sync versions above directly.
 
 
+def _get_db_executor():
+    """Get the appropriate executor for DB operations.
+
+    Returns a single-threaded executor when using libsql/Turso (which uses
+    a single shared connection that isn't thread-safe), or None to use the
+    default threadpool for local SQLite (which uses thread-local connections).
+    """
+    global _db_executor
+    if _db_executor is not None:
+        return _db_executor
+
+    if db.is_using_libsql():
+        from concurrent.futures import ThreadPoolExecutor
+
+        _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+        logger.info("Using serialized DB executor for libsql/Turso")
+    else:
+        _db_executor = None  # Use default threadpool for local SQLite
+        logger.info("Using default threadpool for local SQLite")
+
+    return _db_executor
+
+
+_db_executor = None  # Initialized lazily
+
+
 async def _run_sync(fn, *args):
-    """Run a synchronous function in the default executor (threadpool)."""
+    """Run a synchronous function off the event loop.
+
+    Uses a single-threaded executor for libsql/Turso (shared connection)
+    or the default threadpool for local SQLite (thread-local connections).
+    """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, fn, *args)
+    return await loop.run_in_executor(_get_db_executor(), fn, *args)
 
 
 async def _require_active_namespace(ns: str) -> None:
