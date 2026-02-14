@@ -485,12 +485,9 @@ def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
 
 def _migrate_003_add_reference_mid(conn: sqlite3.Connection) -> None:
     """Migration 003: Add reference_mid column to room_messages for reactions."""
+    conn.execute("ALTER TABLE room_messages ADD COLUMN reference_mid TEXT")
     conn.execute(
-        "ALTER TABLE room_messages ADD COLUMN reference_mid TEXT"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_room_messages_reference "
-        "ON room_messages(reference_mid)"
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_reference ON room_messages(reference_mid)"
     )
     conn.commit()
 
