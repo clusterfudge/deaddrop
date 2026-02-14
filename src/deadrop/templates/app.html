@@ -202,6 +202,7 @@
     let rooms = [];
     let roomMessages = [];
     let roomMembers = {};
+    let roomMessagesLoading = false;  // Guard against concurrent fetches
     // Legacy long-poll removed — subscriptions are the sole update mechanism
     let subscriptionManager = null;  // Unified subscription manager
     
@@ -572,6 +573,7 @@
     
     async function loadRoomMessages() {
         const list = document.getElementById('room-message-list');
+        roomMessagesLoading = true;
         
         // Try loading from cache first for instant display
         const cacheKey = `room_messages_${currentRoomId}`;
@@ -610,6 +612,8 @@
             if (!cached) {
                 list.innerHTML = `<div class="error-message">${e.message}</div>`;
             }
+        } finally {
+            roomMessagesLoading = false;
         }
     }
     
@@ -757,7 +761,15 @@
      * Fetch only new room messages (incremental update).
      */
     async function fetchNewRoomMessages(roomId) {
+        // Skip if a full load is in progress — it will get all messages
+        if (roomMessagesLoading) {
+            console.log('[fetchNew] skipped — full load in progress');
+            return;
+        }
         try {
+            // Deduplicate: use a Set of existing mids
+            const existingMids = new Set(roomMessages.map(m => m.mid));
+            
             const afterMid = roomMessages.length > 0 
                 ? roomMessages[roomMessages.length - 1].mid 
                 : null;
@@ -765,12 +777,16 @@
             const result = await DeadropAPI.getRoomMessages(credentials, roomId, { afterMid });
             
             if (result?.messages?.length > 0) {
-                roomMessages = [...roomMessages, ...result.messages];
-                const cacheKey = `room_messages_${roomId}`;
-                localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
-                renderRoomMessages();
+                // Filter out any messages we already have (including pending/optimistic)
+                const newMsgs = result.messages.filter(m => !existingMids.has(m.mid));
+                if (newMsgs.length > 0) {
+                    roomMessages = [...roomMessages, ...newMsgs];
+                    const cacheKey = `room_messages_${roomId}`;
+                    localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
+                    renderRoomMessages();
+                }
                 
-                // Update subscription cursor
+                // Update subscription cursor (always, even if deduplicated)
                 if (subscriptionManager) {
                     const lastMid = result.messages[result.messages.length - 1].mid;
                     subscriptionManager.updateCursor(`room:${roomId}`, lastMid);
