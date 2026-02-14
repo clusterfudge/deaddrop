@@ -190,6 +190,25 @@
         </div>
     </div>
 </div>
+
+<!-- Image lightbox overlay -->
+<div id="image-lightbox" class="hidden" onclick="closeLightbox()" style="
+    position: fixed; inset: 0; z-index: 2000;
+    background: rgba(0,0,0,0.9);
+    display: flex; align-items: center; justify-content: center;
+    cursor: zoom-out;
+">
+    <button onclick="closeLightbox()" style="
+        position: absolute; top: 16px; right: 16px;
+        background: none; border: none; color: white;
+        font-size: 32px; cursor: pointer; z-index: 2001;
+    ">✕</button>
+    <img id="lightbox-img" src="" alt="" style="
+        max-width: 95vw; max-height: 95vh;
+        object-fit: contain; border-radius: 4px;
+        cursor: default;
+    " onclick="event.stopPropagation()" />
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -261,6 +280,98 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+    
+    // ==================== MARKDOWN RENDERING ====================
+    
+    // Configure marked for GitHub Flavored Markdown
+    const markedInstance = new marked.Marked({
+        breaks: true,      // Convert \n to <br>
+        gfm: true,         // GitHub Flavored Markdown (tables, strikethrough, etc.)
+        renderer: (() => {
+            const renderer = new marked.Renderer();
+            
+            // Images: render as clickable thumbnails for lightbox preview
+            renderer.image = function({ href, title, text }) {
+                const alt = escapeHtml(text || '');
+                const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+                return `<img src="${escapeHtml(href)}" alt="${alt}"${titleAttr} class="md-image" loading="lazy" onclick="openLightbox(this)" />`;
+            };
+            
+            // Links: open in new tab
+            renderer.link = function({ href, title, text }) {
+                const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+                return `<a href="${escapeHtml(href)}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+            };
+            
+            return renderer;
+        })(),
+    });
+    
+    /**
+     * Render message body with markdown support.
+     * Only renders markdown for text/markdown content_type;
+     * text/plain is escaped and shown as-is.
+     */
+    function renderMessageBody(body, contentType) {
+        if (!body) return '';
+        
+        if (contentType === 'text/markdown') {
+            try {
+                const rawHtml = markedInstance.parse(body);
+                // Sanitize to prevent XSS but allow safe tags
+                return DOMPurify.sanitize(rawHtml, {
+                    ALLOWED_TAGS: [
+                        'p', 'br', 'strong', 'em', 'b', 'i', 'u', 's', 'del',
+                        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                        'ul', 'ol', 'li',
+                        'pre', 'code', 'blockquote',
+                        'a', 'img',
+                        'table', 'thead', 'tbody', 'tr', 'th', 'td',
+                        'hr', 'span', 'div', 'sup', 'sub',
+                    ],
+                    ALLOWED_ATTR: [
+                        'href', 'src', 'alt', 'title', 'class', 'target', 'rel',
+                        'loading', 'onclick',
+                    ],
+                });
+            } catch (e) {
+                console.warn('Markdown render failed, falling back to plain text:', e);
+                return escapeHtml(body);
+            }
+        }
+        
+        // text/plain or no content_type: escape and convert newlines
+        return escapeHtml(body).replace(/\n/g, '<br>');
+    }
+    
+    /**
+     * Apply syntax highlighting to all code blocks in a container.
+     * Call after inserting rendered markdown HTML into the DOM.
+     */
+    function highlightCodeBlocks(container) {
+        if (typeof hljs === 'undefined') return;
+        container.querySelectorAll('pre code').forEach(block => {
+            hljs.highlightElement(block);
+        });
+    }
+    
+    /**
+     * Open image in a fullscreen lightbox overlay.
+     */
+    function openLightbox(imgEl) {
+        const overlay = document.getElementById('image-lightbox');
+        const lightboxImg = document.getElementById('lightbox-img');
+        lightboxImg.src = imgEl.src;
+        lightboxImg.alt = imgEl.alt;
+        overlay.classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+    }
+    
+    function closeLightbox() {
+        const overlay = document.getElementById('image-lightbox');
+        overlay.classList.add('hidden');
+        document.body.style.overflow = '';
     }
     
     function getPeerName(id) {
@@ -429,7 +540,7 @@
             
             return `
                 <div class="message ${isSent ? 'message-sent' : 'message-received'}">
-                    <div class="message-body">${msg.body}</div>
+                    <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
                     <div class="message-meta">
                         <span>${formatTime(msg.created_at)}</span>
                         ${expiry ? `<span class="ttl-indicator ttl-${expiry.style}">${expiry.text}</span>` : ''}
@@ -442,6 +553,7 @@
             `;
         }).join('');
         
+        highlightCodeBlocks(list);
         list.scrollTop = list.scrollHeight;
     }
     
@@ -648,13 +760,16 @@
             return `
                 <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}">
                     <div class="sender-name">${getMemberName(msg.from_id)}</div>
-                    <div class="message-body">${escapeHtml(msg.body)}</div>
+                    <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
                     <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
                 </div>
             `;
         }).join('');
         
         // No need to scroll - column-reverse keeps us at bottom
+        
+        // Apply syntax highlighting to code blocks
+        highlightCodeBlocks(list);
         
         // Update read cursor (skip pending messages)
         const realMessages = roomMessages.filter(m => !m.pending);
