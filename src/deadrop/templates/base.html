@@ -5,11 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Deadrop{% endblock %}</title>
     <link rel="stylesheet" href="/static/css/style.css">
+    <!-- Markdown rendering: highlight.js theme -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github.min.css" />
     {% block head %}{% endblock %}
 </head>
 <body>
     {% block body %}{% endblock %}
     
+    <!-- Markdown rendering libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.3.1/dist/purify.min.js"></script>
+
     <script src="/static/js/crypto.js"></script>
     <script src="/static/js/credentials.js"></script>
     <script src="/static/js/api.js"></script>

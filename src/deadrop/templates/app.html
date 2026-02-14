@@ -133,6 +133,9 @@
                 <h1 id="room-chat-title">Room</h1>
                 <div class="subtitle" id="room-chat-members"></div>
             </div>
+            <div style="margin-left: auto;">
+                <button id="room-refresh-btn" class="btn btn-icon" title="Refresh messages">🔄</button>
+            </div>
         </div>
         
         <div id="room-message-list" class="message-list"></div>
@@ -186,6 +189,25 @@
             </div>
         </div>
     </div>
+</div>
+
+<!-- Image lightbox overlay -->
+<div id="image-lightbox" class="hidden" onclick="closeLightbox()" style="
+    position: fixed; inset: 0; z-index: 2000;
+    background: rgba(0,0,0,0.9);
+    display: flex; align-items: center; justify-content: center;
+    cursor: zoom-out;
+">
+    <button onclick="closeLightbox()" style="
+        position: absolute; top: 16px; right: 16px;
+        background: none; border: none; color: white;
+        font-size: 32px; cursor: pointer; z-index: 2001;
+    ">✕</button>
+    <img id="lightbox-img" src="" alt="" style="
+        max-width: 95vw; max-height: 95vh;
+        object-fit: contain; border-radius: 4px;
+        cursor: default;
+    " onclick="event.stopPropagation()" />
 </div>
 {% endblock %}
 
@@ -260,6 +282,98 @@
         return div.innerHTML;
     }
     
+    // ==================== MARKDOWN RENDERING ====================
+    
+    // Configure marked for GitHub Flavored Markdown
+    const markedInstance = new marked.Marked({
+        breaks: true,      // Convert \n to <br>
+        gfm: true,         // GitHub Flavored Markdown (tables, strikethrough, etc.)
+        renderer: (() => {
+            const renderer = new marked.Renderer();
+            
+            // Images: render as clickable thumbnails for lightbox preview
+            renderer.image = function({ href, title, text }) {
+                const alt = escapeHtml(text || '');
+                const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+                return `<img src="${escapeHtml(href)}" alt="${alt}"${titleAttr} class="md-image" loading="lazy" onclick="openLightbox(this)" />`;
+            };
+            
+            // Links: open in new tab
+            renderer.link = function({ href, title, text }) {
+                const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+                return `<a href="${escapeHtml(href)}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+            };
+            
+            return renderer;
+        })(),
+    });
+    
+    /**
+     * Render message body with markdown support.
+     * Only renders markdown for text/markdown content_type;
+     * text/plain is escaped and shown as-is.
+     */
+    function renderMessageBody(body, contentType) {
+        if (!body) return '';
+        
+        if (contentType === 'text/markdown') {
+            try {
+                const rawHtml = markedInstance.parse(body);
+                // Sanitize to prevent XSS but allow safe tags
+                return DOMPurify.sanitize(rawHtml, {
+                    ALLOWED_TAGS: [
+                        'p', 'br', 'strong', 'em', 'b', 'i', 'u', 's', 'del',
+                        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                        'ul', 'ol', 'li',
+                        'pre', 'code', 'blockquote',
+                        'a', 'img',
+                        'table', 'thead', 'tbody', 'tr', 'th', 'td',
+                        'hr', 'span', 'div', 'sup', 'sub',
+                    ],
+                    ALLOWED_ATTR: [
+                        'href', 'src', 'alt', 'title', 'class', 'target', 'rel',
+                        'loading', 'onclick',
+                    ],
+                });
+            } catch (e) {
+                console.warn('Markdown render failed, falling back to plain text:', e);
+                return escapeHtml(body);
+            }
+        }
+        
+        // text/plain or no content_type: escape and convert newlines
+        return escapeHtml(body).replace(/\n/g, '<br>');
+    }
+    
+    /**
+     * Apply syntax highlighting to all code blocks in a container.
+     * Call after inserting rendered markdown HTML into the DOM.
+     */
+    function highlightCodeBlocks(container) {
+        if (typeof hljs === 'undefined') return;
+        container.querySelectorAll('pre code').forEach(block => {
+            hljs.highlightElement(block);
+        });
+    }
+    
+    /**
+     * Open image in a fullscreen lightbox overlay.
+     */
+    function openLightbox(imgEl) {
+        const overlay = document.getElementById('image-lightbox');
+        const lightboxImg = document.getElementById('lightbox-img');
+        lightboxImg.src = imgEl.src;
+        lightboxImg.alt = imgEl.alt;
+        overlay.classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+    }
+    
+    function closeLightbox() {
+        const overlay = document.getElementById('image-lightbox');
+        overlay.classList.add('hidden');
+        document.body.style.overflow = '';
+    }
+    
     function getPeerName(id) {
         const peer = peers.find(p => p.id === id);
         return peer?.metadata?.display_name || id.substring(0, 8) + '...';
@@ -268,7 +382,7 @@
     function getMemberName(id) {
         if (id === credentials?.id) return 'You';
         const member = roomMembers[id];
-        return member?.display_name || id.substring(0, 8) + '...';
+        return member?.metadata?.display_name || member?.display_name || id.substring(0, 8) + '...';
     }
     
     // ==================== NAMESPACE LIST ====================
@@ -426,7 +540,7 @@
             
             return `
                 <div class="message ${isSent ? 'message-sent' : 'message-received'}">
-                    <div class="message-body">${msg.body}</div>
+                    <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
                     <div class="message-meta">
                         <span>${formatTime(msg.created_at)}</span>
                         ${expiry ? `<span class="ttl-indicator ttl-${expiry.style}">${expiry.text}</span>` : ''}
@@ -439,6 +553,7 @@
             `;
         }).join('');
         
+        highlightCodeBlocks(list);
         list.scrollTop = list.scrollHeight;
     }
     
@@ -592,11 +707,26 @@
         
         try {
             const startTime = performance.now();
-            const result = await DeadropAPI.getRoomMessages(credentials, currentRoomId);
-            const elapsed = Math.round(performance.now() - startTime);
-            console.log(`Room messages loaded in ${elapsed}ms`);
             
-            roomMessages = result?.messages || [];
+            // Paginate to fetch ALL messages (server default limit is 100)
+            const PAGE_SIZE = 500;
+            let allMessages = [];
+            let afterMid = null;
+            
+            while (true) {
+                const result = await DeadropAPI.getRoomMessages(
+                    credentials, currentRoomId, { afterMid, limit: PAGE_SIZE });
+                const page = result?.messages || [];
+                allMessages = [...allMessages, ...page];
+                
+                if (page.length < PAGE_SIZE) break;  // Last page
+                afterMid = page[page.length - 1].mid;
+            }
+            
+            const elapsed = Math.round(performance.now() - startTime);
+            console.log(`Room messages loaded in ${elapsed}ms (${allMessages.length} msgs)`);
+            
+            roomMessages = allMessages;
             
             // Save to cache
             localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
@@ -630,13 +760,16 @@
             return `
                 <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}">
                     <div class="sender-name">${getMemberName(msg.from_id)}</div>
-                    <div class="message-body">${escapeHtml(msg.body)}</div>
+                    <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
                     <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
                 </div>
             `;
         }).join('');
         
         // No need to scroll - column-reverse keeps us at bottom
+        
+        // Apply syntax highlighting to code blocks
+        highlightCodeBlocks(list);
         
         // Update read cursor (skip pending messages)
         const realMessages = roomMessages.filter(m => !m.pending);
@@ -835,23 +968,23 @@
     
     // ==================== TAB NAVIGATION ====================
     
-    function switchToInbox() {
+    function switchToInbox({ pushState = true } = {}) {
         document.getElementById('tab-inbox').classList.add('active');
         document.getElementById('tab-inbox-2').classList.add('active');
         document.getElementById('tab-rooms').classList.remove('active');
         document.getElementById('tab-rooms-2').classList.remove('active');
         showView('inbox');
-        history.pushState({}, '', `/app/${currentSlug}`);
+        if (pushState) history.pushState({}, '', `/app/${currentSlug}`);
     }
     
-    function switchToRooms() {
+    function switchToRooms({ pushState = true } = {}) {
         document.getElementById('tab-inbox').classList.remove('active');
         document.getElementById('tab-inbox-2').classList.remove('active');
         document.getElementById('tab-rooms').classList.add('active');
         document.getElementById('tab-rooms-2').classList.add('active');
         showView('rooms');
         loadRooms();
-        history.pushState({}, '', `/app/${currentSlug}/rooms`);
+        if (pushState) history.pushState({}, '', `/app/${currentSlug}/rooms`);
     }
     
     // ==================== EVENT LISTENERS ====================
@@ -889,6 +1022,8 @@
     document.getElementById('room-chat-back').addEventListener('click', (e) => {
         e.preventDefault();
         currentRoomId = null;
+        roomMessages = [];
+        roomMembers = {};
         switchToRooms();
     });
     
@@ -908,6 +1043,18 @@
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendMessage();
+        }
+    });
+    
+    document.getElementById('room-refresh-btn').addEventListener('click', async () => {
+        const btn = document.getElementById('room-refresh-btn');
+        btn.disabled = true;
+        btn.style.animation = 'spin 0.6s linear infinite';
+        try {
+            await loadRoomMessages();
+        } finally {
+            btn.disabled = false;
+            btn.style.animation = '';
         }
     });
     
@@ -971,6 +1118,75 @@
             alert('Failed to restore: ' + e.message);
         }
     }
+    
+    // ==================== BROWSER NAVIGATION ====================
+    
+    /**
+     * Handle browser back/forward navigation.
+     * Parses the current URL and shows the appropriate view.
+     */
+    window.addEventListener('popstate', () => {
+        const path = window.location.pathname;
+        
+        if (path === '/app' || path === '/app/') {
+            // Namespace list
+            currentSlug = null;
+            currentRoomId = null;
+            currentPeerId = null;
+            roomMessages = [];
+            roomMembers = {};
+            stopSubscription();
+            showView('namespaces');
+            renderNamespaceList();
+        } else if (path.match(/^\/app\/([^/]+)\/room\/([^/]+)$/)) {
+            // Room view
+            const [, slug, roomId] = path.match(/^\/app\/([^/]+)\/room\/([^/]+)$/);
+            if (slug !== currentSlug) {
+                openNamespace(slug).then(() => openRoom(roomId));
+            } else {
+                openRoom(roomId);
+            }
+        } else if (path.match(/^\/app\/([^/]+)\/archived$/)) {
+            // Archived view
+            const [, slug] = path.match(/^\/app\/([^/]+)\/archived$/);
+            if (slug !== currentSlug) {
+                openNamespace(slug);
+            }
+            document.getElementById('archived-link').click();
+        } else if (path.match(/^\/app\/([^/]+)\/([^/]+)$/)) {
+            // Could be peer conversation or rooms view
+            const [, slug, second] = path.match(/^\/app\/([^/]+)\/([^/]+)$/);
+            if (second === 'rooms') {
+                if (slug !== currentSlug) {
+                    openNamespace(slug).then(() => switchToRooms({ pushState: false }));
+                } else {
+                    currentRoomId = null;
+                    roomMessages = [];
+                    roomMembers = {};
+                    switchToRooms({ pushState: false });
+                }
+            } else {
+                // Peer conversation
+                if (slug !== currentSlug) {
+                    openNamespace(slug).then(() => openConversation(second));
+                } else {
+                    openConversation(second);
+                }
+            }
+        } else if (path.match(/^\/app\/([^/]+)$/)) {
+            // Namespace inbox view
+            const [, slug] = path.match(/^\/app\/([^/]+)$/);
+            currentRoomId = null;
+            currentPeerId = null;
+            roomMessages = [];
+            roomMembers = {};
+            if (slug !== currentSlug) {
+                openNamespace(slug);
+            } else {
+                showView('inbox');
+            }
+        }
+    });
     
     // ==================== INITIALIZE ====================
     
