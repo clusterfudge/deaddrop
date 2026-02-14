@@ -319,10 +319,9 @@
         
         showView('inbox');
         loadInbox();
-        loadRoomsInBackground().then(() => {
-            // Start unified subscription after we know which rooms we're in
-            startSubscription();
-        });
+        await loadRoomsInBackground();
+        // Start unified subscription after we know which rooms we're in
+        startSubscription();
     }
     
     // ==================== INBOX ====================
