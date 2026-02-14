@@ -43,7 +43,7 @@ from .auth import derive_id, generate_secret, hash_secret
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -483,10 +483,23 @@ def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_003_add_reference_mid(conn: sqlite3.Connection) -> None:
+    """Migration 003: Add reference_mid column to room_messages for reactions."""
+    conn.execute(
+        "ALTER TABLE room_messages ADD COLUMN reference_mid TEXT"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_reference "
+        "ON room_messages(reference_mid)"
+    )
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
     (2, "Add rooms tables for group communication", _migrate_002_add_rooms),
+    (3, "Add reference_mid to room_messages for reactions", _migrate_003_add_reference_mid),
 ]
 
 
@@ -1872,6 +1885,7 @@ def send_room_message(
     from_id: str,
     body: str,
     content_type: str = "text/plain",
+    reference_mid: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> dict:
     """Send a message to a room.
@@ -1881,6 +1895,7 @@ def send_room_message(
         from_id: Sender identity ID (must be a member)
         body: Message body
         content_type: Content type (default: text/plain)
+        reference_mid: Optional message ID this message references (e.g. for reactions)
         conn: Optional database connection
 
     Returns:
@@ -1904,9 +1919,10 @@ def send_room_message(
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
-        """INSERT INTO room_messages (mid, room_id, from_id, body, content_type, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (mid, room_id, from_id, body, content_type, now),
+        """INSERT INTO room_messages
+               (mid, room_id, from_id, body, content_type, reference_mid, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (mid, room_id, from_id, body, content_type, reference_mid, now),
     )
     conn.commit()
 
@@ -1916,6 +1932,7 @@ def send_room_message(
         "from": from_id,
         "body": body,
         "content_type": content_type,
+        "reference_mid": reference_mid,
         "created_at": now,
     }
 
