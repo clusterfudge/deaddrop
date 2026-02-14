@@ -1988,7 +1988,7 @@ def get_room_messages(
     conn = _get_conn(conn)
 
     query = """
-        SELECT mid, room_id, from_id, body, content_type, created_at
+        SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
         FROM room_messages
         WHERE room_id = ?
     """
@@ -2011,6 +2011,7 @@ def get_room_messages(
             "from": row["from_id"],
             "body": row["body"],
             "content_type": row.get("content_type") or "text/plain",
+            "reference_mid": row.get("reference_mid"),
             "created_at": row["created_at"],
         }
         for row in rows
@@ -2034,7 +2035,7 @@ def get_room_message(
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
-        """SELECT mid, room_id, from_id, body, content_type, created_at
+        """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
            FROM room_messages WHERE room_id = ? AND mid = ?""",
         (room_id, mid),
     )
@@ -2047,6 +2048,7 @@ def get_room_message(
             "from": row["from_id"],
             "body": row["body"],
             "content_type": row.get("content_type") or "text/plain",
+            "reference_mid": row.get("reference_mid"),
             "created_at": row["created_at"],
         }
     return None
