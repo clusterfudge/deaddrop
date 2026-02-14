@@ -736,12 +736,19 @@ textarea.form-input {
     font-size: 12px;
     color: var(--text-muted);
     padding: 2px 6px;
-    opacity: 0;
+    opacity: 0.4;
     transition: opacity 0.15s ease;
 }
 
 .room-message:hover .reaction-badge.add-reaction {
     opacity: 1;
+}
+
+/* Touch devices: always show the add-reaction button since there's no hover */
+@media (hover: none) {
+    .reaction-badge.add-reaction {
+        opacity: 0.6;
+    }
 }
 
 /* From-me reactions: adjust for blue bubble context */

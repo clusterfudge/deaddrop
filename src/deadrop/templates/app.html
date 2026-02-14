@@ -844,14 +844,17 @@
             `<button class="reaction-picker-btn" onclick="pickReaction(event, '${targetMid}', '${emoji}')">${emoji}</button>`
         ).join('');
         
-        // Position near the click
-        const rect = event.target.getBoundingClientRect();
-        picker.style.position = 'fixed';
-        picker.style.left = Math.min(rect.left, window.innerWidth - 250) + 'px';
-        picker.style.top = (rect.top - 44) + 'px';
-        picker.style.zIndex = '1500';
-        
+        // Position near the click, clamped to viewport
         document.body.appendChild(picker);
+        const rect = event.target.getBoundingClientRect();
+        const pickerRect = picker.getBoundingClientRect();
+        const left = Math.max(8, Math.min(rect.left, window.innerWidth - pickerRect.width - 8));
+        let top = rect.top - pickerRect.height - 4;
+        if (top < 8) top = rect.bottom + 4;  // flip below if no room above
+        picker.style.position = 'fixed';
+        picker.style.left = left + 'px';
+        picker.style.top = top + 'px';
+        picker.style.zIndex = '1500';
         
         // Close on click outside
         const close = (e) => {
