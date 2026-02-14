@@ -132,14 +132,12 @@ const DeadropAPI = {
      * @param {object} options - Optional parameters
      * @param {string} options.afterMid - Get messages after this message ID
      * @param {number} options.limit - Max messages to return
-     * @param {number} options.wait - Long-poll timeout in seconds
      */
-    async getRoomMessages(credentials, roomId, { afterMid = null, limit = null, wait = null } = {}) {
+    async getRoomMessages(credentials, roomId, { afterMid = null, limit = null } = {}) {
         let path = `/${credentials.ns}/rooms/${roomId}/messages`;
         const params = new URLSearchParams();
         if (afterMid) params.set('after', afterMid);
         if (limit) params.set('limit', limit.toString());
-        if (wait) params.set('wait', wait.toString());
         if (params.toString()) path += '?' + params.toString();
         
         return this.request('GET', path, { credentials });

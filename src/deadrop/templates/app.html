@@ -202,7 +202,7 @@
     let rooms = [];
     let roomMessages = [];
     let roomMembers = {};
-    let roomPollController = null;  // For canceling long-polls (legacy, kept for compat)
+    // Legacy long-poll removed — subscriptions are the sole update mechanism
     let subscriptionManager = null;  // Unified subscription manager
     
     // DOM elements
@@ -217,11 +217,7 @@
     
     // Utility functions
     function showView(name) {
-        // Cancel any ongoing room polling when leaving room view
-        if (name !== 'roomChat' && roomPollController) {
-            roomPollController.abort();
-            roomPollController = null;
-        }
+        // (Legacy room polling removed — subscriptions handle updates)
         
         Object.values(views).forEach(v => v.classList.add('hidden'));
         views[name].classList.remove('hidden');
@@ -323,10 +319,9 @@
         
         showView('inbox');
         loadInbox();
-        loadRoomsInBackground().then(() => {
-            // Start unified subscription after we know which rooms we're in
-            startSubscription();
-        });
+        await loadRoomsInBackground();
+        // Start unified subscription after we know which rooms we're in
+        startSubscription();
     }
     
     // ==================== INBOX ====================
@@ -569,7 +564,6 @@
             
             showView('roomChat');
             await loadRoomMessages();
-            startRoomPolling();
             
         } catch (e) {
             alert('Failed to open room: ' + e.message);
@@ -696,59 +690,9 @@
         }
     }
     
-    function startRoomPolling() {
-        // Skip legacy polling when subscription manager is active —
-        // the subscription onEvent handler already calls fetchNewRoomMessages().
-        if (subscriptionManager) {
-            console.log('[polling] skipped — subscription manager active');
-            return;
-        }
-        
-        // Fallback: use long-polling when subscriptions are unavailable
-        if (roomPollController) {
-            roomPollController.abort();
-        }
-        
-        roomPollController = new AbortController();
-        pollRoomMessages(roomPollController.signal);
-    }
+    // startRoomPolling removed — subscriptions handle real-time updates
     
-    async function pollRoomMessages(signal) {
-        while (!signal.aborted) {
-            try {
-                const afterMid = roomMessages.length > 0 ? roomMessages[roomMessages.length - 1].mid : null;
-                
-                // Use long-polling (wait up to 30 seconds)
-                const result = await DeadropAPI.getRoomMessages(credentials, currentRoomId, {
-                    afterMid,
-                    wait: 30,
-                });
-                
-                if (signal.aborted) break;
-                
-                if (result?.messages?.length > 0) {
-                    // Add new messages
-                    roomMessages = [...roomMessages, ...result.messages];
-                    // Update cache
-                    const cacheKey = `room_messages_${currentRoomId}`;
-                    localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
-                    renderRoomMessages();
-                    
-                    // Update subscription cursor for this room
-                    if (subscriptionManager) {
-                        const lastMid = result.messages[result.messages.length - 1].mid;
-                        subscriptionManager.updateCursor(`room:${currentRoomId}`, lastMid);
-                    }
-                }
-                
-            } catch (e) {
-                if (signal.aborted) break;
-                console.error('Room poll error:', e);
-                // Wait a bit before retrying on error
-                await new Promise(r => setTimeout(r, 5000));
-            }
-        }
-    }
+    // pollRoomMessages removed — subscriptions handle real-time updates
     
     // ==================== UNIFIED SUBSCRIPTION ====================
     
