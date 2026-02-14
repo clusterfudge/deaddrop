@@ -1118,6 +1118,7 @@ class RoomMemberInfo(BaseModel):
 class SendRoomMessageRequest(BaseModel):
     body: str
     content_type: str = "text/plain"
+    reference_mid: str | None = None
 
 
 class RoomMessageInfo(BaseModel):
@@ -1126,6 +1127,7 @@ class RoomMessageInfo(BaseModel):
     from_id: str  # The sender's identity ID
     body: str
     content_type: str
+    reference_mid: str | None = None
     created_at: str
 
     @classmethod
@@ -1137,6 +1139,7 @@ class RoomMessageInfo(BaseModel):
             from_id=data["from"],
             body=data["body"],
             content_type=data.get("content_type", "text/plain"),
+            reference_mid=data.get("reference_mid"),
             created_at=data["created_at"],
         )
 
@@ -1408,6 +1411,7 @@ async def send_room_message(
                 from_id=from_id,
                 body=request.body,
                 content_type=request.content_type,
+                reference_mid=request.reference_mid,
             )
         )
     except ValueError as e:

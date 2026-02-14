@@ -288,6 +288,84 @@ for topic, mid in client.listen_all(ns, secret, topics):
 
 This uses a single subscription connection to monitor all topics efficiently.
 
+## Reactions
+
+Reactions are lightweight emoji responses attached to room messages. They use the existing message system — a reaction is just a room message with `content_type: "reaction"` and a `reference_mid` pointing to the target message.
+
+### Sending Reactions
+
+```bash
+# React to a message with 👍
+POST /{ns}/rooms/{room_id}/messages
+{
+  "body": "👍",
+  "content_type": "reaction",
+  "reference_mid": "target_message_mid"
+}
+```
+
+```python
+# Python client
+client.send_room_message(
+    ns["ns"], room["room_id"], alice["secret"],
+    body="👍",
+    content_type="reaction",
+    reference_mid=target_msg["mid"]
+)
+```
+
+### Reading Reactions
+
+Reactions appear in the normal message stream with `content_type: "reaction"`. Clients should:
+1. Filter reactions out of the main message list
+2. Group reactions by `reference_mid` and emoji
+3. Display as badges on the target message
+
+```python
+messages = client.get_room_messages(ns["ns"], room["room_id"], secret)
+
+# Separate reactions from regular messages
+regular = [m for m in messages if m["content_type"] != "reaction"]
+reactions = [m for m in messages if m["content_type"] == "reaction"]
+
+# Build reaction map: {target_mid: {emoji: [sender_ids]}}
+reaction_map = {}
+for r in reactions:
+    target = r["reference_mid"]
+    emoji = r["body"]
+    if target not in reaction_map:
+        reaction_map[target] = {}
+    if emoji not in reaction_map[target]:
+        reaction_map[target][emoji] = []
+    reaction_map[target][emoji].append(r["from_id"])
+
+# Display
+for msg in regular:
+    print(f"{msg['from_id']}: {msg['body']}")
+    if msg["mid"] in reaction_map:
+        badges = " ".join(
+            f"{emoji}×{len(senders)}"
+            for emoji, senders in reaction_map[msg["mid"]].items()
+        )
+        print(f"  Reactions: {badges}")
+```
+
+### Message Format
+
+| Field | Value |
+|-------|-------|
+| `body` | Emoji character (e.g., "👍", "❤️", "🎉") |
+| `content_type` | `"reaction"` |
+| `reference_mid` | Message ID of the target message |
+
+### Design Notes
+
+- **No new tables or endpoints** — reactions reuse the room messages system
+- **Reactions are permanent** — once sent, they cannot be retracted (same as any room message)
+- **No duplicate enforcement** — the same user can send the same emoji reaction multiple times; clients should deduplicate at display time
+- **Real-time** — reactions arrive via the same subscription channel as regular messages
+- The web client supports six emoji reactions: 👍 ❤️ 😂 🎉 👀 🙏
+
 ## Rooms vs 1:1 Messaging
 
 | Feature | 1:1 Messaging | Rooms |

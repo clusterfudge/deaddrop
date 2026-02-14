@@ -146,9 +146,11 @@ const DeadropAPI = {
     /**
      * Send a message to a room.
      */
-    async sendRoomMessage(credentials, roomId, body, contentType = 'text/plain') {
+    async sendRoomMessage(credentials, roomId, body, contentType = 'text/plain', referenceMid = null) {
+        const payload = { body, content_type: contentType };
+        if (referenceMid) payload.reference_mid = referenceMid;
         return this.request('POST', `/${credentials.ns}/rooms/${roomId}/messages`, {
-            body: { body, content_type: contentType },
+            body: payload,
             credentials,
         });
     },

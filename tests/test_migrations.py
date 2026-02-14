@@ -161,9 +161,13 @@ class TestRunMigrations:
         """run_migrations applies all migrations to a fresh database."""
         conn = db.get_connection()
 
-        # Reset everything
+        # Reset everything — drop all tables so migrations run from scratch
+        conn.execute("PRAGMA foreign_keys=OFF")
         conn.executescript("""
             DROP TABLE IF EXISTS schema_version;
+            DROP TABLE IF EXISTS room_messages;
+            DROP TABLE IF EXISTS room_members;
+            DROP TABLE IF EXISTS rooms;
             DROP TABLE IF EXISTS messages;
             CREATE TABLE messages (
                 mid TEXT PRIMARY KEY,
@@ -174,11 +178,12 @@ class TestRunMigrations:
             );
         """)
         conn.commit()
+        conn.execute("PRAGMA foreign_keys=ON")
 
         # Run migrations
         applied = db.run_migrations(conn)
 
-        # Should have applied migration 1
+        # Should have applied all migrations
         assert 1 in applied
         assert db.get_schema_version(conn) == db.SCHEMA_VERSION
         assert db._column_exists(conn, "messages", "content_type") is True
@@ -220,9 +225,13 @@ class TestRunMigrations:
         """Running run_migrations multiple times is safe."""
         conn = db.get_connection()
 
-        # Reset
+        # Reset — drop all tables so migrations run cleanly
+        conn.execute("PRAGMA foreign_keys=OFF")
         conn.executescript("""
             DROP TABLE IF EXISTS schema_version;
+            DROP TABLE IF EXISTS room_messages;
+            DROP TABLE IF EXISTS room_members;
+            DROP TABLE IF EXISTS rooms;
             DROP TABLE IF EXISTS messages;
             CREATE TABLE messages (
                 mid TEXT PRIMARY KEY,
@@ -232,6 +241,7 @@ class TestRunMigrations:
                 body TEXT NOT NULL
             );
         """)
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.commit()
 
         # Run migrations twice

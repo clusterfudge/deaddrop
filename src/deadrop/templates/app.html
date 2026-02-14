@@ -747,20 +747,58 @@
         }
     }
     
+    const REACTION_EMOJIS = ['👍', '❤️', '😂', '🎉', '👀', '🙏'];
+    
+    function buildReactionMap(messages) {
+        // Group reactions by reference_mid → { emoji → Set of sender IDs }
+        const map = {};
+        for (const msg of messages) {
+            if (msg.content_type !== 'reaction' || !msg.reference_mid) continue;
+            if (!map[msg.reference_mid]) map[msg.reference_mid] = {};
+            const byEmoji = map[msg.reference_mid];
+            if (!byEmoji[msg.body]) byEmoji[msg.body] = new Set();
+            byEmoji[msg.body].add(msg.from_id);
+        }
+        return map;
+    }
+    
+    function renderReactionBadges(mid, reactionMap) {
+        const reactions = reactionMap[mid];
+        if (!reactions) return '';
+        
+        return `<div class="reaction-badges">${
+            Object.entries(reactions).map(([emoji, senders]) => {
+                const isMine = senders.has(credentials.id);
+                const names = [...senders].map(id => getMemberName(id)).join(', ');
+                return `<button class="reaction-badge ${isMine ? 'mine' : ''}"
+                    title="${names}"
+                    onclick="toggleReaction('${mid}', '${emoji}')"
+                    >${emoji}<span class="reaction-count">${senders.size > 1 ? ' ' + senders.size : ''}</span></button>`;
+            }).join('')
+        }<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button></div>`;
+    }
+    
     function renderRoomMessages() {
         const list = document.getElementById('room-message-list');
         
+        // Build reaction map from all messages
+        const reactionMap = buildReactionMap(roomMessages);
+        
+        // Filter out reaction messages from the main list
+        const displayMessages = roomMessages.filter(m => m.content_type !== 'reaction');
+        
         // Reverse for column-reverse display (newest at bottom visually)
-        const reversed = [...roomMessages].reverse();
+        const reversed = [...displayMessages].reverse();
         
         list.innerHTML = reversed.map(msg => {
             const isMe = msg.from_id === credentials.id;
             const isPending = msg.pending;
             
             return `
-                <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}">
+                <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}" data-mid="${msg.mid}">
                     <div class="sender-name">${getMemberName(msg.from_id)}</div>
                     <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
+                    ${renderReactionBadges(msg.mid, reactionMap)}
                     <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
                 </div>
             `;
@@ -825,6 +863,68 @@
             sendBtn.disabled = false;
             sendBtn.textContent = 'Send ➤';
         }
+    }
+    
+    // ==================== REACTIONS ====================
+    
+    async function toggleReaction(targetMid, emoji) {
+        // Check if we already reacted with this emoji
+        const existing = roomMessages.find(m =>
+            m.content_type === 'reaction' &&
+            m.reference_mid === targetMid &&
+            m.body === emoji &&
+            m.from_id === credentials.id
+        );
+        if (existing) return;  // Already reacted, reactions are permanent
+        
+        try {
+            const result = await DeadropAPI.sendRoomMessage(
+                credentials, currentRoomId, emoji, 'reaction', targetMid);
+            roomMessages.push(result);
+            renderRoomMessages();
+        } catch (e) {
+            console.error('Failed to send reaction:', e);
+        }
+    }
+    
+    function showReactionPicker(event, targetMid) {
+        event.stopPropagation();
+        
+        // Remove any existing picker
+        const old = document.getElementById('reaction-picker');
+        if (old) old.remove();
+        
+        const picker = document.createElement('div');
+        picker.id = 'reaction-picker';
+        picker.className = 'reaction-picker';
+        picker.innerHTML = REACTION_EMOJIS.map(emoji =>
+            `<button class="reaction-picker-btn" onclick="pickReaction(event, '${targetMid}', '${emoji}')">${emoji}</button>`
+        ).join('');
+        
+        // Position near the click
+        const rect = event.target.getBoundingClientRect();
+        picker.style.position = 'fixed';
+        picker.style.left = Math.min(rect.left, window.innerWidth - 250) + 'px';
+        picker.style.top = (rect.top - 44) + 'px';
+        picker.style.zIndex = '1500';
+        
+        document.body.appendChild(picker);
+        
+        // Close on click outside
+        const close = (e) => {
+            if (!picker.contains(e.target)) {
+                picker.remove();
+                document.removeEventListener('click', close);
+            }
+        };
+        setTimeout(() => document.addEventListener('click', close), 0);
+    }
+    
+    function pickReaction(event, targetMid, emoji) {
+        event.stopPropagation();
+        const picker = document.getElementById('reaction-picker');
+        if (picker) picker.remove();
+        toggleReaction(targetMid, emoji);
     }
     
     // startRoomPolling removed — subscriptions handle real-time updates

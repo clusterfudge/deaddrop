@@ -792,6 +792,87 @@ textarea.form-input {
 
 /* From-me messages are plain text, no markdown overrides needed */
 
+/* ========== REACTION BADGES ========== */
+
+.reaction-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 4px;
+}
+
+.reaction-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-color);
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    line-height: 1.4;
+}
+
+.reaction-badge:hover {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+.reaction-badge.mine {
+    background: rgba(37, 99, 235, 0.1);
+    border-color: var(--primary-color);
+}
+
+.reaction-badge .reaction-count {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.reaction-badge.add-reaction {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 2px 6px;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.room-message:hover .reaction-badge.add-reaction {
+    opacity: 1;
+}
+
+/* From-me reactions: adjust for blue bubble context */
+.room-message.from-me .reaction-badges {
+    justify-content: flex-end;
+}
+
+/* Reaction picker popup */
+.reaction-picker {
+    display: flex;
+    gap: 2px;
+    padding: 6px 8px;
+    background: white;
+    border-radius: 24px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+    border: 1px solid var(--border-color);
+}
+
+.reaction-picker-btn {
+    font-size: 22px;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.1s;
+    line-height: 1;
+}
+
+.reaction-picker-btn:hover {
+    background: var(--hover-bg);
+}
+
 .room-message .message-time {
     font-size: 11px;
     color: var(--text-muted);
