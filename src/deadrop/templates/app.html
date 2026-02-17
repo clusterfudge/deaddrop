@@ -459,7 +459,7 @@
                 let preview = `${room.member_count || '?'} members`;
                 if (room.last_message_body) {
                     const senderName = room.last_message_from === credentials.id
-                        ? 'You' : (room.last_message_from?.substring(0, 8) || '?');
+                        ? 'You' : (room.last_message_from_name || room.last_message_from?.substring(0, 8) || '?');
                     preview = `${senderName}: ${room.last_message_body}`;
                 }
                 threads.push({
