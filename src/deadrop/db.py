@@ -1715,9 +1715,11 @@ def list_rooms_for_identity(
                    WHERE rm2.room_id = r.room_id) AS last_activity_at,
                   (SELECT rm3.body FROM room_messages rm3
                    WHERE rm3.room_id = r.room_id
+                     AND rm3.content_type != 'reaction'
                    ORDER BY rm3.mid DESC LIMIT 1) AS last_message_body,
                   (SELECT rm4.from_id FROM room_messages rm4
                    WHERE rm4.room_id = r.room_id
+                     AND rm4.content_type != 'reaction'
                    ORDER BY rm4.mid DESC LIMIT 1) AS last_message_from
            FROM rooms r
            JOIN room_members m ON r.room_id = m.room_id
