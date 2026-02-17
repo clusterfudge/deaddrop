@@ -1103,6 +1103,7 @@ class RoomWithMemberInfo(BaseModel):
     last_activity_at: str | None = None
     last_message_body: str | None = None
     last_message_from: str | None = None
+    last_message_from_name: str | None = None
 
 
 class AddRoomMemberRequest(BaseModel):

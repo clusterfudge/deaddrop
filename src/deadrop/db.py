@@ -1720,7 +1720,15 @@ def list_rooms_for_identity(
                   (SELECT rm4.from_id FROM room_messages rm4
                    WHERE rm4.room_id = r.room_id
                      AND rm4.content_type != 'reaction'
-                   ORDER BY rm4.mid DESC LIMIT 1) AS last_message_from
+                   ORDER BY rm4.mid DESC LIMIT 1) AS last_message_from,
+                  (SELECT COALESCE(
+                       json_extract(i.metadata, '$.display_name'),
+                       rm5.from_id)
+                   FROM room_messages rm5
+                   LEFT JOIN identities i ON i.id = rm5.from_id AND i.ns = r.ns
+                   WHERE rm5.room_id = r.room_id
+                     AND rm5.content_type != 'reaction'
+                   ORDER BY rm5.mid DESC LIMIT 1) AS last_message_from_name
            FROM rooms r
            JOIN room_members m ON r.room_id = m.room_id
            WHERE r.ns = ? AND m.identity_id = ?
