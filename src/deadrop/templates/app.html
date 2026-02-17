@@ -707,18 +707,16 @@
     
     function renderReactionBadges(mid, reactionMap) {
         const reactions = reactionMap[mid];
-        if (!reactions) return '';
+        const badges = reactions ? Object.entries(reactions).map(([emoji, senders]) => {
+            const isMine = senders.has(credentials.id);
+            const names = [...senders].map(id => getMemberName(id)).join(', ');
+            return `<button class="reaction-badge ${isMine ? 'mine' : ''}"
+                title="${names}"
+                onclick="toggleReaction('${mid}', '${emoji}')"
+                >${emoji}<span class="reaction-count">${senders.size > 1 ? ' ' + senders.size : ''}</span></button>`;
+        }).join('') : '';
         
-        return `<div class="reaction-badges">${
-            Object.entries(reactions).map(([emoji, senders]) => {
-                const isMine = senders.has(credentials.id);
-                const names = [...senders].map(id => getMemberName(id)).join(', ');
-                return `<button class="reaction-badge ${isMine ? 'mine' : ''}"
-                    title="${names}"
-                    onclick="toggleReaction('${mid}', '${emoji}')"
-                    >${emoji}<span class="reaction-count">${senders.size > 1 ? ' ' + senders.size : ''}</span></button>`;
-            }).join('')
-        }<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button></div>`;
+        return `<div class="reaction-badges">${badges}<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button></div>`;
     }
     
     function renderRoomMessages() {
