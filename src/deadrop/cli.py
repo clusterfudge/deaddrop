@@ -456,9 +456,9 @@ def listen(
 
     topic_names = ", ".join(topics.keys())
     if not json_output:
-        print(f"Subscribing to: {topic_names}")
-        print("Waiting for events... (Ctrl+C to stop)")
-        print()
+        print(f"Subscribing to: {topic_names}", flush=True)
+        print("Waiting for events... (Ctrl+C to stop)", flush=True)
+        print(flush=True)
 
     # Subscribe loop
     try:
@@ -490,7 +490,7 @@ def listen(
                     topics[topic] = mid
 
                     if json_output:
-                        print(json.dumps({"topic": topic, "latest_mid": mid}))
+                        print(json.dumps({"topic": topic, "latest_mid": mid}), flush=True)
                     else:
                         # Fetch and display the actual message
                         _display_event(global_config.url, ns_id, identity.secret, topic, mid)
@@ -525,13 +525,13 @@ def _display_event(base_url: str, ns: str, secret: str, topic: str, mid: str):
                     for msg in messages:
                         from_id = msg.get("from", "unknown")[:8]
                         body = msg.get("body", "")
-                        print(f"[inbox] {from_id}: {body}")
+                        print(f"[inbox] {from_id}: {body}", flush=True)
                 else:
-                    print(f"[inbox] New activity (mid: {mid[:12]}...)")
+                    print(f"[inbox] New activity (mid: {mid[:12]}...)", flush=True)
             else:
-                print(f"[inbox] New activity (mid: {mid[:12]}...)")
+                print(f"[inbox] New activity (mid: {mid[:12]}...)", flush=True)
         except Exception:
-            print(f"[inbox] New activity (mid: {mid[:12]}...)")
+            print(f"[inbox] New activity (mid: {mid[:12]}...)", flush=True)
 
     elif topic_type == "room":
         try:
@@ -547,13 +547,13 @@ def _display_event(base_url: str, ns: str, secret: str, topic: str, mid: str):
                     for msg in messages:
                         from_id = msg.get("from_id", "unknown")[:8]
                         body = msg.get("body", "")
-                        print(f"[room:{topic_id[:8]}] {from_id}: {body}")
+                        print(f"[room:{topic_id[:8]}] {from_id}: {body}", flush=True)
                 else:
-                    print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)")
+                    print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)", flush=True)
             else:
-                print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)")
+                print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)", flush=True)
         except Exception:
-            print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)")
+            print(f"[room:{topic_id[:8]}] New activity (mid: {mid[:12]}...)", flush=True)
 
 
 # --- Namespace Commands ---
