@@ -144,6 +144,27 @@ const DeadropAPI = {
     },
 
     /**
+     * Get room messages (top-level only, with thread metadata).
+     */
+    async getRoomMessagesTopLevel(credentials, roomId, { afterMid = null, limit = null } = {}) {
+        let path = `/${credentials.ns}/rooms/${roomId}/messages`;
+        const params = new URLSearchParams();
+        params.set('include_replies', 'false');
+        if (afterMid) params.set('after', afterMid);
+        if (limit) params.set('limit', limit.toString());
+        path += '?' + params.toString();
+        
+        return this.request('GET', path, { credentials });
+    },
+
+    /**
+     * Get a thread (root message + all replies).
+     */
+    async getThread(credentials, roomId, rootMid) {
+        return this.request('GET', `/${credentials.ns}/rooms/${roomId}/threads/${rootMid}`, { credentials });
+    },
+
+    /**
      * Send a message to a room.
      */
     async sendRoomMessage(credentials, roomId, body, contentType = 'text/plain', referenceMid = null) {
