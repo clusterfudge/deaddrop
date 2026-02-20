@@ -217,6 +217,113 @@ class TestInMemoryBackendRooms:
         assert count == 2
 
 
+class TestInMemoryBackendThreading:
+    """Test threading on InMemoryBackend."""
+
+    @pytest.fixture
+    def backend(self):
+        return InMemoryBackend()
+
+    @pytest.fixture
+    def setup(self, backend):
+        ns = backend.create_namespace(display_name="Test NS")
+        alice = backend.create_identity(ns["ns"], display_name="Alice")
+        room = backend.create_room(ns["ns"], alice["secret"])
+        return {
+            "backend": backend,
+            "ns": ns["ns"],
+            "alice": alice,
+            "room_id": room["room_id"],
+        }
+
+    def test_send_reply(self, setup):
+        """Send a thread reply via backend."""
+        b = setup["backend"]
+        root = b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Root"
+        )
+        reply = b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Reply",
+            reference_mid=root["mid"],
+        )
+        assert reply["reference_mid"] == root["mid"]
+
+    def test_get_thread(self, setup):
+        """Get a thread via backend."""
+        b = setup["backend"]
+        root = b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Root"
+        )
+        b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Reply 1",
+            reference_mid=root["mid"],
+        )
+        b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Reply 2",
+            reference_mid=root["mid"],
+        )
+
+        thread = b.get_thread(setup["ns"], setup["room_id"], setup["alice"]["secret"], root["mid"])
+        assert thread is not None
+        assert thread["root"]["mid"] == root["mid"]
+        assert thread["reply_count"] == 2
+        assert len(thread["replies"]) == 2
+
+    def test_get_thread_not_found(self, setup):
+        """Get thread for non-existent message."""
+        b = setup["backend"]
+        thread = b.get_thread(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "nonexistent"
+        )
+        assert thread is None
+
+    def test_get_messages_exclude_replies(self, setup):
+        """Filter out replies from room messages."""
+        b = setup["backend"]
+        b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Top level"
+        )
+        root = b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Root"
+        )
+        b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Reply",
+            reference_mid=root["mid"],
+        )
+
+        all_msgs = b.get_room_messages(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"]
+        )
+        assert len(all_msgs) == 3
+
+        top_only = b.get_room_messages(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"],
+            include_replies=False,
+        )
+        assert len(top_only) == 2
+        bodies = [m["body"] for m in top_only]
+        assert "Reply" not in bodies
+
+    def test_get_messages_thread_metadata(self, setup):
+        """Thread metadata included when filtering replies."""
+        b = setup["backend"]
+        root = b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Root"
+        )
+        b.send_room_message(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"], "Reply",
+            reference_mid=root["mid"],
+        )
+
+        top_only = b.get_room_messages(
+            setup["ns"], setup["room_id"], setup["alice"]["secret"],
+            include_replies=False,
+        )
+        root_msg = next(m for m in top_only if m["body"] == "Root")
+        assert root_msg["reply_count"] == 1
+        assert root_msg["last_reply_at"] is not None
+
+
 class TestDeaddropClientRooms:
     """Test room operations on Deaddrop client."""
 
@@ -352,3 +459,61 @@ class TestDeaddropClientRooms:
 
         rooms = c.list_rooms(setup["ns"], setup["alice"]["secret"])
         assert len(rooms) == 0
+
+    def test_send_thread_reply(self, setup):
+        """Send a thread reply via client."""
+        c = setup["client"]
+        room = c.create_room(setup["ns"], setup["alice"]["secret"])
+        root = c.send_room_message(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], "Root"
+        )
+        reply = c.send_room_message(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], "Reply",
+            reference_mid=root["mid"],
+        )
+        assert reply["reference_mid"] == root["mid"]
+
+    def test_get_thread(self, setup):
+        """Get a thread via client."""
+        c = setup["client"]
+        room = c.create_room(setup["ns"], setup["alice"]["secret"])
+        root = c.send_room_message(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], "Root"
+        )
+        c.send_room_message(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], "Reply",
+            reference_mid=root["mid"],
+        )
+
+        thread = c.get_thread(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], root["mid"]
+        )
+        assert thread is not None
+        assert thread["root"]["mid"] == root["mid"]
+        assert thread["reply_count"] == 1
+
+    def test_get_messages_filter_replies(self, setup):
+        """Filter replies from room messages via client."""
+        c = setup["client"]
+        room = c.create_room(setup["ns"], setup["alice"]["secret"])
+        c.send_room_message(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], "Top"
+        )
+        root = c.send_room_message(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], "Root"
+        )
+        c.send_room_message(
+            setup["ns"], room["room_id"], setup["alice"]["secret"], "Reply",
+            reference_mid=root["mid"],
+        )
+
+        all_msgs = c.get_room_messages(
+            setup["ns"], room["room_id"], setup["alice"]["secret"]
+        )
+        assert len(all_msgs) == 3
+
+        top_only = c.get_room_messages(
+            setup["ns"], room["room_id"], setup["alice"]["secret"],
+            include_replies=False,
+        )
+        assert len(top_only) == 2
