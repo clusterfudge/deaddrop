@@ -507,6 +507,206 @@ class TestRoomReadTracking:
         assert db.get_room_unread_count(room["room_id"], bob["id"]) == 0
 
 
+class TestRoomThreading:
+    """Tests for flat threading (Slack-style)."""
+
+    def _setup_room(self):
+        """Helper to create a namespace, identity, and room."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        return ns, alice, room
+
+    def test_send_thread_reply(self):
+        """Send a reply to a top-level message."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root message")
+
+        reply = db.send_room_message(
+            room["room_id"], alice["id"], "Reply to root",
+            reference_mid=root["mid"],
+        )
+
+        assert reply["reference_mid"] == root["mid"]
+        assert reply["body"] == "Reply to root"
+
+    def test_reply_to_reply_redirects_to_root(self):
+        """Replying to a reply should redirect to the thread root (flat threading)."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root message")
+        reply1 = db.send_room_message(
+            room["room_id"], alice["id"], "Reply 1",
+            reference_mid=root["mid"],
+        )
+
+        # Reply to the reply — should be redirected to root
+        reply2 = db.send_room_message(
+            room["room_id"], alice["id"], "Reply to reply",
+            reference_mid=reply1["mid"],
+        )
+
+        assert reply2["reference_mid"] == root["mid"]
+
+    def test_reply_to_invalid_message_fails(self):
+        """Replying to a non-existent message should raise ValueError."""
+        _, alice, room = self._setup_room()
+
+        with pytest.raises(ValueError, match="not found"):
+            db.send_room_message(
+                room["room_id"], alice["id"], "Bad reply",
+                reference_mid="nonexistent-mid",
+            )
+
+    def test_reaction_to_reply_not_redirected(self):
+        """Reactions to replies should NOT be redirected to root."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root message")
+        reply = db.send_room_message(
+            room["room_id"], alice["id"], "Reply",
+            reference_mid=root["mid"],
+        )
+
+        # React to the reply — should keep reference_mid pointing to reply
+        reaction = db.send_room_message(
+            room["room_id"], alice["id"], "👍",
+            content_type="reaction",
+            reference_mid=reply["mid"],
+        )
+
+        assert reaction["reference_mid"] == reply["mid"]
+        assert reaction["content_type"] == "reaction"
+
+    def test_get_thread(self):
+        """Get a thread returns root + replies in order."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root message")
+        db.send_room_message(
+            room["room_id"], alice["id"], "Reply 1",
+            reference_mid=root["mid"],
+        )
+        db.send_room_message(
+            room["room_id"], alice["id"], "Reply 2",
+            reference_mid=root["mid"],
+        )
+
+        thread = db.get_thread(room["room_id"], root["mid"])
+
+        assert thread is not None
+        assert thread["root"]["mid"] == root["mid"]
+        assert thread["root"]["body"] == "Root message"
+        assert thread["reply_count"] == 2
+        assert len(thread["replies"]) == 2
+        assert thread["replies"][0]["body"] == "Reply 1"
+        assert thread["replies"][1]["body"] == "Reply 2"
+
+    def test_get_thread_excludes_reactions(self):
+        """Thread replies should not include reactions."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root message")
+        db.send_room_message(
+            room["room_id"], alice["id"], "Reply",
+            reference_mid=root["mid"],
+        )
+        db.send_room_message(
+            room["room_id"], alice["id"], "👍",
+            content_type="reaction",
+            reference_mid=root["mid"],
+        )
+
+        thread = db.get_thread(room["room_id"], root["mid"])
+
+        assert thread["reply_count"] == 1
+        assert thread["replies"][0]["body"] == "Reply"
+
+    def test_get_thread_not_found(self):
+        """Getting a thread for non-existent message returns None."""
+        _, _, room = self._setup_room()
+        result = db.get_thread(room["room_id"], "nonexistent-mid")
+        assert result is None
+
+    def test_get_thread_no_replies(self):
+        """Getting a thread for a message with no replies returns empty replies."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Lonely message")
+
+        thread = db.get_thread(room["room_id"], root["mid"])
+
+        assert thread is not None
+        assert thread["reply_count"] == 0
+        assert thread["replies"] == []
+
+    def test_get_room_messages_exclude_replies(self):
+        """get_room_messages with include_replies=False filters out thread replies."""
+        _, alice, room = self._setup_room()
+        msg1 = db.send_room_message(room["room_id"], alice["id"], "Top level 1")
+        root = db.send_room_message(room["room_id"], alice["id"], "Thread root")
+        db.send_room_message(
+            room["room_id"], alice["id"], "Reply 1",
+            reference_mid=root["mid"],
+        )
+        db.send_room_message(
+            room["room_id"], alice["id"], "Reply 2",
+            reference_mid=root["mid"],
+        )
+        msg5 = db.send_room_message(room["room_id"], alice["id"], "Top level 2")
+
+        # Without filter — all messages
+        all_msgs = db.get_room_messages(room["room_id"])
+        assert len(all_msgs) == 5
+
+        # With filter — only top-level messages (+ reactions if any)
+        top_level = db.get_room_messages(room["room_id"], include_replies=False)
+        assert len(top_level) == 3
+        bodies = [m["body"] for m in top_level]
+        assert "Top level 1" in bodies
+        assert "Thread root" in bodies
+        assert "Top level 2" in bodies
+        assert "Reply 1" not in bodies
+        assert "Reply 2" not in bodies
+
+    def test_get_room_messages_reactions_not_filtered(self):
+        """Reactions should NOT be filtered when include_replies=False."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Message")
+        db.send_room_message(
+            room["room_id"], alice["id"], "👍",
+            content_type="reaction",
+            reference_mid=root["mid"],
+        )
+
+        top_level = db.get_room_messages(room["room_id"], include_replies=False)
+        assert len(top_level) == 2  # message + reaction
+
+    def test_get_room_messages_with_thread_meta(self):
+        """get_room_messages with include_thread_meta adds reply_count/last_reply_at."""
+        _, alice, room = self._setup_room()
+        msg1 = db.send_room_message(room["room_id"], alice["id"], "No replies")
+        root = db.send_room_message(room["room_id"], alice["id"], "Has replies")
+        db.send_room_message(
+            room["room_id"], alice["id"], "Reply 1",
+            reference_mid=root["mid"],
+        )
+        reply2 = db.send_room_message(
+            room["room_id"], alice["id"], "Reply 2",
+            reference_mid=root["mid"],
+        )
+
+        messages = db.get_room_messages(
+            room["room_id"], include_replies=False, include_thread_meta=True
+        )
+
+        assert len(messages) == 2
+        # "No replies" message
+        no_reply_msg = next(m for m in messages if m["body"] == "No replies")
+        assert no_reply_msg["reply_count"] == 0
+        assert no_reply_msg["last_reply_at"] is None
+
+        # "Has replies" message
+        has_reply_msg = next(m for m in messages if m["body"] == "Has replies")
+        assert has_reply_msg["reply_count"] == 2
+        assert has_reply_msg["last_reply_at"] == reply2["created_at"]
+
+
 class TestRoomMultiUser:
     """Tests for multi-user room scenarios."""
 
