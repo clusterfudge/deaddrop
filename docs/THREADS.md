@@ -55,7 +55,7 @@ GET /{ns}/rooms/{room_id}/threads/{root_mid}
 
 ### Room messages (main timeline)
 
-By default, `GET /{ns}/rooms/{room_id}/messages` returns **only top-level messages** — replies and reactions are excluded. Top-level messages include thread metadata:
+By default, `GET /{ns}/rooms/{room_id}/messages` returns all messages including replies (for backward compatibility). Pass `?include_replies=false` to get only top-level messages with thread metadata:
 
 ```json
 {
@@ -68,7 +68,7 @@ By default, `GET /{ns}/rooms/{room_id}/messages` returns **only top-level messag
 }
 ```
 
-To get all messages including replies (useful for agents wanting full context), pass `?include_replies=true`.
+To get only top-level messages with thread metadata, pass `?include_replies=false`. The web UI uses this by default to show a clean timeline.
 
 ### Response fields
 
@@ -86,11 +86,11 @@ client.send_room_message(ns, room_id, secret, body, reference_mid=root_mid)
 # Get a thread
 client.get_thread(ns, room_id, secret, root_mid)
 
-# Get room messages (top-level only, with thread metadata)
+# Get all room messages (default, backward-compatible)
 client.get_room_messages(ns, room_id, secret)
 
-# Get everything including replies
-client.get_room_messages(ns, room_id, secret, include_replies=True)
+# Get top-level only, with thread metadata (reply_count, last_reply_at)
+client.get_room_messages(ns, room_id, secret, include_replies=False)
 ```
 
 ## Web UI
