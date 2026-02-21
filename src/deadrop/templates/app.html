@@ -847,9 +847,13 @@
             const elapsed = Math.round(performance.now() - startTime);
             console.log(`Room message sent in ${elapsed}ms`);
             
-            // Replace optimistic message with real one
+            // Replace optimistic message with real one (or remove it if subscription already added the real one)
             const idx = roomMessages.findIndex(m => m.mid === optimisticMsg.mid);
-            if (idx >= 0) {
+            const realIdx = roomMessages.findIndex(m => m.mid === result.mid);
+            if (realIdx >= 0 && idx >= 0) {
+                // Subscription already delivered the real message; just remove optimistic
+                roomMessages.splice(idx, 1);
+            } else if (idx >= 0) {
                 roomMessages[idx] = result;
             }
             renderRoomMessages();
@@ -971,8 +975,11 @@
             threadMessages.push(result);
             renderThread();
             
-            // Add to main room messages list (so thread meta updates)
-            roomMessages.push(result);
+            // Add to main room messages list (deduplicated — subscription may also deliver it)
+            const existingMids = new Set(roomMessages.map(m => m.mid));
+            if (!existingMids.has(result.mid)) {
+                roomMessages.push(result);
+            }
             renderRoomMessages();
         } catch (e) {
             alert('Failed to send reply: ' + e.message);
