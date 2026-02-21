@@ -449,14 +449,10 @@ def schedule_cache_warming() -> None:
                 # Refresh caches (with timeout to prevent blocking the event loop
                 # if the Turso connection is stale or the network is unreachable)
                 try:
-                    results = await asyncio.wait_for(
-                        warm_caches(), timeout=CACHE_WARMING_TIMEOUT
-                    )
+                    results = await asyncio.wait_for(warm_caches(), timeout=CACHE_WARMING_TIMEOUT)
                     logger.debug(f"Cache refresh: {results}")
                 except asyncio.TimeoutError:
-                    logger.error(
-                        f"Cache refresh timed out after {CACHE_WARMING_TIMEOUT}s"
-                    )
+                    logger.error(f"Cache refresh timed out after {CACHE_WARMING_TIMEOUT}s")
                     # Continue running - don't let refresh failures stop the loop
                 except Exception as e:
                     logger.error(f"Cache refresh failed: {e}")

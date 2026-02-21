@@ -123,7 +123,9 @@ def _is_hrana_stream_error(error: Exception) -> bool:
     )
 
 
-def _health_check_conn(conn: sqlite3.Connection, timeout: float = LIBSQL_HEALTH_CHECK_TIMEOUT) -> None:
+def _health_check_conn(
+    conn: sqlite3.Connection, timeout: float = LIBSQL_HEALTH_CHECK_TIMEOUT
+) -> None:
     """Run a health check query with a timeout.
 
     Executes ``SELECT 1`` in a daemon thread so that a hung TCP connection
@@ -152,8 +154,7 @@ def _health_check_conn(conn: sqlite3.Connection, timeout: float = LIBSQL_HEALTH_
 
     if t.is_alive():
         raise TimeoutError(
-            f"Database health check timed out after {timeout}s. "
-            "The connection is likely stale."
+            f"Database health check timed out after {timeout}s. The connection is likely stale."
         )
 
     if error[0] is not None:

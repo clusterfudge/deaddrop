@@ -143,6 +143,7 @@ def test_health_check_timeout():
 
     class HangingConnection:
         """Simulates a connection whose execute() hangs indefinitely."""
+
         def execute(self, query):
             time.sleep(30)  # Simulate indefinite hang
 
