@@ -1154,16 +1154,25 @@
                     
                     // If thread panel is open, check if any new messages belong to it
                     if (currentThreadRootMid) {
-                        const threadReplies = newMsgs.filter(m => 
-                            m.reference_mid === currentThreadRootMid && m.content_type !== 'reaction'
-                        );
-                        if (threadReplies.length > 0) {
-                            const existingThreadMids = new Set(threadMessages.map(m => m.mid));
-                            for (const reply of threadReplies) {
-                                if (!existingThreadMids.has(reply.mid)) {
-                                    threadMessages.push(reply);
+                        const threadMids = new Set(threadMessages.map(m => m.mid));
+                        let threadChanged = false;
+                        
+                        for (const msg of newMsgs) {
+                            // New reply to this thread
+                            if (msg.reference_mid === currentThreadRootMid && msg.content_type !== 'reaction') {
+                                if (!threadMids.has(msg.mid)) {
+                                    threadMessages.push(msg);
+                                    threadMids.add(msg.mid);
+                                    threadChanged = true;
                                 }
                             }
+                            // New reaction targeting any message in this thread — re-render
+                            if (msg.content_type === 'reaction' && threadMids.has(msg.reference_mid)) {
+                                threadChanged = true;
+                            }
+                        }
+                        
+                        if (threadChanged) {
                             renderThread();
                         }
                     }
