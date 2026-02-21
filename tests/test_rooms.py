@@ -523,7 +523,9 @@ class TestRoomThreading:
         root = db.send_room_message(room["room_id"], alice["id"], "Root message")
 
         reply = db.send_room_message(
-            room["room_id"], alice["id"], "Reply to root",
+            room["room_id"],
+            alice["id"],
+            "Reply to root",
             reference_mid=root["mid"],
         )
 
@@ -535,13 +537,17 @@ class TestRoomThreading:
         _, alice, room = self._setup_room()
         root = db.send_room_message(room["room_id"], alice["id"], "Root message")
         reply1 = db.send_room_message(
-            room["room_id"], alice["id"], "Reply 1",
+            room["room_id"],
+            alice["id"],
+            "Reply 1",
             reference_mid=root["mid"],
         )
 
         # Reply to the reply — should be redirected to root
         reply2 = db.send_room_message(
-            room["room_id"], alice["id"], "Reply to reply",
+            room["room_id"],
+            alice["id"],
+            "Reply to reply",
             reference_mid=reply1["mid"],
         )
 
@@ -553,7 +559,9 @@ class TestRoomThreading:
 
         with pytest.raises(ValueError, match="not found"):
             db.send_room_message(
-                room["room_id"], alice["id"], "Bad reply",
+                room["room_id"],
+                alice["id"],
+                "Bad reply",
                 reference_mid="nonexistent-mid",
             )
 
@@ -562,13 +570,17 @@ class TestRoomThreading:
         _, alice, room = self._setup_room()
         root = db.send_room_message(room["room_id"], alice["id"], "Root message")
         reply = db.send_room_message(
-            room["room_id"], alice["id"], "Reply",
+            room["room_id"],
+            alice["id"],
+            "Reply",
             reference_mid=root["mid"],
         )
 
         # React to the reply — should keep reference_mid pointing to reply
         reaction = db.send_room_message(
-            room["room_id"], alice["id"], "👍",
+            room["room_id"],
+            alice["id"],
+            "👍",
             content_type="reaction",
             reference_mid=reply["mid"],
         )
@@ -581,11 +593,15 @@ class TestRoomThreading:
         _, alice, room = self._setup_room()
         root = db.send_room_message(room["room_id"], alice["id"], "Root message")
         db.send_room_message(
-            room["room_id"], alice["id"], "Reply 1",
+            room["room_id"],
+            alice["id"],
+            "Reply 1",
             reference_mid=root["mid"],
         )
         db.send_room_message(
-            room["room_id"], alice["id"], "Reply 2",
+            room["room_id"],
+            alice["id"],
+            "Reply 2",
             reference_mid=root["mid"],
         )
 
@@ -604,11 +620,15 @@ class TestRoomThreading:
         _, alice, room = self._setup_room()
         root = db.send_room_message(room["room_id"], alice["id"], "Root message")
         db.send_room_message(
-            room["room_id"], alice["id"], "Reply",
+            room["room_id"],
+            alice["id"],
+            "Reply",
             reference_mid=root["mid"],
         )
         db.send_room_message(
-            room["room_id"], alice["id"], "👍",
+            room["room_id"],
+            alice["id"],
+            "👍",
             content_type="reaction",
             reference_mid=root["mid"],
         )
@@ -638,17 +658,21 @@ class TestRoomThreading:
     def test_get_room_messages_exclude_replies(self):
         """get_room_messages with include_replies=False filters out thread replies."""
         _, alice, room = self._setup_room()
-        msg1 = db.send_room_message(room["room_id"], alice["id"], "Top level 1")
+        db.send_room_message(room["room_id"], alice["id"], "Top level 1")
         root = db.send_room_message(room["room_id"], alice["id"], "Thread root")
         db.send_room_message(
-            room["room_id"], alice["id"], "Reply 1",
+            room["room_id"],
+            alice["id"],
+            "Reply 1",
             reference_mid=root["mid"],
         )
         db.send_room_message(
-            room["room_id"], alice["id"], "Reply 2",
+            room["room_id"],
+            alice["id"],
+            "Reply 2",
             reference_mid=root["mid"],
         )
-        msg5 = db.send_room_message(room["room_id"], alice["id"], "Top level 2")
+        db.send_room_message(room["room_id"], alice["id"], "Top level 2")
 
         # Without filter — all messages
         all_msgs = db.get_room_messages(room["room_id"])
@@ -669,7 +693,9 @@ class TestRoomThreading:
         _, alice, room = self._setup_room()
         root = db.send_room_message(room["room_id"], alice["id"], "Message")
         db.send_room_message(
-            room["room_id"], alice["id"], "👍",
+            room["room_id"],
+            alice["id"],
+            "👍",
             content_type="reaction",
             reference_mid=root["mid"],
         )
@@ -680,14 +706,18 @@ class TestRoomThreading:
     def test_get_room_messages_with_thread_meta(self):
         """get_room_messages with include_thread_meta adds reply_count/last_reply_at."""
         _, alice, room = self._setup_room()
-        msg1 = db.send_room_message(room["room_id"], alice["id"], "No replies")
+        db.send_room_message(room["room_id"], alice["id"], "No replies")
         root = db.send_room_message(room["room_id"], alice["id"], "Has replies")
         db.send_room_message(
-            room["room_id"], alice["id"], "Reply 1",
+            room["room_id"],
+            alice["id"],
+            "Reply 1",
             reference_mid=root["mid"],
         )
         reply2 = db.send_room_message(
-            room["room_id"], alice["id"], "Reply 2",
+            room["room_id"],
+            alice["id"],
+            "Reply 2",
             reference_mid=root["mid"],
         )
 
@@ -705,6 +735,82 @@ class TestRoomThreading:
         has_reply_msg = next(m for m in messages if m["body"] == "Has replies")
         assert has_reply_msg["reply_count"] == 2
         assert has_reply_msg["last_reply_at"] == reply2["created_at"]
+
+    def test_reply_to_reaction_redirects_to_reacted_message(self):
+        """Replying to a reaction should redirect to the message being reacted to."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root message")
+        reaction = db.send_room_message(
+            room["room_id"],
+            alice["id"],
+            "👍",
+            content_type="reaction",
+            reference_mid=root["mid"],
+        )
+
+        # Reply to the reaction — should redirect to root (the reacted-to message)
+        reply = db.send_room_message(
+            room["room_id"],
+            alice["id"],
+            "Nice reaction!",
+            reference_mid=reaction["mid"],
+        )
+
+        assert reply["reference_mid"] == root["mid"]
+
+    def test_three_level_reply_chain_redirects_to_root(self):
+        """3+ level reply chains all redirect to the original root."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root")
+        reply1 = db.send_room_message(
+            room["room_id"],
+            alice["id"],
+            "Reply 1",
+            reference_mid=root["mid"],
+        )
+
+        # reply2 targets reply1, should redirect to root
+        reply2 = db.send_room_message(
+            room["room_id"],
+            alice["id"],
+            "Reply 2",
+            reference_mid=reply1["mid"],
+        )
+        assert reply2["reference_mid"] == root["mid"]
+
+        # reply3 targets reply2 (which already points to root), should also redirect to root
+        reply3 = db.send_room_message(
+            room["room_id"],
+            alice["id"],
+            "Reply 3",
+            reference_mid=reply2["mid"],
+        )
+        assert reply3["reference_mid"] == root["mid"]
+
+    def test_thread_meta_excludes_reactions_from_count(self):
+        """Thread metadata reply_count should not include reactions to the root."""
+        _, alice, room = self._setup_room()
+        root = db.send_room_message(room["room_id"], alice["id"], "Root")
+        db.send_room_message(
+            room["room_id"],
+            alice["id"],
+            "Reply",
+            reference_mid=root["mid"],
+        )
+        # Add reaction to root — should NOT count as a reply
+        db.send_room_message(
+            room["room_id"],
+            alice["id"],
+            "👍",
+            content_type="reaction",
+            reference_mid=root["mid"],
+        )
+
+        messages = db.get_room_messages(
+            room["room_id"], include_replies=False, include_thread_meta=True
+        )
+        root_msg = next(m for m in messages if m["body"] == "Root")
+        assert root_msg["reply_count"] == 1  # Only the text reply, not the reaction
 
 
 class TestRoomMultiUser:

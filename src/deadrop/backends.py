@@ -982,8 +982,12 @@ class LocalBackend(Backend):
             raise ValueError("Room not found in this namespace")
 
         return db.send_room_message(
-            room_id, from_id, body, content_type,
-            reference_mid=reference_mid, conn=self._conn,
+            room_id,
+            from_id,
+            body,
+            content_type,
+            reference_mid=reference_mid,
+            conn=self._conn,
         )
 
     def get_room_messages(
@@ -1005,7 +1009,9 @@ class LocalBackend(Backend):
 
         include_thread_meta = not include_replies
         return db.get_room_messages(
-            room_id, after_mid=after_mid, limit=limit,
+            room_id,
+            after_mid=after_mid,
+            limit=limit,
             include_replies=include_replies,
             include_thread_meta=include_thread_meta,
             conn=self._conn,

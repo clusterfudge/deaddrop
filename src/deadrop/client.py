@@ -535,7 +535,11 @@ class Deaddrop:
             Message dict.
         """
         return self._backend.send_room_message(
-            ns, room_id, secret, body, content_type,
+            ns,
+            room_id,
+            secret,
+            body,
+            content_type,
             reference_mid=reference_mid,
         )
 
@@ -563,7 +567,11 @@ class Deaddrop:
             List of message dicts.
         """
         return self._backend.get_room_messages(
-            ns, room_id, secret, after_mid=after_mid, limit=limit,
+            ns,
+            room_id,
+            secret,
+            after_mid=after_mid,
+            limit=limit,
             include_replies=include_replies,
         )
 

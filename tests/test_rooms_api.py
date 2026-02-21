@@ -597,7 +597,9 @@ class TestRoomThreading:
         room = self._create_room(client, data)
         root = self._send_msg(client, data, room["room_id"], "Root")
         reply1 = self._send_msg(client, data, room["room_id"], "Reply 1", reference_mid=root["mid"])
-        reply2 = self._send_msg(client, data, room["room_id"], "Reply 2", reference_mid=reply1["mid"])
+        reply2 = self._send_msg(
+            client, data, room["room_id"], "Reply 2", reference_mid=reply1["mid"]
+        )
 
         assert reply2["reference_mid"] == root["mid"]
 

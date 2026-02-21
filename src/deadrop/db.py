@@ -1942,8 +1942,10 @@ def send_room_message(
         ref_msg = get_room_message(room_id, reference_mid, conn=conn)
         if not ref_msg:
             raise ValueError(f"Referenced message {reference_mid} not found in room {room_id}")
-        # If the target is itself a reply (not a reaction), redirect to the root
-        if ref_msg.get("reference_mid") and ref_msg.get("content_type") != "reaction":
+        # If the target has a reference_mid (i.e. it's a reply or a reaction),
+        # redirect to that message's reference_mid — this keeps threads flat and
+        # also correctly handles replying to a reaction (redirects to the reacted message)
+        if ref_msg.get("reference_mid"):
             reference_mid = ref_msg["reference_mid"]
 
     mid = str(make_uuid7())
@@ -2063,13 +2065,18 @@ def get_room_messages(
     if include_thread_meta:
         # Collect mids of top-level messages to look up thread info
         top_level_mids = [
-            m["mid"] for m in messages
-            if not m.get("reference_mid") or m.get("content_type") == "reaction"
+            str(m["mid"])
+            for m in messages
+            if (not m.get("reference_mid") or m.get("content_type") == "reaction")
+            and m.get("mid") is not None
         ]
         if top_level_mids:
             thread_meta = _get_thread_metadata(room_id, top_level_mids, conn=conn)
             for msg in messages:
-                meta = thread_meta.get(msg["mid"])
+                mid = msg.get("mid")
+                if mid is None:
+                    continue
+                meta = thread_meta.get(mid)
                 if meta:
                     msg["reply_count"] = meta["reply_count"]
                     msg["last_reply_at"] = meta["last_reply_at"]

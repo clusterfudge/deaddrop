@@ -1432,9 +1432,7 @@ async def get_thread(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    thread = await _run_sync(
-        functools.partial(db.get_thread, room_id, root_mid)
-    )
+    thread = await _run_sync(functools.partial(db.get_thread, room_id, root_mid))
 
     if not thread:
         raise HTTPException(404, "Thread root message not found")
