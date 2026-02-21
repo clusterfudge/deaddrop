@@ -366,6 +366,7 @@ class Backend(ABC):
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a room.
 
@@ -375,6 +376,7 @@ class Backend(ABC):
             secret: Sender's inbox secret (must be a member)
             body: Message body
             content_type: MIME type
+            reference_mid: Optional message ID to reply to (thread root)
 
         Returns:
             Message dict
@@ -389,6 +391,7 @@ class Backend(ABC):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
+        include_replies: bool = True,
     ) -> list[dict[str, Any]]:
         """Get messages from a room.
 
@@ -398,9 +401,31 @@ class Backend(ABC):
             secret: Caller's inbox secret (must be a member)
             after_mid: Only get messages after this ID
             limit: Maximum messages to return
+            include_replies: If False, exclude thread replies
 
         Returns:
             List of message dicts
+        """
+        ...
+
+    @abstractmethod
+    def get_thread(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        root_mid: str,
+    ) -> dict[str, Any] | None:
+        """Get a thread: root message and all replies.
+
+        Args:
+            ns: Namespace ID
+            room_id: Room ID
+            secret: Caller's inbox secret (must be a member)
+            root_mid: Message ID of the thread root
+
+        Returns:
+            Dict with "root", "replies", "reply_count", or None if not found
         """
         ...
 
@@ -946,6 +971,7 @@ class LocalBackend(Backend):
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
         from_id = derive_id(secret)
         if not db.is_room_member(room_id, from_id, conn=self._conn):
@@ -955,7 +981,14 @@ class LocalBackend(Backend):
         if not room or room.get("ns") != ns:
             raise ValueError("Room not found in this namespace")
 
-        return db.send_room_message(room_id, from_id, body, content_type, conn=self._conn)
+        return db.send_room_message(
+            room_id,
+            from_id,
+            body,
+            content_type,
+            reference_mid=reference_mid,
+            conn=self._conn,
+        )
 
     def get_room_messages(
         self,
@@ -964,6 +997,7 @@ class LocalBackend(Backend):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
+        include_replies: bool = True,
     ) -> list[dict[str, Any]]:
         identity_id = derive_id(secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
@@ -973,7 +1007,32 @@ class LocalBackend(Backend):
         if not room or room.get("ns") != ns:
             raise ValueError("Room not found in this namespace")
 
-        return db.get_room_messages(room_id, after_mid=after_mid, limit=limit, conn=self._conn)
+        include_thread_meta = not include_replies
+        return db.get_room_messages(
+            room_id,
+            after_mid=after_mid,
+            limit=limit,
+            include_replies=include_replies,
+            include_thread_meta=include_thread_meta,
+            conn=self._conn,
+        )
+
+    def get_thread(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        root_mid: str,
+    ) -> dict[str, Any] | None:
+        identity_id = derive_id(secret)
+        if not db.is_room_member(room_id, identity_id, conn=self._conn):
+            raise PermissionError("Not a member of this room")
+
+        room = db.get_room(room_id, conn=self._conn)
+        if not room or room.get("ns") != ns:
+            raise ValueError("Room not found in this namespace")
+
+        return db.get_thread(room_id, root_mid, conn=self._conn)
 
     def update_room_read_cursor(
         self,
@@ -1597,11 +1656,15 @@ class RemoteBackend(Backend):
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"body": body, "content_type": content_type}
+        if reference_mid is not None:
+            payload["reference_mid"] = reference_mid
         return self._request(
             "POST",
             f"/{ns}/rooms/{room_id}/messages",
-            json={"body": body, "content_type": content_type},
+            json=payload,
             headers=self._inbox_headers(secret),
         )
 
@@ -1612,12 +1675,15 @@ class RemoteBackend(Backend):
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
+        include_replies: bool = True,
     ) -> list[dict[str, Any]]:
         params = []
         if after_mid:
             params.append(f"after={after_mid}")
         if limit != 100:
             params.append(f"limit={limit}")
+        if not include_replies:
+            params.append("include_replies=false")
 
         path = f"/{ns}/rooms/{room_id}/messages"
         if params:
@@ -1629,6 +1695,22 @@ class RemoteBackend(Backend):
             headers=self._inbox_headers(secret),
         )
         return result.get("messages", [])
+
+    def get_thread(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        root_mid: str,
+    ) -> dict[str, Any] | None:
+        try:
+            return self._request(
+                "GET",
+                f"/{ns}/rooms/{room_id}/threads/{root_mid}",
+                headers=self._inbox_headers(secret),
+            )
+        except Exception:
+            return None
 
     def update_room_read_cursor(
         self,

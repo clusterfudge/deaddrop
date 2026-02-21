@@ -1133,6 +1133,14 @@ class RoomMessageInfo(BaseModel):
     content_type: str
     reference_mid: str | None = None
     created_at: str
+    # Thread metadata (only present when requested via include_thread_meta)
+    reply_count: int = 0
+    last_reply_at: str | None = None
+
+    @property
+    def is_thread_reply(self) -> bool:
+        """True if this message is a reply in a thread (not a reaction)."""
+        return self.reference_mid is not None and self.content_type != "reaction"
 
     @classmethod
     def from_db(cls, data: dict) -> "RoomMessageInfo":
@@ -1145,6 +1153,8 @@ class RoomMessageInfo(BaseModel):
             content_type=data.get("content_type", "text/plain"),
             reference_mid=data.get("reference_mid"),
             created_at=data["created_at"],
+            reply_count=data.get("reply_count", 0),
+            last_reply_at=data.get("last_reply_at"),
         )
 
 
@@ -1363,6 +1373,7 @@ async def get_room_messages(
     room_id: str,
     after: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    include_replies: Annotated[bool, Query()] = True,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages from a room.
@@ -1370,6 +1381,8 @@ async def get_room_messages(
     Query parameters:
     - after: Only return messages after this message ID (for pagination/polling)
     - limit: Maximum number of messages to return (default: 100, max: 1000)
+    - include_replies: If false, exclude thread replies (default: true for backward compat).
+        When false, top-level messages include reply_count and last_reply_at metadata.
 
     For real-time updates, use the POST /{ns}/subscribe endpoint instead.
     """
@@ -1380,13 +1393,54 @@ async def get_room_messages(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
+    # When filtering replies, also include thread metadata
+    include_thread_meta = not include_replies
+
     messages = await _run_sync(
-        functools.partial(db.get_room_messages, room_id, after_mid=after, limit=limit)
+        functools.partial(
+            db.get_room_messages,
+            room_id,
+            after_mid=after,
+            limit=limit,
+            include_replies=include_replies,
+            include_thread_meta=include_thread_meta,
+        )
     )
 
     return {
         "messages": [RoomMessageInfo.from_db(m).model_dump() for m in messages],
         "room_id": room_id,
+    }
+
+
+@app.get("/{ns}/rooms/{room_id}/threads/{root_mid}")
+async def get_thread(
+    ns: str,
+    room_id: str,
+    root_mid: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Get a thread: the root message and all its replies.
+
+    Returns the root message, all thread replies (excluding reactions) in
+    chronological order, and the reply count.
+    """
+    import functools
+
+    room, identity_id = await _require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    thread = await _run_sync(functools.partial(db.get_thread, room_id, root_mid))
+
+    if not thread:
+        raise HTTPException(404, "Thread root message not found")
+
+    return {
+        "root": RoomMessageInfo.from_db(thread["root"]).model_dump(),
+        "replies": [RoomMessageInfo.from_db(r).model_dump() for r in thread["replies"]],
+        "reply_count": thread["reply_count"],
     }
 
 

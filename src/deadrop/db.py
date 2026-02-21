@@ -1905,19 +1905,26 @@ def send_room_message(
 ) -> dict:
     """Send a message to a room.
 
+    For thread replies (non-reaction messages with reference_mid set),
+    the reference_mid must point to a top-level message. If it points to
+    another reply, it is silently redirected to the thread root (Slack-style
+    flat threading).
+
     Args:
         room_id: Room ID
         from_id: Sender identity ID (must be a member)
         body: Message body
         content_type: Content type (default: text/plain)
-        reference_mid: Optional message ID this message references (e.g. for reactions)
+        reference_mid: Optional message ID this references.
+            For reactions (content_type="reaction"): the message being reacted to.
+            For thread replies: the thread root message.
         conn: Optional database connection
 
     Returns:
         Message info dict
 
     Raises:
-        ValueError: If room not found or sender not a member
+        ValueError: If room not found, sender not a member, or reference_mid invalid
     """
     conn = _get_conn(conn)
 
@@ -1929,6 +1936,17 @@ def send_room_message(
     # Verify sender is a member
     if not is_room_member(room_id, from_id, conn=conn):
         raise ValueError(f"Identity {from_id} is not a member of room {room_id}")
+
+    # Validate and resolve reference_mid for thread replies
+    if reference_mid is not None and content_type != "reaction":
+        ref_msg = get_room_message(room_id, reference_mid, conn=conn)
+        if not ref_msg:
+            raise ValueError(f"Referenced message {reference_mid} not found in room {room_id}")
+        # If the target has a reference_mid (i.e. it's a reply or a reaction),
+        # redirect to that message's reference_mid — this keeps threads flat and
+        # also correctly handles replying to a reaction (redirects to the reacted message)
+        if ref_msg.get("reference_mid"):
+            reference_mid = ref_msg["reference_mid"]
 
     mid = str(make_uuid7())
     now = datetime.now(timezone.utc).isoformat()
@@ -1987,6 +2005,8 @@ def get_room_messages(
     room_id: str,
     after_mid: str | None = None,
     limit: int = 100,
+    include_replies: bool = True,
+    include_thread_meta: bool = False,
     conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """Get messages from a room.
@@ -1995,6 +2015,11 @@ def get_room_messages(
         room_id: Room ID
         after_mid: Only get messages after this message ID (for pagination/polling)
         limit: Maximum number of messages to return
+        include_replies: If False, exclude thread replies (messages with reference_mid
+            set and content_type != 'reaction'). Reactions are always included.
+            Default True for backward compatibility.
+        include_thread_meta: If True, include reply_count and last_reply_at fields
+            on top-level messages that have thread replies.
         conn: Optional database connection
 
     Returns:
@@ -2009,6 +2034,10 @@ def get_room_messages(
     """
     params: list[Any] = [room_id]
 
+    if not include_replies:
+        # Exclude thread replies but keep reactions and top-level messages
+        query += " AND (reference_mid IS NULL OR content_type = 'reaction')"
+
     if after_mid:
         query += " AND mid > ?"
         params.append(after_mid)
@@ -2019,7 +2048,7 @@ def get_room_messages(
     cursor = conn.execute(query, tuple(params))
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
-    return [
+    messages = [
         {
             "mid": row["mid"],
             "room_id": row["room_id"],
@@ -2031,6 +2060,124 @@ def get_room_messages(
         }
         for row in rows
     ]
+
+    # Add thread metadata if requested
+    if include_thread_meta:
+        # Collect mids of top-level messages to look up thread info
+        top_level_mids = [
+            str(m["mid"])
+            for m in messages
+            if (not m.get("reference_mid") or m.get("content_type") == "reaction")
+            and m.get("mid") is not None
+        ]
+        if top_level_mids:
+            thread_meta = _get_thread_metadata(room_id, top_level_mids, conn=conn)
+            for msg in messages:
+                mid = msg.get("mid")
+                if mid is None:
+                    continue
+                meta = thread_meta.get(mid)
+                if meta:
+                    msg["reply_count"] = meta["reply_count"]
+                    msg["last_reply_at"] = meta["last_reply_at"]
+                else:
+                    msg["reply_count"] = 0
+                    msg["last_reply_at"] = None
+
+    return messages
+
+
+def _get_thread_metadata(
+    room_id: str,
+    root_mids: list[str],
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, dict]:
+    """Get thread reply counts and last reply timestamps for root messages.
+
+    Args:
+        room_id: Room ID
+        root_mids: List of root message IDs to get metadata for
+        conn: Optional database connection
+
+    Returns:
+        Dict mapping root_mid → {"reply_count": int, "last_reply_at": str | None}
+    """
+    conn = _get_conn(conn)
+
+    if not root_mids:
+        return {}
+
+    placeholders = ",".join("?" * len(root_mids))
+    cursor = conn.execute(
+        f"""SELECT reference_mid, COUNT(*) as reply_count, MAX(created_at) as last_reply_at
+            FROM room_messages
+            WHERE room_id = ? AND reference_mid IN ({placeholders})
+            AND content_type != 'reaction'
+            GROUP BY reference_mid""",
+        tuple([room_id] + root_mids),
+    )
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
+
+    return {
+        row["reference_mid"]: {
+            "reply_count": row["reply_count"],
+            "last_reply_at": row["last_reply_at"],
+        }
+        for row in rows
+    }
+
+
+def get_thread(
+    room_id: str,
+    root_mid: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Get a thread: the root message and all its replies.
+
+    Args:
+        room_id: Room ID
+        root_mid: Message ID of the thread root
+        conn: Optional database connection
+
+    Returns:
+        Dict with "root" (message dict), "replies" (list of message dicts),
+        and "reply_count" (int). Returns None if root message not found.
+    """
+    conn = _get_conn(conn)
+
+    # Get the root message
+    root = get_room_message(room_id, root_mid, conn=conn)
+    if not root:
+        return None
+
+    # Get all replies (non-reaction messages referencing this root)
+    cursor = conn.execute(
+        """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
+           FROM room_messages
+           WHERE room_id = ? AND reference_mid = ? AND content_type != 'reaction'
+           ORDER BY mid""",
+        (room_id, root_mid),
+    )
+    rows = _rows_to_dicts(cursor.description, cursor.fetchall())
+
+    replies = [
+        {
+            "mid": row["mid"],
+            "room_id": row["room_id"],
+            "from": row["from_id"],
+            "body": row["body"],
+            "content_type": row.get("content_type") or "text/plain",
+            "reference_mid": row.get("reference_mid"),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+    return {
+        "root": root,
+        "replies": replies,
+        "reply_count": len(replies),
+    }
 
 
 def get_room_message(

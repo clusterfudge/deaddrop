@@ -519,6 +519,7 @@ class Deaddrop:
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a room.
 
@@ -528,11 +529,19 @@ class Deaddrop:
             secret: Sender's inbox secret (must be a member).
             body: Message body.
             content_type: MIME type.
+            reference_mid: Optional message ID to reply to (creates a thread reply).
 
         Returns:
             Message dict.
         """
-        return self._backend.send_room_message(ns, room_id, secret, body, content_type)
+        return self._backend.send_room_message(
+            ns,
+            room_id,
+            secret,
+            body,
+            content_type,
+            reference_mid=reference_mid,
+        )
 
     def get_room_messages(
         self,
@@ -541,6 +550,7 @@ class Deaddrop:
         secret: str,
         after_mid: str | None = None,
         limit: int = 100,
+        include_replies: bool = True,
     ) -> list[dict[str, Any]]:
         """Get messages from a room.
 
@@ -550,13 +560,40 @@ class Deaddrop:
             secret: Caller's inbox secret (must be a member).
             after_mid: Only get messages after this ID.
             limit: Maximum messages to return.
+            include_replies: If False, exclude thread replies and include
+                thread metadata (reply_count, last_reply_at) on root messages.
 
         Returns:
             List of message dicts.
         """
         return self._backend.get_room_messages(
-            ns, room_id, secret, after_mid=after_mid, limit=limit
+            ns,
+            room_id,
+            secret,
+            after_mid=after_mid,
+            limit=limit,
+            include_replies=include_replies,
         )
+
+    def get_thread(
+        self,
+        ns: str,
+        room_id: str,
+        secret: str,
+        root_mid: str,
+    ) -> dict[str, Any] | None:
+        """Get a thread: root message and all replies.
+
+        Args:
+            ns: Namespace ID.
+            room_id: Room ID.
+            secret: Caller's inbox secret (must be a member).
+            root_mid: Message ID of the thread root.
+
+        Returns:
+            Dict with "root", "replies", "reply_count", or None if not found.
+        """
+        return self._backend.get_thread(ns, room_id, secret, root_mid)
 
     def update_room_read_cursor(
         self,

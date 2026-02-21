@@ -560,6 +560,156 @@ class TestRoomReadTracking:
         assert response.json()["unread_count"] == 2
 
 
+class TestRoomThreading:
+    """Tests for thread API endpoints."""
+
+    def _create_room(self, client, data):
+        """Helper to create a room."""
+        return client.post(
+            f"/{data['ns']}/rooms",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json={"display_name": "Test Room"},
+        ).json()
+
+    def _send_msg(self, client, data, room_id, body, reference_mid=None):
+        """Helper to send a message."""
+        payload = {"body": body}
+        if reference_mid:
+            payload["reference_mid"] = reference_mid
+        return client.post(
+            f"/{data['ns']}/rooms/{room_id}/messages",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json=payload,
+        ).json()
+
+    def test_send_thread_reply(self, client, setup_identities):
+        """Send a reply via API sets reference_mid."""
+        data = setup_identities
+        room = self._create_room(client, data)
+        root = self._send_msg(client, data, room["room_id"], "Root message")
+        reply = self._send_msg(client, data, room["room_id"], "Reply", reference_mid=root["mid"])
+
+        assert reply["reference_mid"] == root["mid"]
+
+    def test_send_reply_to_reply_redirects(self, client, setup_identities):
+        """Replying to a reply redirects to root (flat threading)."""
+        data = setup_identities
+        room = self._create_room(client, data)
+        root = self._send_msg(client, data, room["room_id"], "Root")
+        reply1 = self._send_msg(client, data, room["room_id"], "Reply 1", reference_mid=root["mid"])
+        reply2 = self._send_msg(
+            client, data, room["room_id"], "Reply 2", reference_mid=reply1["mid"]
+        )
+
+        assert reply2["reference_mid"] == root["mid"]
+
+    def test_get_thread(self, client, setup_identities):
+        """GET thread endpoint returns root + replies."""
+        data = setup_identities
+        room = self._create_room(client, data)
+        root = self._send_msg(client, data, room["room_id"], "Root message")
+        self._send_msg(client, data, room["room_id"], "Reply 1", reference_mid=root["mid"])
+        self._send_msg(client, data, room["room_id"], "Reply 2", reference_mid=root["mid"])
+
+        response = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/threads/{root['mid']}",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        )
+
+        assert response.status_code == 200
+        thread = response.json()
+        assert thread["root"]["mid"] == root["mid"]
+        assert thread["reply_count"] == 2
+        assert len(thread["replies"]) == 2
+        assert thread["replies"][0]["body"] == "Reply 1"
+        assert thread["replies"][1]["body"] == "Reply 2"
+
+    def test_get_thread_not_found(self, client, setup_identities):
+        """GET thread for non-existent root returns 404."""
+        data = setup_identities
+        room = self._create_room(client, data)
+
+        response = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/threads/nonexistent-mid",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        )
+
+        assert response.status_code == 404
+
+    def test_get_thread_not_member(self, client, setup_identities):
+        """Non-member cannot get thread."""
+        data = setup_identities
+        room = self._create_room(client, data)
+        root = self._send_msg(client, data, room["room_id"], "Root")
+
+        response = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/threads/{root['mid']}",
+            headers={"X-Inbox-Secret": data["bob"]["secret"]},
+        )
+
+        assert response.status_code == 403
+
+    def test_get_messages_exclude_replies(self, client, setup_identities):
+        """include_replies=false filters out thread replies."""
+        data = setup_identities
+        room = self._create_room(client, data)
+        self._send_msg(client, data, room["room_id"], "Top level 1")
+        root = self._send_msg(client, data, room["room_id"], "Thread root")
+        self._send_msg(client, data, room["room_id"], "Reply", reference_mid=root["mid"])
+        self._send_msg(client, data, room["room_id"], "Top level 2")
+
+        # With replies
+        all_resp = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/messages",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        )
+        assert len(all_resp.json()["messages"]) == 4
+
+        # Without replies
+        top_resp = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/messages",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            params={"include_replies": "false"},
+        )
+        messages = top_resp.json()["messages"]
+        assert len(messages) == 3
+        bodies = [m["body"] for m in messages]
+        assert "Reply" not in bodies
+
+    def test_get_messages_thread_metadata(self, client, setup_identities):
+        """include_replies=false includes reply_count and last_reply_at."""
+        data = setup_identities
+        room = self._create_room(client, data)
+        self._send_msg(client, data, room["room_id"], "No thread")
+        root = self._send_msg(client, data, room["room_id"], "Has thread")
+        self._send_msg(client, data, room["room_id"], "Reply 1", reference_mid=root["mid"])
+        self._send_msg(client, data, room["room_id"], "Reply 2", reference_mid=root["mid"])
+
+        resp = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/messages",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            params={"include_replies": "false"},
+        )
+        messages = resp.json()["messages"]
+
+        no_thread = next(m for m in messages if m["body"] == "No thread")
+        has_thread = next(m for m in messages if m["body"] == "Has thread")
+
+        assert no_thread["reply_count"] == 0
+        assert no_thread["last_reply_at"] is None
+        assert has_thread["reply_count"] == 2
+        assert has_thread["last_reply_at"] is not None
+
+    def test_message_response_has_reply_count_field(self, client, setup_identities):
+        """All message responses include reply_count field (default 0)."""
+        data = setup_identities
+        room = self._create_room(client, data)
+        msg = self._send_msg(client, data, room["room_id"], "Hello")
+
+        assert "reply_count" in msg
+        assert msg["reply_count"] == 0
+
+
 class TestRoomDeletion:
     """Tests for room deletion."""
 

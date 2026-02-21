@@ -95,9 +95,25 @@
             </div>
         </div>
         
-        <div id="room-message-list" class="message-list"></div>
+        <div style="display: flex; flex: 1; overflow: hidden;">
+            <div id="room-message-list" class="message-list" style="flex: 1;"></div>
+            
+            <!-- Thread Panel (slides in from right) -->
+            <div id="thread-panel" class="thread-panel hidden">
+                <div class="thread-panel-header">
+                    <h2>Thread</h2>
+                    <button id="thread-panel-close" class="btn btn-icon" title="Close thread">✕</button>
+                </div>
+                <div id="thread-messages" class="message-list thread-message-list"></div>
+                <div class="compose-area thread-compose">
+                    <textarea id="thread-message-input" class="compose-input" 
+                              placeholder="Reply in thread..." rows="1" enterkeyhint="send"></textarea>
+                    <button id="thread-send-btn" class="btn btn-primary">Reply ➤</button>
+                </div>
+            </div>
+        </div>
         
-        <div class="compose-area">
+        <div class="compose-area" id="room-compose-area">
             <textarea id="room-message-input" class="compose-input" 
                       placeholder="Type a message..." rows="1" enterkeyhint="send"></textarea>
             <button id="room-send-btn" class="btn btn-primary">Send ➤</button>
@@ -184,6 +200,10 @@
     let roomMessagesLoading = false;  // Guard against concurrent fetches
     // Legacy long-poll removed — subscriptions are the sole update mechanism
     let subscriptionManager = null;  // Unified subscription manager
+    
+    // Thread state
+    let currentThreadRootMid = null;
+    let threadMessages = [];  // [root, ...replies]
     
     // DOM elements
     const views = {
@@ -725,8 +745,13 @@
         // Build reaction map from all messages
         const reactionMap = buildReactionMap(roomMessages);
         
-        // Filter out reaction messages from the main list
-        const displayMessages = roomMessages.filter(m => m.content_type !== 'reaction');
+        // Build thread metadata map: root_mid → { reply_count, last_reply_at }
+        const threadMetaMap = buildThreadMetaMap(roomMessages);
+        
+        // Filter out reaction messages AND thread replies from the main list
+        const displayMessages = roomMessages.filter(m => 
+            m.content_type !== 'reaction' && !isThreadReply(m)
+        );
         
         // Reverse for column-reverse display (newest at bottom visually)
         const reversed = [...displayMessages].reverse();
@@ -734,12 +759,22 @@
         list.innerHTML = reversed.map(msg => {
             const isMe = msg.from_id === credentials.id;
             const isPending = msg.pending;
+            const threadMeta = threadMetaMap[msg.mid];
+            const threadIndicator = threadMeta 
+                ? `<div class="thread-indicator" onclick="openThread('${msg.mid}')">
+                     <span class="thread-icon">💬</span>
+                     ${threadMeta.reply_count} ${threadMeta.reply_count === 1 ? 'reply' : 'replies'}
+                     <span style="color: var(--text-muted); margin-left: 4px;">${formatTime(threadMeta.last_reply_at)}</span>
+                   </div>`
+                : '';
             
             return `
                 <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}" data-mid="${msg.mid}">
+                    <button class="reply-btn" onclick="openThread('${msg.mid}')" title="Reply in thread">💬</button>
                     <div class="sender-name">${getMemberName(msg.from_id)}</div>
                     <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
                     ${renderReactionBadges(msg.mid, reactionMap)}
+                    ${threadIndicator}
                     <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
                 </div>
             `;
@@ -756,6 +791,41 @@
             const lastMid = realMessages[realMessages.length - 1].mid;
             DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
         }
+    }
+    
+    /**
+     * Safely add a message to roomMessages, preventing duplicates.
+     * Returns true if the message was added, false if already present.
+     */
+    function addRoomMessage(msg) {
+        if (roomMessages.some(m => m.mid === msg.mid)) return false;
+        roomMessages.push(msg);
+        return true;
+    }
+    
+    /**
+     * Check if a message is a thread reply (non-reaction with reference_mid set).
+     */
+    function isThreadReply(msg) {
+        return msg.reference_mid && msg.content_type !== 'reaction';
+    }
+    
+    /**
+     * Build thread metadata from messages: root_mid → { reply_count, last_reply_at }
+     */
+    function buildThreadMetaMap(messages) {
+        const map = {};
+        for (const msg of messages) {
+            if (!isThreadReply(msg)) continue;
+            if (!map[msg.reference_mid]) {
+                map[msg.reference_mid] = { reply_count: 0, last_reply_at: null };
+            }
+            map[msg.reference_mid].reply_count++;
+            if (!map[msg.reference_mid].last_reply_at || msg.created_at > map[msg.reference_mid].last_reply_at) {
+                map[msg.reference_mid].last_reply_at = msg.created_at;
+            }
+        }
+        return map;
     }
     
     async function sendRoomMessage() {
@@ -787,9 +857,13 @@
             const elapsed = Math.round(performance.now() - startTime);
             console.log(`Room message sent in ${elapsed}ms`);
             
-            // Replace optimistic message with real one
+            // Replace optimistic message with real one (or remove it if subscription already added the real one)
             const idx = roomMessages.findIndex(m => m.mid === optimisticMsg.mid);
-            if (idx >= 0) {
+            const realIdx = roomMessages.findIndex(m => m.mid === result.mid);
+            if (realIdx >= 0 && idx >= 0) {
+                // Subscription already delivered the real message; just remove optimistic
+                roomMessages.splice(idx, 1);
+            } else if (idx >= 0) {
                 roomMessages[idx] = result;
             }
             renderRoomMessages();
@@ -803,6 +877,123 @@
         } finally {
             sendBtn.disabled = false;
             sendBtn.textContent = 'Send ➤';
+        }
+    }
+    
+    // ==================== THREADS ====================
+    
+    async function openThread(rootMid) {
+        currentThreadRootMid = rootMid;
+        
+        const panel = document.getElementById('thread-panel');
+        const msgList = document.getElementById('thread-messages');
+        
+        panel.classList.remove('hidden');
+        msgList.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+        
+        try {
+            const thread = await DeadropAPI.getThread(credentials, currentRoomId, rootMid);
+            
+            // Build thread messages array: root + replies
+            threadMessages = [thread.root, ...thread.replies];
+            renderThread();
+        } catch (e) {
+            msgList.innerHTML = `<div class="error-message">Failed to load thread: ${e.message}</div>`;
+        }
+        
+        // Focus the thread input
+        document.getElementById('thread-message-input').focus();
+    }
+    
+    function closeThread() {
+        currentThreadRootMid = null;
+        threadMessages = [];
+        document.getElementById('thread-panel').classList.add('hidden');
+    }
+    
+    function renderThread() {
+        const list = document.getElementById('thread-messages');
+        
+        if (threadMessages.length === 0) {
+            list.innerHTML = '<div class="empty-state">No messages</div>';
+            return;
+        }
+        
+        // Build reaction map for thread messages
+        const allMids = new Set(threadMessages.map(m => m.mid));
+        const threadReactions = roomMessages.filter(m => 
+            m.content_type === 'reaction' && allMids.has(m.reference_mid)
+        );
+        const reactionMap = buildReactionMap([...threadMessages, ...threadReactions]);
+        
+        const root = threadMessages[0];
+        const replies = threadMessages.slice(1);
+        
+        // Reverse for column-reverse display
+        const items = [];
+        
+        // Replies (reversed for column-reverse)
+        for (let i = replies.length - 1; i >= 0; i--) {
+            const msg = replies[i];
+            const isMe = msg.from_id === credentials.id;
+            items.push(`
+                <div class="room-message ${isMe ? 'from-me' : ''}" data-mid="${msg.mid}">
+                    <div class="sender-name">${getMemberName(msg.from_id)}</div>
+                    <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
+                    ${renderReactionBadges(msg.mid, reactionMap)}
+                    <div class="message-time">${formatTime(msg.created_at)}</div>
+                </div>
+            `);
+        }
+        
+        // Reply count divider
+        if (replies.length > 0) {
+            items.push(`<div class="thread-reply-divider">${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}</div>`);
+        }
+        
+        // Root message (at the "bottom" in reversed display = top visually)
+        const isRootMe = root.from_id === credentials.id;
+        items.push(`
+            <div class="room-message thread-root-msg ${isRootMe ? 'from-me' : ''}" data-mid="${root.mid}">
+                <div class="sender-name">${getMemberName(root.from_id)}</div>
+                <div class="message-body markdown-body">${renderMessageBody(root.body, root.content_type)}</div>
+                ${renderReactionBadges(root.mid, reactionMap)}
+                <div class="message-time">${formatTime(root.created_at)}</div>
+            </div>
+        `);
+        
+        list.innerHTML = items.join('');
+        highlightCodeBlocks(list);
+    }
+    
+    async function sendThreadReply() {
+        const input = document.getElementById('thread-message-input');
+        const sendBtn = document.getElementById('thread-send-btn');
+        const body = input.value.trim();
+        if (!body || !currentThreadRootMid) return;
+        
+        input.value = '';
+        sendBtn.disabled = true;
+        sendBtn.textContent = 'Sending...';
+        
+        try {
+            const result = await DeadropAPI.sendRoomMessage(
+                credentials, currentRoomId, body, 'text/plain', currentThreadRootMid
+            );
+            
+            // Add to thread view
+            threadMessages.push(result);
+            renderThread();
+            
+            // Add to main room messages list (deduplicated — subscription may also deliver it)
+            addRoomMessage(result);
+            renderRoomMessages();
+        } catch (e) {
+            alert('Failed to send reply: ' + e.message);
+            input.value = body;
+        } finally {
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Reply ➤';
         }
     }
     
@@ -821,7 +1012,7 @@
         try {
             const result = await DeadropAPI.sendRoomMessage(
                 credentials, currentRoomId, emoji, 'reaction', targetMid);
-            roomMessages.push(result);
+            addRoomMessage(result);
             renderRoomMessages();
         } catch (e) {
             console.error('Failed to send reaction:', e);
@@ -951,11 +1142,40 @@
             if (result?.messages?.length > 0) {
                 // Filter out any messages we already have (including pending/optimistic)
                 const newMsgs = result.messages.filter(m => !existingMids.has(m.mid));
-                if (newMsgs.length > 0) {
-                    roomMessages = [...roomMessages, ...newMsgs];
+                // Double-check dedup with addRoomMessage (guards against races)
+                let addedAny = false;
+                for (const msg of newMsgs) {
+                    if (addRoomMessage(msg)) addedAny = true;
+                }
+                if (addedAny) {
                     const cacheKey = `room_messages_${roomId}`;
                     localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
                     renderRoomMessages();
+                    
+                    // If thread panel is open, check if any new messages belong to it
+                    if (currentThreadRootMid) {
+                        const threadMids = new Set(threadMessages.map(m => m.mid));
+                        let threadChanged = false;
+                        
+                        for (const msg of newMsgs) {
+                            // New reply to this thread
+                            if (msg.reference_mid === currentThreadRootMid && msg.content_type !== 'reaction') {
+                                if (!threadMids.has(msg.mid)) {
+                                    threadMessages.push(msg);
+                                    threadMids.add(msg.mid);
+                                    threadChanged = true;
+                                }
+                            }
+                            // New reaction targeting any message in this thread — re-render
+                            if (msg.content_type === 'reaction' && threadMids.has(msg.reference_mid)) {
+                                threadChanged = true;
+                            }
+                        }
+                        
+                        if (threadChanged) {
+                            renderThread();
+                        }
+                    }
                 }
                 
                 // Update subscription cursor (always, even if deduplicated)
@@ -1030,6 +1250,7 @@
     
     document.getElementById('room-chat-back').addEventListener('click', (e) => {
         e.preventDefault();
+        closeThread();
         currentRoomId = null;
         roomMessages = [];
         roomMembers = {};
@@ -1067,6 +1288,16 @@
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendRoomMessage();
+        }
+    });
+    
+    // Thread panel events
+    document.getElementById('thread-panel-close').addEventListener('click', closeThread);
+    document.getElementById('thread-send-btn').addEventListener('click', sendThreadReply);
+    document.getElementById('thread-message-input').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendThreadReply();
         }
     });
     
