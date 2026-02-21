@@ -123,6 +123,43 @@ def _is_hrana_stream_error(error: Exception) -> bool:
     )
 
 
+def _health_check_conn(conn: sqlite3.Connection, timeout: float = LIBSQL_HEALTH_CHECK_TIMEOUT) -> None:
+    """Run a health check query with a timeout.
+
+    Executes ``SELECT 1`` in a daemon thread so that a hung TCP connection
+    (e.g. an expired Hrana stream that never errors but never responds)
+    cannot block the caller indefinitely.
+
+    Args:
+        conn: The database connection to check.
+        timeout: Maximum seconds to wait for the health check.
+
+    Raises:
+        TimeoutError: If the health check does not complete in time.
+        Exception: Any exception raised by the underlying ``execute``.
+    """
+    error: list[BaseException | None] = [None]
+
+    def _probe():
+        try:
+            conn.execute("SELECT 1")
+        except BaseException as e:
+            error[0] = e
+
+    t = threading.Thread(target=_probe, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        raise TimeoutError(
+            f"Database health check timed out after {timeout}s. "
+            "The connection is likely stale."
+        )
+
+    if error[0] is not None:
+        raise error[0]
+
+
 # --- Connection Management ---
 
 
@@ -189,14 +226,21 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                     raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
 
             # Test connection health with a simple query
-            # This catches stale Hrana streams before they cause operation failures
+            # This catches stale Hrana streams before they cause operation failures.
+            # We run the health check in a separate thread with a timeout to prevent
+            # indefinite hangs on stale TCP connections (which can freeze the event
+            # loop if get_connection() is called from the main thread).
             try:
-                _conn.execute("SELECT 1")
-            except Exception as e:
-                if _is_hrana_stream_error(e):
+                _health_check_conn(_conn, timeout=LIBSQL_HEALTH_CHECK_TIMEOUT)
+            except (TimeoutError, Exception) as e:
+                is_timeout = isinstance(e, TimeoutError)
+                is_hrana = not is_timeout and _is_hrana_stream_error(e)
+
+                if is_timeout or is_hrana:
                     import logging
 
-                    logging.warning(f"Libsql connection stale, reconnecting: {e}")
+                    reason = "timed out" if is_timeout else "stale"
+                    logging.warning(f"Libsql connection {reason}, reconnecting: {e}")
                     try:
                         _conn.close()
                     except Exception:

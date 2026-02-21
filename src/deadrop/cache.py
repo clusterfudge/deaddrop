@@ -46,6 +46,7 @@ IDENTITY_CACHE_SIZE = int(os.environ.get("DEADROP_IDENTITY_CACHE_SIZE", 5000))
 # Cache warming configuration
 CACHE_WARMING_ENABLED = os.environ.get("DEADROP_CACHE_WARMING", "1").lower() in ("1", "true", "yes")
 CACHE_REFRESH_INTERVAL = int(os.environ.get("DEADROP_CACHE_REFRESH_INTERVAL", 300))  # 5 min default
+CACHE_WARMING_TIMEOUT = int(os.environ.get("DEADROP_CACHE_WARMING_TIMEOUT", 30))  # 30s default
 
 
 @dataclass
@@ -286,7 +287,13 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
     from . import db
 
     if conn is None:
-        conn = db.get_connection()
+        # IMPORTANT: Get the connection in a thread pool to avoid blocking
+        # the event loop.  For libsql/Turso, get_connection() acquires a
+        # threading lock and runs a network health check — both blocking
+        # operations that would freeze the entire server if executed on
+        # the event loop thread.
+        loop = asyncio.get_event_loop()
+        conn = await loop.run_in_executor(None, db.get_connection)
 
     start_time = time.perf_counter()
     results = {"rooms": 0, "memberships": 0, "identities": 0}
@@ -413,9 +420,12 @@ def schedule_cache_warming() -> None:
         # Small delay to let the server fully start
         await asyncio.sleep(0.5)
 
-        # Initial warming
+        # Initial warming (with timeout to prevent blocking on startup)
         try:
-            await warm_caches()
+            await asyncio.wait_for(warm_caches(), timeout=CACHE_WARMING_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error(f"Initial cache warming timed out after {CACHE_WARMING_TIMEOUT}s")
+            print(f"ERROR:    Initial cache warming timed out after {CACHE_WARMING_TIMEOUT}s")
         except Exception as e:
             logger.error(f"Initial cache warming failed: {e}")
             print(f"ERROR:    Initial cache warming failed: {e}")
@@ -436,10 +446,18 @@ def schedule_cache_warming() -> None:
                     # Timeout means it's time to refresh
                     pass
 
-                # Refresh caches
+                # Refresh caches (with timeout to prevent blocking the event loop
+                # if the Turso connection is stale or the network is unreachable)
                 try:
-                    results = await warm_caches()
+                    results = await asyncio.wait_for(
+                        warm_caches(), timeout=CACHE_WARMING_TIMEOUT
+                    )
                     logger.debug(f"Cache refresh: {results}")
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Cache refresh timed out after {CACHE_WARMING_TIMEOUT}s"
+                    )
+                    # Continue running - don't let refresh failures stop the loop
                 except Exception as e:
                     logger.error(f"Cache refresh failed: {e}")
                     # Continue running - don't let refresh failures stop the loop
