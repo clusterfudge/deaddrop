@@ -794,6 +794,16 @@
     }
     
     /**
+     * Safely add a message to roomMessages, preventing duplicates.
+     * Returns true if the message was added, false if already present.
+     */
+    function addRoomMessage(msg) {
+        if (roomMessages.some(m => m.mid === msg.mid)) return false;
+        roomMessages.push(msg);
+        return true;
+    }
+    
+    /**
      * Check if a message is a thread reply (non-reaction with reference_mid set).
      */
     function isThreadReply(msg) {
@@ -976,10 +986,7 @@
             renderThread();
             
             // Add to main room messages list (deduplicated — subscription may also deliver it)
-            const existingMids = new Set(roomMessages.map(m => m.mid));
-            if (!existingMids.has(result.mid)) {
-                roomMessages.push(result);
-            }
+            addRoomMessage(result);
             renderRoomMessages();
         } catch (e) {
             alert('Failed to send reply: ' + e.message);
@@ -1005,7 +1012,7 @@
         try {
             const result = await DeadropAPI.sendRoomMessage(
                 credentials, currentRoomId, emoji, 'reaction', targetMid);
-            roomMessages.push(result);
+            addRoomMessage(result);
             renderRoomMessages();
         } catch (e) {
             console.error('Failed to send reaction:', e);
@@ -1135,8 +1142,12 @@
             if (result?.messages?.length > 0) {
                 // Filter out any messages we already have (including pending/optimistic)
                 const newMsgs = result.messages.filter(m => !existingMids.has(m.mid));
-                if (newMsgs.length > 0) {
-                    roomMessages = [...roomMessages, ...newMsgs];
+                // Double-check dedup with addRoomMessage (guards against races)
+                let addedAny = false;
+                for (const msg of newMsgs) {
+                    if (addRoomMessage(msg)) addedAny = true;
+                }
+                if (addedAny) {
                     const cacheKey = `room_messages_${roomId}`;
                     localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
                     renderRoomMessages();
