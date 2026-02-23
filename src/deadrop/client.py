@@ -519,20 +519,40 @@ class Deaddrop:
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a room.
+
+        For regular messages, only ``body`` is required.  To send an emoji
+        reaction, set ``content_type="reaction"`` and ``reference_mid`` to the
+        target message ID.  For thread replies, set ``reference_mid`` to the
+        thread root message ID.
 
         Args:
             ns: Namespace ID.
             room_id: Room ID.
             secret: Sender's inbox secret (must be a member).
-            body: Message body.
-            content_type: MIME type.
+            body: Message body (emoji character for reactions).
+            content_type: MIME type.  Use ``"reaction"`` for emoji reactions.
+            reference_mid: For reactions, the message being reacted to.
+                For thread replies, the thread root message.
 
         Returns:
-            Message dict.
+            Message dict with keys: mid, room_id, from_id, body,
+            content_type, reference_mid, created_at.
+
+        Example — send a reaction::
+
+            client.send_room_message(
+                ns, room_id, secret,
+                body="👍",
+                content_type="reaction",
+                reference_mid=target_mid,
+            )
         """
-        return self._backend.send_room_message(ns, room_id, secret, body, content_type)
+        return self._backend.send_room_message(
+            ns, room_id, secret, body, content_type, reference_mid=reference_mid
+        )
 
     def get_room_messages(
         self,

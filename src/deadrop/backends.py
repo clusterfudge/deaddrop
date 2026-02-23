@@ -366,6 +366,7 @@ class Backend(ABC):
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a room.
 
@@ -374,10 +375,13 @@ class Backend(ABC):
             room_id: Room ID
             secret: Sender's inbox secret (must be a member)
             body: Message body
-            content_type: MIME type
+            content_type: MIME type (use "reaction" for emoji reactions)
+            reference_mid: For reactions, the message ID being reacted to.
+                For thread replies, the thread root message ID.
 
         Returns:
-            Message dict
+            Message dict with keys: mid, room_id, from, body, content_type,
+            reference_mid, created_at
         """
         ...
 
@@ -946,6 +950,7 @@ class LocalBackend(Backend):
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
         from_id = derive_id(secret)
         if not db.is_room_member(room_id, from_id, conn=self._conn):
@@ -955,7 +960,9 @@ class LocalBackend(Backend):
         if not room or room.get("ns") != ns:
             raise ValueError("Room not found in this namespace")
 
-        return db.send_room_message(room_id, from_id, body, content_type, conn=self._conn)
+        return db.send_room_message(
+            room_id, from_id, body, content_type, reference_mid=reference_mid, conn=self._conn
+        )
 
     def get_room_messages(
         self,
@@ -1597,11 +1604,15 @@ class RemoteBackend(Backend):
         secret: str,
         body: str,
         content_type: str = "text/plain",
+        reference_mid: str | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"body": body, "content_type": content_type}
+        if reference_mid is not None:
+            payload["reference_mid"] = reference_mid
         return self._request(
             "POST",
             f"/{ns}/rooms/{room_id}/messages",
-            json={"body": body, "content_type": content_type},
+            json=payload,
             headers=self._inbox_headers(secret),
         )
 
