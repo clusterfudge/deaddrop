@@ -333,27 +333,11 @@ def require_active_namespace(ns: str) -> None:
 def _get_db_executor():
     """Get the appropriate executor for DB operations.
 
-    Returns a single-threaded executor when using libsql/Turso (which uses
-    a single shared connection that isn't thread-safe), or None to use the
-    default threadpool for local SQLite (which uses thread-local connections).
+    Delegates to db.get_db_executor() to ensure ALL database operations
+    (API handlers, cache warming, background tasks) share the same
+    single-threaded executor when using libsql/Turso.
     """
-    global _db_executor
-    if _db_executor is not None:
-        return _db_executor
-
-    if db.is_using_libsql():
-        from concurrent.futures import ThreadPoolExecutor
-
-        _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
-        logger.info("Using serialized DB executor for libsql/Turso")
-    else:
-        _db_executor = None  # Use default threadpool for local SQLite
-        logger.info("Using default threadpool for local SQLite")
-
-    return _db_executor
-
-
-_db_executor = None  # Initialized lazily
+    return db.get_db_executor()
 
 
 async def _run_sync(fn, *args):
