@@ -77,6 +77,43 @@ _libsql_lock = threading.Lock()
 LIBSQL_CONNECT_TIMEOUT = 10.0
 LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
 
+# Shared single-threaded executor for serializing libsql operations.
+# When using Turso/libsql, ALL database operations must go through this
+# executor because the shared connection is NOT thread-safe.
+_db_executor = None
+_db_executor_lock = threading.Lock()
+
+
+def get_db_executor():
+    """Get the shared executor for database operations.
+
+    Returns a single-threaded executor when using libsql/Turso (which uses
+    a single shared connection that isn't thread-safe), or None to use the
+    default threadpool for local SQLite (which uses thread-local connections).
+
+    This MUST be used by all async code that accesses the database, including
+    cache warming, API handlers, and any other background tasks.
+    """
+    global _db_executor
+
+    if _db_executor is not None:
+        return _db_executor
+
+    with _db_executor_lock:
+        # Double-check under lock
+        if _db_executor is not None:
+            return _db_executor
+
+        if is_using_libsql():
+            from concurrent.futures import ThreadPoolExecutor
+
+            import logging
+
+            _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+            logging.getLogger(__name__).info("Using serialized DB executor for libsql/Turso")
+
+    return _db_executor
+
 
 def _reset_libsql_connection() -> None:
     """Reset the global libsql connection.

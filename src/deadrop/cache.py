@@ -287,13 +287,18 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
     from . import db
 
     if conn is None:
-        # IMPORTANT: Get the connection in a thread pool to avoid blocking
-        # the event loop.  For libsql/Turso, get_connection() acquires a
+        # IMPORTANT: Get the connection via the shared DB executor to avoid
+        # both blocking the event loop AND concurrent access to the shared
+        # libsql connection.  For libsql/Turso, get_connection() acquires a
         # threading lock and runs a network health check — both blocking
         # operations that would freeze the entire server if executed on
-        # the event loop thread.
+        # the event loop thread.  Using the DB executor (instead of the
+        # default threadpool) ensures cache warming is serialized with API
+        # handler DB operations, preventing thread-safety violations on the
+        # shared libsql connection.
         loop = asyncio.get_event_loop()
-        conn = await loop.run_in_executor(None, db.get_connection)
+        executor = db.get_db_executor()
+        conn = await loop.run_in_executor(executor, db.get_connection)
 
     start_time = time.perf_counter()
     results = {"rooms": 0, "memberships": 0, "identities": 0}
@@ -333,13 +338,16 @@ async def _warm_room_cache(conn: sqlite3.Connection) -> int:
     """Load all rooms into cache."""
     from . import db
 
-    # Run DB query in thread pool to not block event loop
+    # Run DB query via the shared DB executor to serialize with API operations.
+    # Using the default threadpool here would cause concurrent access to the
+    # shared libsql connection, which is not thread-safe.
     loop = asyncio.get_event_loop()
+    executor = db.get_db_executor()
     cursor = await loop.run_in_executor(
-        None,
+        executor,
         lambda: conn.execute("SELECT room_id, ns, display_name, created_by, created_at FROM rooms"),
     )
-    rows = await loop.run_in_executor(None, cursor.fetchall)
+    rows = await loop.run_in_executor(executor, cursor.fetchall)
 
     # Build cache entries
     items = {}
@@ -354,13 +362,16 @@ async def _warm_room_cache(conn: sqlite3.Connection) -> int:
 
 async def _warm_membership_cache(conn: sqlite3.Connection) -> int:
     """Load all room memberships into cache."""
-    # Run DB query in thread pool
+    from . import db
+
+    # Run DB query via the shared DB executor to serialize with API operations
     loop = asyncio.get_event_loop()
+    executor = db.get_db_executor()
     cursor = await loop.run_in_executor(
-        None,
+        executor,
         lambda: conn.execute("SELECT room_id, identity_id FROM room_members"),
     )
-    rows = await loop.run_in_executor(None, cursor.fetchall)
+    rows = await loop.run_in_executor(executor, cursor.fetchall)
 
     # Build cache entries (membership is just a boolean - True if member)
     items = {}
@@ -374,13 +385,16 @@ async def _warm_membership_cache(conn: sqlite3.Connection) -> int:
 
 async def _warm_identity_cache(conn: sqlite3.Connection) -> int:
     """Load all identity secret hashes into cache."""
-    # Run DB query in thread pool
+    from . import db
+
+    # Run DB query via the shared DB executor to serialize with API operations
     loop = asyncio.get_event_loop()
+    executor = db.get_db_executor()
     cursor = await loop.run_in_executor(
-        None,
+        executor,
         lambda: conn.execute("SELECT ns, id, secret_hash FROM identities"),
     )
-    rows = await loop.run_in_executor(None, cursor.fetchall)
+    rows = await loop.run_in_executor(executor, cursor.fetchall)
 
     # Build cache entries
     items = {}
