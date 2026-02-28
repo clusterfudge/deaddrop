@@ -527,6 +527,8 @@
         document.getElementById('conversation-title').textContent = getPeerName(peerId);
         showView('conversation');
         renderConversation();
+        // Focus the input so the user can start typing immediately
+        document.getElementById('message-input').focus();
     }
     
     function renderConversation() {
@@ -623,6 +625,8 @@
             
             showView('roomChat');
             await loadRoomMessages();
+            // Focus the input so the user can start typing immediately
+            document.getElementById('room-message-input').focus();
             
         } catch (e) {
             alert('Failed to open room: ' + e.message);
@@ -1123,6 +1127,41 @@
         }
     }
     
+    // ==================== TAB VISIBILITY ====================
+    
+    /**
+     * Pause subscriptions and message fetching when the tab is not visible
+     * (backgrounded, another workspace, screen locked, etc.).
+     *
+     * This prevents messages from being marked as read while the user isn't
+     * actually looking at them.  When the tab regains focus the subscription
+     * is restarted and the current view is refreshed.
+     */
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            // Tab hidden — stop subscription so we don't fetch (and mark-as-read)
+            stopSubscription();
+        } else {
+            // Tab visible again — restart subscription and refresh the active view
+            if (currentSlug && credentials) {
+                startSubscription();
+
+                // Refresh whichever view is currently shown
+                const inboxView = document.getElementById('view-inbox');
+                const roomView = document.getElementById('view-room-chat');
+                const convView = document.getElementById('view-conversation');
+
+                if (roomView && !roomView.classList.contains('hidden') && currentRoomId) {
+                    loadRoomMessages();
+                } else if (convView && !convView.classList.contains('hidden') && currentPeerId) {
+                    loadUnifiedInbox().then(() => renderConversation());
+                } else if (inboxView && !inboxView.classList.contains('hidden')) {
+                    loadUnifiedInbox();
+                }
+            }
+        }
+    });
+
     // ==================== BROWSER NAVIGATION ====================
     
     /**
