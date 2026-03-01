@@ -34,13 +34,21 @@ class EventBus(ABC):
     """
 
     @abstractmethod
-    async def publish(self, namespace: str, topic: str, mid: str) -> None:
+    async def publish(
+        self,
+        namespace: str,
+        topic: str,
+        mid: str,
+        sender_id: str | None = None,
+    ) -> None:
         """Publish that a topic has a new message.
 
         Args:
             namespace: Namespace ID
             topic: Topic key (e.g., "inbox:abc123" or "room:def456")
             mid: The new message ID (UUIDv7, lexicographically sortable)
+            sender_id: Identity ID of the sender (allows clients to ignore
+                       their own events)
         """
 
     @abstractmethod
@@ -49,7 +57,7 @@ class EventBus(ABC):
         namespace: str,
         topics: dict[str, str | None],
         timeout: float = 30.0,
-    ) -> dict[str, str]:
+    ) -> dict[str, dict[str, str | None]]:
         """Block until any subscribed topic has changes, or timeout.
 
         Compares the caller's last_seen_mid for each topic against the
@@ -62,8 +70,8 @@ class EventBus(ABC):
             timeout: Max seconds to wait (0 = check and return immediately)
 
         Returns:
-            Map of topic_key -> latest_mid for topics that have changes.
-            Empty dict if timeout reached with no changes.
+            Map of topic_key -> {"latest_mid": mid, "sender_id": id_or_none}
+            for topics that have changes. Empty dict if timeout reached.
         """
 
     @abstractmethod
@@ -112,8 +120,8 @@ class InMemoryEventBus(EventBus):
     """
 
     def __init__(self) -> None:
-        # latest_mid per (namespace, topic)
-        self._latest: dict[str, dict[str, str]] = defaultdict(dict)
+        # Latest event per (namespace, topic): maps to (mid, sender_id)
+        self._latest: dict[str, dict[str, tuple[str, str | None]]] = defaultdict(dict)
         # One condition per namespace for waiter notification
         self._conditions: dict[str, asyncio.Condition] = {}
 
@@ -123,37 +131,47 @@ class InMemoryEventBus(EventBus):
             self._conditions[namespace] = asyncio.Condition()
         return self._conditions[namespace]
 
-    async def publish(self, namespace: str, topic: str, mid: str) -> None:
+    async def publish(
+        self,
+        namespace: str,
+        topic: str,
+        mid: str,
+        sender_id: str | None = None,
+    ) -> None:
         """Publish a new message event for a topic."""
         condition = self._get_condition(namespace)
         async with condition:
-            self._latest[namespace][topic] = mid
+            self._latest[namespace][topic] = (mid, sender_id)
             condition.notify_all()
 
     def _check_changes(
         self,
         namespace: str,
         topics: dict[str, str | None],
-    ) -> dict[str, str]:
+    ) -> dict[str, dict[str, str | None]]:
         """Check which topics have changes beyond the caller's cursors.
 
         UUIDv7 message IDs are lexicographically sortable, so string
         comparison is valid for determining "newer than".
+
+        Returns:
+            Map of topic_key -> {"latest_mid": mid, "sender_id": id_or_none}
         """
-        changes: dict[str, str] = {}
+        changes: dict[str, dict[str, str | None]] = {}
         ns_latest = self._latest.get(namespace, {})
 
         for topic, last_seen in topics.items():
-            latest = ns_latest.get(topic)
-            if latest is None:
+            entry = ns_latest.get(topic)
+            if entry is None:
                 # No messages published for this topic yet
                 continue
+            mid, sender_id = entry
             if last_seen is None:
                 # Caller has never seen this topic — any message is new
-                changes[topic] = latest
-            elif latest > last_seen:
+                changes[topic] = {"latest_mid": mid, "sender_id": sender_id}
+            elif mid > last_seen:
                 # There are messages newer than what the caller has seen
-                changes[topic] = latest
+                changes[topic] = {"latest_mid": mid, "sender_id": sender_id}
 
         return changes
 
@@ -162,7 +180,7 @@ class InMemoryEventBus(EventBus):
         namespace: str,
         topics: dict[str, str | None],
         timeout: float = 30.0,
-    ) -> dict[str, str]:
+    ) -> dict[str, dict[str, str | None]]:
         """Block until any topic has changes, or timeout."""
         # Immediate check — avoid acquiring condition if possible
         changes = self._check_changes(namespace, topics)
@@ -195,16 +213,16 @@ class InMemoryEventBus(EventBus):
         self,
         namespace: str,
         topics: dict[str, str | None],
-    ) -> AsyncIterator[dict[str, str]]:
+    ) -> AsyncIterator[dict[str, str | None]]:
         """Stream events as they occur."""
         # Track our own cursor so we don't re-yield the same change
         cursors = dict(topics)
 
         # First, yield any immediately-available changes
         changes = self._check_changes(namespace, cursors)
-        for topic, mid in changes.items():
-            cursors[topic] = mid
-            yield {"topic": topic, "latest_mid": mid}
+        for topic, info in changes.items():
+            cursors[topic] = info["latest_mid"]
+            yield {"topic": topic, "latest_mid": info["latest_mid"], "sender_id": info["sender_id"]}
 
         # Then wait for new events
         condition = self._get_condition(namespace)
@@ -214,13 +232,21 @@ class InMemoryEventBus(EventBus):
 
             # Check what changed
             changes = self._check_changes(namespace, cursors)
-            for topic, mid in changes.items():
-                cursors[topic] = mid
-                yield {"topic": topic, "latest_mid": mid}
+            for topic, info in changes.items():
+                cursors[topic] = info["latest_mid"]
+                yield {
+                    "topic": topic,
+                    "latest_mid": info["latest_mid"],
+                    "sender_id": info["sender_id"],
+                }
 
     def get_latest(self, namespace: str, topic: str) -> str | None:
         """Get the latest known mid for a topic."""
-        return self._latest.get(namespace, {}).get(topic)
+        entry = self._latest.get(namespace, {}).get(topic)
+        if entry is None:
+            return None
+        mid, _sender_id = entry
+        return mid
 
 
 # --- Global singleton ---

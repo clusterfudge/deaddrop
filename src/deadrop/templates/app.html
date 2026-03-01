@@ -893,8 +893,14 @@
         
         subscriptionManager = new SubscriptionManager(credentials);
         
-        subscriptionManager.onEvent = async (topic, latestMid) => {
-            console.log(`[subscription] event on ${topic}: ${latestMid}`);
+        subscriptionManager.onEvent = async (topic, latestMid, senderId) => {
+            console.log(`[subscription] event on ${topic}: ${latestMid} from ${senderId || 'unknown'}`);
+            
+            // Skip events from ourselves — we already have optimistic updates
+            if (senderId === credentials.id) {
+                console.log(`[subscription] ignoring self-event on ${topic}`);
+                return;
+            }
             
             if (topic === `inbox:${credentials.id}`) {
                 // Inbox has new messages — refresh if viewing unified inbox

@@ -35,7 +35,9 @@ class TestPublishAndSubscribe:
             timeout=5.0,
         )
 
-        assert result == {"room:abc": "01961234-0000-7000-8000-000000000001"}
+        assert result == {
+            "room:abc": {"latest_mid": "01961234-0000-7000-8000-000000000001", "sender_id": None}
+        }
 
     @pytest.mark.asyncio
     async def test_subscribe_with_current_cursor_blocks_then_receives(self, bus):
@@ -57,7 +59,7 @@ class TestPublishAndSubscribe:
         )
         await task
 
-        assert result == {"room:abc": mid2}
+        assert result == {"room:abc": {"latest_mid": mid2, "sender_id": None}}
 
     @pytest.mark.asyncio
     async def test_subscribe_timeout_returns_empty(self, bus):
@@ -90,7 +92,9 @@ class TestPublishAndSubscribe:
             {"room:abc": None},
             timeout=0,
         )
-        assert result == {"room:abc": "01961234-0000-7000-8000-000000000001"}
+        assert result == {
+            "room:abc": {"latest_mid": "01961234-0000-7000-8000-000000000001", "sender_id": None}
+        }
 
     @pytest.mark.asyncio
     async def test_subscribe_multiple_topics_one_changed(self, bus):
@@ -109,7 +113,7 @@ class TestPublishAndSubscribe:
             timeout=0,
         )
 
-        assert result == {"room:abc": mid1}
+        assert result == {"room:abc": {"latest_mid": mid1, "sender_id": None}}
 
     @pytest.mark.asyncio
     async def test_subscribe_multiple_topics_multiple_changed(self, bus):
@@ -130,7 +134,10 @@ class TestPublishAndSubscribe:
             timeout=0,
         )
 
-        assert result == {"room:abc": mid1, "inbox:xyz": mid2}
+        assert result == {
+            "room:abc": {"latest_mid": mid1, "sender_id": None},
+            "inbox:xyz": {"latest_mid": mid2, "sender_id": None},
+        }
 
     @pytest.mark.asyncio
     async def test_subscribe_no_change_when_cursor_matches(self, bus):
@@ -185,7 +192,7 @@ class TestNamespaceIsolation:
 
         await asyncio.gather(subscribe_ns1(), subscribe_ns2(), publish_ns1())
 
-        assert ns1_result == {"room:abc": mid}
+        assert ns1_result == {"room:abc": {"latest_mid": mid, "sender_id": None}}
         assert ns2_result == {}
 
 
@@ -216,7 +223,9 @@ class TestConcurrentSubscribers:
 
         assert len(results) == 3
         for idx, result in results:
-            assert result == {"room:abc": mid}, f"Subscriber {idx} got wrong result"
+            assert result == {"room:abc": {"latest_mid": mid, "sender_id": None}}, (
+                f"Subscriber {idx} got wrong result"
+            )
 
     @pytest.mark.asyncio
     async def test_subscribers_different_topics_in_same_namespace(self, bus):
@@ -240,7 +249,7 @@ class TestConcurrentSubscribers:
 
         await asyncio.gather(room_subscriber(), inbox_subscriber(), publisher())
 
-        assert room_result == {"room:abc": mid}
+        assert room_result == {"room:abc": {"latest_mid": mid, "sender_id": None}}
         assert inbox_result == {}
 
 
@@ -287,7 +296,7 @@ class TestStream:
         stream = bus.stream("ns1", {"room:abc": None})
         event = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
 
-        assert event == {"topic": "room:abc", "latest_mid": mid1}
+        assert event == {"topic": "room:abc", "latest_mid": mid1, "sender_id": None}
 
     @pytest.mark.asyncio
     async def test_stream_waits_for_new_events(self, bus):
@@ -304,7 +313,7 @@ class TestStream:
         event = await asyncio.wait_for(stream.__anext__(), timeout=2.0)
         await publish_task
 
-        assert event == {"topic": "room:abc", "latest_mid": mid1}
+        assert event == {"topic": "room:abc", "latest_mid": mid1, "sender_id": None}
 
     @pytest.mark.asyncio
     async def test_stream_yields_multiple_events(self, bus):
@@ -356,6 +365,35 @@ class TestStream:
         assert event2["latest_mid"] == mid2
 
         await publish_task
+
+    @pytest.mark.asyncio
+    async def test_stream_includes_sender_id(self, bus):
+        """Stream yields sender_id when provided in publish."""
+        mid1 = "01961234-0000-7000-8000-000000000001"
+        await bus.publish("ns1", "room:abc", mid1, sender_id="user1")
+
+        stream = bus.stream("ns1", {"room:abc": None})
+        event = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+
+        assert event == {"topic": "room:abc", "latest_mid": mid1, "sender_id": "user1"}
+
+
+class TestSenderIdPropagation:
+    """Tests that sender_id is propagated through publish/subscribe/stream."""
+
+    @pytest.mark.asyncio
+    async def test_publish_with_sender_id_in_subscribe(self, bus):
+        """Publish with sender_id; subscribe returns sender_id in result."""
+        mid1 = "01961234-0000-7000-8000-000000000001"
+        await bus.publish("ns1", "room:abc", mid1, sender_id="user1")
+
+        result = await bus.subscribe(
+            "ns1",
+            {"room:abc": None},
+            timeout=5.0,
+        )
+
+        assert result == {"room:abc": {"latest_mid": mid1, "sender_id": "user1"}}
 
 
 class TestGlobalSingleton:

@@ -387,7 +387,8 @@ class SubscriptionManager {
                             const data = JSON.parse(event.data);
                             if (data.topic && data.latest_mid) {
                                 this.updateCursor(data.topic, data.latest_mid);
-                                if (this.onEvent) this.onEvent(data.topic, data.latest_mid);
+                                const senderId = data.sender_id || null;
+                                if (this.onEvent) this.onEvent(data.topic, data.latest_mid, senderId);
                             }
                         } catch (e) {
                             console.warn('Failed to parse SSE event data:', e);
@@ -442,9 +443,11 @@ class SubscriptionManager {
                 if (!this.running) break;
 
                 if (result.events && !result.timeout) {
+                    const details = result.details || {};
                     for (const [topic, mid] of Object.entries(result.events)) {
                         this.updateCursor(topic, mid);
-                        if (this.onEvent) this.onEvent(topic, mid);
+                        const senderId = details[topic]?.sender_id || null;
+                        if (this.onEvent) this.onEvent(topic, mid, senderId);
                     }
                 }
             } catch (e) {

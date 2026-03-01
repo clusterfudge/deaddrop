@@ -1157,7 +1157,14 @@ class LocalBackend(Backend):
         else:
             changes = loop.run_until_complete(event_bus.subscribe(ns, topics, timeout=timeout))
 
-        return {"events": changes, "timeout": len(changes) == 0}
+        # Flatten to {topic: mid} for backward compatibility with clients;
+        # include rich details alongside.
+        events = {topic: info["latest_mid"] for topic, info in changes.items()}
+        details = {
+            topic: {"latest_mid": info["latest_mid"], "sender_id": info["sender_id"]}
+            for topic, info in changes.items()
+        }
+        return {"events": events, "details": details, "timeout": len(changes) == 0}
 
     def subscribe_stream(
         self,
