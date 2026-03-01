@@ -753,7 +753,7 @@ async def send_message(
 
     # Notify subscribers that the recipient's inbox has a new message
     try:
-        await get_event_bus().publish(ns, f"inbox:{request.to}", result["mid"])
+        await get_event_bus().publish(ns, f"inbox:{request.to}", result["mid"], sender_id=from_id)
     except Exception:
         logger.warning("Failed to publish inbox event", exc_info=True)
 
@@ -1407,7 +1407,7 @@ async def send_room_message(
 
     # Notify subscribers that this room has a new message
     try:
-        await get_event_bus().publish(ns, f"room:{room_id}", message["mid"])
+        await get_event_bus().publish(ns, f"room:{room_id}", message["mid"], sender_id=from_id)
     except Exception:
         logger.warning("Failed to publish room event", exc_info=True)
 
@@ -1578,8 +1578,17 @@ async def subscribe(
     # Poll mode — block until event or timeout
     changes = await event_bus.subscribe(ns, request.topics, timeout=request.timeout)
 
+    # Build response: "events" maps topic -> latest_mid (backward compatible),
+    # "details" maps topic -> {latest_mid, sender_id} (new rich info)
+    events = {topic: info["latest_mid"] for topic, info in changes.items()}
+    details = {
+        topic: {"latest_mid": info["latest_mid"], "sender_id": info["sender_id"]}
+        for topic, info in changes.items()
+    }
+
     return {
-        "events": changes,
+        "events": events,
+        "details": details,
         "timeout": len(changes) == 0,
     }
 
