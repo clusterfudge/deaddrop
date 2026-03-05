@@ -112,6 +112,10 @@ if STATIC_DIR.exists():
 # Initialize templates if directory exists
 templates = Jinja2Templates(directory=TEMPLATES_DIR) if TEMPLATES_DIR.exists() else None
 
+# Expose server-side configuration to templates as Jinja globals
+if templates:
+    templates.env.globals["ROOM_PAGE_SIZE"] = int(os.environ.get("DEADROP_ROOM_PAGE_SIZE", "20"))
+
 
 # --- Request/Response Models ---
 
