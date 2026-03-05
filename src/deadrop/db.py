@@ -2068,19 +2068,32 @@ def has_new_room_messages(
 def get_room_messages(
     room_id: str,
     after_mid: str | None = None,
+    before_mid: str | None = None,
     limit: int = 100,
     conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """Get messages from a room.
 
+    Supports both forward and backward pagination:
+    - ``after_mid``: messages newer than this ID (forward / polling)
+    - ``before_mid``: messages older than this ID (backward / scroll-up)
+
+    When ``before_mid`` is provided the query fetches the *newest* messages
+    that are still older than the cursor, so the caller receives the page
+    immediately preceding the cursor in chronological order.
+
+    Results are always returned in chronological (ascending mid) order
+    regardless of pagination direction.
+
     Args:
         room_id: Room ID
-        after_mid: Only get messages after this message ID (for pagination/polling)
+        after_mid: Only get messages after this message ID (forward pagination)
+        before_mid: Only get messages before this message ID (backward pagination)
         limit: Maximum number of messages to return
         conn: Optional database connection
 
     Returns:
-        List of message dicts ordered by creation time
+        List of message dicts ordered by creation time (ascending)
     """
     conn = _get_conn(conn)
 
@@ -2095,13 +2108,26 @@ def get_room_messages(
         query += " AND mid > ?"
         params.append(after_mid)
 
-    query += " ORDER BY mid LIMIT ?"
+    if before_mid:
+        query += " AND mid < ?"
+        params.append(before_mid)
+
+    # Determine sort direction:
+    # - after_mid only: forward scan (ASC) — polling for new messages
+    # - before_mid (with or without after_mid): backward scan (DESC) — scroll-up
+    # - neither cursor: backward scan (DESC) — initial load gets newest page
+    use_desc = not after_mid or (before_mid and not after_mid)
+
+    if use_desc:
+        query += " ORDER BY mid DESC LIMIT ?"
+    else:
+        query += " ORDER BY mid LIMIT ?"
     params.append(limit)
 
     cursor = conn.execute(query, tuple(params))
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
-    return [
+    messages = [
         {
             "mid": row["mid"],
             "room_id": row["room_id"],
@@ -2113,6 +2139,12 @@ def get_room_messages(
         }
         for row in rows
     ]
+
+    # DESC rows need reversing so callers always get chronological order.
+    if use_desc:
+        messages.reverse()
+
+    return messages
 
 
 def get_room_message(

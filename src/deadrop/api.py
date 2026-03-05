@@ -1346,14 +1346,19 @@ async def get_room_messages(
     ns: str,
     room_id: str,
     after: Annotated[str | None, Query()] = None,
+    before: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages from a room.
 
     Query parameters:
-    - after: Only return messages after this message ID (for pagination/polling)
+    - after: Only return messages after this message ID (forward pagination / polling)
+    - before: Only return messages before this message ID (backward pagination / scroll-up)
     - limit: Maximum number of messages to return (default: 100, max: 1000)
+
+    Messages are always returned in chronological order regardless of
+    pagination direction.
 
     For real-time updates, use the POST /{ns}/subscribe endpoint instead.
     """
@@ -1365,7 +1370,13 @@ async def get_room_messages(
         raise HTTPException(404, "Room not found in this namespace")
 
     messages = await _run_sync(
-        functools.partial(db.get_room_messages, room_id, after_mid=after, limit=limit)
+        functools.partial(
+            db.get_room_messages,
+            room_id,
+            after_mid=after,
+            before_mid=before,
+            limit=limit,
+        )
     )
 
     return {

@@ -560,6 +560,7 @@ class Deaddrop:
         room_id: str,
         secret: str,
         after_mid: str | None = None,
+        before_mid: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Get messages from a room.
@@ -568,14 +569,15 @@ class Deaddrop:
             ns: Namespace ID.
             room_id: Room ID.
             secret: Caller's inbox secret (must be a member).
-            after_mid: Only get messages after this ID.
+            after_mid: Only get messages after this ID (forward pagination).
+            before_mid: Only get messages before this ID (backward pagination).
             limit: Maximum messages to return.
 
         Returns:
-            List of message dicts.
+            List of message dicts in chronological order.
         """
         return self._backend.get_room_messages(
-            ns, room_id, secret, after_mid=after_mid, limit=limit
+            ns, room_id, secret, after_mid=after_mid, before_mid=before_mid, limit=limit
         )
 
     def update_room_read_cursor(

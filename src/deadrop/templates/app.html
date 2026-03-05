@@ -182,6 +182,8 @@
     let roomMessages = [];
     let roomMembers = {};
     let roomMessagesLoading = false;  // Guard against concurrent fetches
+    let roomHasOlderMessages = true;  // Whether there are more messages to load on scroll-up
+    let roomLoadingOlder = false;     // Guard against concurrent scroll-up fetches
     // Legacy long-poll removed — subscriptions are the sole update mechanism
     let subscriptionManager = null;  // Unified subscription manager
     
@@ -633,9 +635,12 @@
         }
     }
     
+    const ROOM_PAGE_SIZE = 100;
+
     async function loadRoomMessages() {
         const list = document.getElementById('room-message-list');
         roomMessagesLoading = true;
+        roomHasOlderMessages = true;
         
         // Try loading from cache first for instant display
         const cacheKey = `room_messages_${currentRoomId}`;
@@ -655,30 +660,23 @@
         try {
             const startTime = performance.now();
             
-            // Paginate to fetch ALL messages (server default limit is 100)
-            const PAGE_SIZE = 500;
-            let allMessages = [];
-            let afterMid = null;
-            
-            while (true) {
-                const result = await DeadropAPI.getRoomMessages(
-                    credentials, currentRoomId, { afterMid, limit: PAGE_SIZE });
-                const page = result?.messages || [];
-                allMessages = [...allMessages, ...page];
-                
-                if (page.length < PAGE_SIZE) break;  // Last page
-                afterMid = page[page.length - 1].mid;
-            }
+            // Load only the newest page — no cursor means "latest N messages"
+            // The server returns results in chronological order (ASC) even
+            // when fetching backward, so the last element is the newest.
+            const result = await DeadropAPI.getRoomMessages(
+                credentials, currentRoomId, { limit: ROOM_PAGE_SIZE });
+            const page = result?.messages || [];
             
             const elapsed = Math.round(performance.now() - startTime);
-            console.log(`Room messages loaded in ${elapsed}ms (${allMessages.length} msgs)`);
+            console.log(`Room messages loaded in ${elapsed}ms (${page.length} msgs)`);
             
-            roomMessages = allMessages;
+            roomMessages = page;
+            roomHasOlderMessages = page.length >= ROOM_PAGE_SIZE;
             
             // Save to cache
             localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
             
-            // Update subscription cursor
+            // Update subscription cursor for the newest message
             if (subscriptionManager && roomMessages.length > 0) {
                 const lastMid = roomMessages[roomMessages.length - 1].mid;
                 subscriptionManager.updateCursor(`room:${currentRoomId}`, lastMid);
@@ -691,6 +689,59 @@
             }
         } finally {
             roomMessagesLoading = false;
+        }
+    }
+    
+    /**
+     * Load older messages when the user scrolls to the top.
+     * Uses the `before` cursor to fetch the page preceding the oldest
+     * message currently loaded.
+     */
+    async function loadOlderRoomMessages() {
+        if (roomLoadingOlder || !roomHasOlderMessages || roomMessages.length === 0) return;
+        roomLoadingOlder = true;
+        
+        const list = document.getElementById('room-message-list');
+        
+        try {
+            // The oldest message we have is the first element (chronological order)
+            const oldestMid = roomMessages[0].mid;
+            
+            const result = await DeadropAPI.getRoomMessages(
+                credentials, currentRoomId, { beforeMid: oldestMid, limit: ROOM_PAGE_SIZE });
+            const olderPage = result?.messages || [];
+            
+            if (olderPage.length === 0) {
+                roomHasOlderMessages = false;
+                return;
+            }
+            
+            roomHasOlderMessages = olderPage.length >= ROOM_PAGE_SIZE;
+            
+            // Prepend older messages (they come in chronological order)
+            roomMessages = [...olderPage, ...roomMessages];
+            
+            // Save to cache
+            const cacheKey = `room_messages_${currentRoomId}`;
+            localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
+            
+            // Re-render preserving scroll position.
+            // With column-reverse, the "top" in visual terms is the bottom of
+            // the DOM scroll.  We record scrollHeight before, render, then
+            // adjust scrollTop by the delta so the viewport stays on the same
+            // messages.
+            const prevScrollHeight = list.scrollHeight;
+            renderRoomMessages({skipReadCursor: true});
+            const newScrollHeight = list.scrollHeight;
+            // column-reverse: scrollTop is negative (or 0 at bottom).
+            // Adding the height delta keeps the same content in view.
+            list.scrollTop -= (newScrollHeight - prevScrollHeight);
+            
+            console.log(`Loaded ${olderPage.length} older messages (total: ${roomMessages.length})`);
+        } catch (e) {
+            console.error('Failed to load older messages:', e);
+        } finally {
+            roomLoadingOlder = false;
         }
     }
     
@@ -723,7 +774,7 @@
         return `<div class="reaction-badges">${badges}<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button></div>`;
     }
     
-    function renderRoomMessages() {
+    function renderRoomMessages({skipReadCursor = false} = {}) {
         const list = document.getElementById('room-message-list');
         
         // Build reaction map from all messages
@@ -734,6 +785,12 @@
         
         // Reverse for column-reverse display (newest at bottom visually)
         const reversed = [...displayMessages].reverse();
+
+        // Show a "load more" sentinel at the visual top (DOM bottom in
+        // column-reverse) when there are older messages to fetch.
+        const loadMoreHtml = roomHasOlderMessages
+            ? '<div id="room-load-more" class="load-more-sentinel" style="text-align:center;padding:12px;color:var(--text-muted);font-size:13px;">Loading older messages…</div>'
+            : '';
         
         list.innerHTML = reversed.map(msg => {
             const isMe = msg.from_id === credentials.id;
@@ -747,19 +804,33 @@
                     <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
                 </div>
             `;
-        }).join('');
+        }).join('') + loadMoreHtml;
         
         // No need to scroll - column-reverse keeps us at bottom
         
         // Apply syntax highlighting to code blocks
         highlightCodeBlocks(list);
         
-        // Update read cursor (skip pending messages)
-        const realMessages = roomMessages.filter(m => !m.pending);
-        if (realMessages.length > 0) {
-            const lastMid = realMessages[realMessages.length - 1].mid;
-            DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
+        // Only update read cursor if the newest message is actually visible
+        // (i.e. the user hasn't scrolled up away from the bottom).
+        // In column-reverse, scrollTop ≈ 0 means we're at the bottom (newest).
+        if (!skipReadCursor && isAtBottom(list)) {
+            const realMessages = roomMessages.filter(m => !m.pending);
+            if (realMessages.length > 0) {
+                const lastMid = realMessages[realMessages.length - 1].mid;
+                DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
+            }
         }
+    }
+    
+    /**
+     * Check whether the message list is scrolled to the bottom (newest).
+     * In a column-reverse container, scrollTop = 0 means "at the bottom"
+     * (newest content visible). Negative values mean scrolled up.
+     */
+    function isAtBottom(listEl) {
+        // Allow a small tolerance for fractional pixels
+        return listEl.scrollTop >= -50;
     }
     
     async function sendRoomMessage() {
@@ -965,7 +1036,10 @@
                     roomMessages = [...roomMessages, ...newMsgs];
                     const cacheKey = `room_messages_${roomId}`;
                     localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
-                    renderRoomMessages();
+                    
+                    // Only auto-update read cursor if user is at the bottom
+                    const list = document.getElementById('room-message-list');
+                    renderRoomMessages({skipReadCursor: !isAtBottom(list)});
                 }
                 
                 // Update subscription cursor (always, even if deduplicated)
@@ -1043,6 +1117,8 @@
         currentRoomId = null;
         roomMessages = [];
         roomMembers = {};
+        roomHasOlderMessages = true;
+        roomLoadingOlder = false;
         history.pushState({}, '', `/app/${currentSlug}`);
         showView('inbox');
     });
@@ -1057,6 +1133,31 @@
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendMessage();
+        }
+    });
+    
+    // Scroll-up to load older messages + scroll-to-bottom to mark as read
+    document.getElementById('room-message-list').addEventListener('scroll', () => {
+        const list = document.getElementById('room-message-list');
+        
+        // column-reverse: scrollTop is 0 at bottom, negative when scrolled up.
+        // When the user scrolls near the "top" (oldest, most negative scrollTop),
+        // load more history.
+        if (roomHasOlderMessages && !roomLoadingOlder) {
+            const scrolledUp = -list.scrollTop;
+            const threshold = list.scrollHeight - list.clientHeight - 200;
+            if (scrolledUp >= threshold) {
+                loadOlderRoomMessages();
+            }
+        }
+        
+        // When the user scrolls back to the bottom (newest), update read cursor
+        if (isAtBottom(list)) {
+            const realMessages = roomMessages.filter(m => !m.pending);
+            if (realMessages.length > 0) {
+                const lastMid = realMessages[realMessages.length - 1].mid;
+                DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
+            }
         }
     });
     

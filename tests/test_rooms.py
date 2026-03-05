@@ -378,6 +378,44 @@ class TestRoomMessages:
         messages = db.get_room_messages(room["room_id"], limit=3)
 
         assert len(messages) == 3
+        # No cursor = newest page; results are still chronological (ASC)
+        assert messages[0]["body"] == "Message 2"
+        assert messages[2]["body"] == "Message 4"
+
+    def test_get_room_messages_before_mid(self):
+        """Get older messages before a given mid (backward pagination)."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+
+        mids = []
+        for i in range(5):
+            msg = db.send_room_message(room["room_id"], alice["id"], f"Message {i}")
+            mids.append(msg["mid"])
+
+        # Get messages before mid[3] (i.e., "Message 3"), limit 2
+        messages = db.get_room_messages(room["room_id"], before_mid=mids[3], limit=2)
+
+        assert len(messages) == 2
+        # Should get the 2 newest messages before mid[3]: "Message 1" and "Message 2"
+        assert messages[0]["body"] == "Message 1"
+        assert messages[1]["body"] == "Message 2"
+
+    def test_get_room_messages_before_mid_exhausted(self):
+        """Before-mid pagination returns fewer when history is exhausted."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+
+        mids = []
+        for i in range(3):
+            msg = db.send_room_message(room["room_id"], alice["id"], f"Message {i}")
+            mids.append(msg["mid"])
+
+        # Ask for 10 before mid[1], only "Message 0" exists
+        messages = db.get_room_messages(room["room_id"], before_mid=mids[1], limit=10)
+
+        assert len(messages) == 1
         assert messages[0]["body"] == "Message 0"
 
     def test_get_room_message(self):

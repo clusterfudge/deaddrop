@@ -392,6 +392,7 @@ class Backend(ABC):
         room_id: str,
         secret: str,
         after_mid: str | None = None,
+        before_mid: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Get messages from a room.
@@ -400,11 +401,12 @@ class Backend(ABC):
             ns: Namespace ID
             room_id: Room ID
             secret: Caller's inbox secret (must be a member)
-            after_mid: Only get messages after this ID
+            after_mid: Only get messages after this ID (forward pagination)
+            before_mid: Only get messages before this ID (backward pagination)
             limit: Maximum messages to return
 
         Returns:
-            List of message dicts
+            List of message dicts in chronological order
         """
         ...
 
@@ -970,6 +972,7 @@ class LocalBackend(Backend):
         room_id: str,
         secret: str,
         after_mid: str | None = None,
+        before_mid: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         identity_id = derive_id(secret)
@@ -980,7 +983,9 @@ class LocalBackend(Backend):
         if not room or room.get("ns") != ns:
             raise ValueError("Room not found in this namespace")
 
-        return db.get_room_messages(room_id, after_mid=after_mid, limit=limit, conn=self._conn)
+        return db.get_room_messages(
+            room_id, after_mid=after_mid, before_mid=before_mid, limit=limit, conn=self._conn
+        )
 
     def update_room_read_cursor(
         self,
@@ -1629,11 +1634,14 @@ class RemoteBackend(Backend):
         room_id: str,
         secret: str,
         after_mid: str | None = None,
+        before_mid: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         params = []
         if after_mid:
             params.append(f"after={after_mid}")
+        if before_mid:
+            params.append(f"before={before_mid}")
         if limit != 100:
             params.append(f"limit={limit}")
 
