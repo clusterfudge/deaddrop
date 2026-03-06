@@ -184,6 +184,7 @@
     let roomMessagesLoading = false;  // Guard against concurrent fetches
     let roomHasOlderMessages = true;  // Whether there are more messages to load on scroll-up
     let roomLoadingOlder = false;     // Guard against concurrent scroll-up fetches
+    let roomReadCursorTimer = null;   // Debounce timer for read cursor updates
     // Legacy long-poll removed — subscriptions are the sole update mechanism
     let subscriptionManager = null;  // Unified subscription manager
     
@@ -607,11 +608,17 @@
         currentRoomId = roomId;
         history.pushState({}, '', `/app/${currentSlug}/room/${roomId}`);
         
-        // Load room details and members
+        // Show room view immediately with loading state
+        showView('roomChat');
+        document.getElementById('room-message-list').innerHTML =
+            '<div class="loading"><div class="spinner"></div></div>';
+
+        // Fetch room details, members, AND messages in parallel
         try {
             const [roomDetails, members] = await Promise.all([
                 DeadropAPI.getRoom(credentials, roomId),
                 DeadropAPI.listRoomMembers(credentials, roomId),
+                loadRoomMessages(),  // runs concurrently — populates roomMessages
             ]);
             
             document.getElementById('room-chat-title').textContent = roomDetails.display_name || 'Room';
@@ -625,9 +632,8 @@
             document.getElementById('room-chat-members').textContent = 
                 `${Object.keys(roomMembers).length} members`;
             
-            showView('roomChat');
-            await loadRoomMessages();
-            // Focus the input so the user can start typing immediately
+            // Re-render now that we have member names
+            renderRoomMessages();
             document.getElementById('room-message-input').focus();
             
         } catch (e) {
@@ -813,13 +819,9 @@
         
         // Only update read cursor if the newest message is actually visible
         // (i.e. the user hasn't scrolled up away from the bottom).
-        // In column-reverse, scrollTop ≈ 0 means we're at the bottom (newest).
+        // Debounced to avoid spamming the server on rapid re-renders.
         if (!skipReadCursor && isAtBottom(list)) {
-            const realMessages = roomMessages.filter(m => !m.pending);
-            if (realMessages.length > 0) {
-                const lastMid = realMessages[realMessages.length - 1].mid;
-                DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
-            }
+            debouncedUpdateReadCursor();
         }
     }
     
@@ -831,6 +833,22 @@
     function isAtBottom(listEl) {
         // Allow a small tolerance for fractional pixels
         return listEl.scrollTop >= -50;
+    }
+
+    /**
+     * Debounced read cursor update — coalesces rapid calls (scroll events,
+     * multiple renders during load) into a single POST after 500ms of quiet.
+     */
+    function debouncedUpdateReadCursor() {
+        if (roomReadCursorTimer) clearTimeout(roomReadCursorTimer);
+        roomReadCursorTimer = setTimeout(() => {
+            roomReadCursorTimer = null;
+            const realMessages = roomMessages.filter(m => !m.pending);
+            if (realMessages.length > 0 && currentRoomId) {
+                const lastMid = realMessages[realMessages.length - 1].mid;
+                DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
+            }
+        }, 500);
     }
     
     async function sendRoomMessage() {
@@ -1153,11 +1171,7 @@
         
         // When the user scrolls back to the bottom (newest), update read cursor
         if (isAtBottom(list)) {
-            const realMessages = roomMessages.filter(m => !m.pending);
-            if (realMessages.length > 0) {
-                const lastMid = realMessages[realMessages.length - 1].mid;
-                DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
-            }
+            debouncedUpdateReadCursor();
         }
     });
     
