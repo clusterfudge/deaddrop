@@ -115,6 +115,33 @@ def get_db_executor():
     return _db_executor
 
 
+def _replace_db_executor():
+    """Replace the shared DB executor with a fresh one.
+
+    Called when the executor thread is stuck on a hung Turso operation.
+    The old executor (and its stuck thread) is abandoned — the thread is a
+    daemon so it won't prevent process exit.
+
+    The old executor is intentionally NOT shut down (that would block waiting
+    for the stuck thread to finish).  A new single-threaded executor is
+    created to take its place.
+    """
+    global _db_executor
+
+    if not is_using_libsql():
+        return  # Only relevant for libsql with its single-threaded executor
+
+    with _db_executor_lock:
+        from concurrent.futures import ThreadPoolExecutor
+
+        import logging
+
+        _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+        logging.getLogger(__name__).warning(
+            "Replaced stuck DB executor with a fresh one (old thread abandoned)"
+        )
+
+
 def _reset_libsql_connection() -> None:
     """Reset the global libsql connection.
 

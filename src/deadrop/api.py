@@ -344,14 +344,50 @@ def _get_db_executor():
     return db.get_db_executor()
 
 
+# Maximum time a single DB operation can take before we assume the connection
+# is stale and needs to be reset.  This prevents a hung Turso query from
+# blocking the single-threaded executor indefinitely.
+DB_OPERATION_TIMEOUT = float(os.environ.get("DEADROP_DB_OPERATION_TIMEOUT", "15"))
+
+
 async def _run_sync(fn, *args):
     """Run a synchronous function off the event loop.
 
     Uses a single-threaded executor for libsql/Turso (shared connection)
     or the default threadpool for local SQLite (thread-local connections).
+
+    Wraps the call in an asyncio timeout so that a hung Turso connection
+    cannot block the server indefinitely.  On timeout the executor is
+    replaced (the hung thread is abandoned as a daemon) and the libsql
+    connection is reset on the new executor.
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_get_db_executor(), fn, *args)
+    executor = _get_db_executor()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(executor, fn, *args),
+            timeout=DB_OPERATION_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        import logging
+
+        logging.error(
+            f"DB operation timed out after {DB_OPERATION_TIMEOUT}s, "
+            "replacing executor and resetting connection"
+        )
+        # The old executor thread is stuck — replace the executor entirely.
+        # The hung thread is a daemon and will be abandoned.
+        db._replace_db_executor()
+        # Reset connection on the *new* executor
+        new_executor = db.get_db_executor()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(new_executor, db._reset_libsql_connection),
+                timeout=5.0,
+            )
+        except Exception:
+            pass
+        raise HTTPException(503, "Database operation timed out — please retry")
 
 
 async def _require_active_namespace(ns: str) -> None:

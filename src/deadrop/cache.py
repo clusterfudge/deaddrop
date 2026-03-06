@@ -45,7 +45,9 @@ IDENTITY_CACHE_SIZE = int(os.environ.get("DEADROP_IDENTITY_CACHE_SIZE", 5000))
 
 # Cache warming configuration
 CACHE_WARMING_ENABLED = os.environ.get("DEADROP_CACHE_WARMING", "1").lower() in ("1", "true", "yes")
-CACHE_REFRESH_INTERVAL = int(os.environ.get("DEADROP_CACHE_REFRESH_INTERVAL", 300))  # 5 min default
+CACHE_REFRESH_INTERVAL = int(
+    os.environ.get("DEADROP_CACHE_REFRESH_INTERVAL", 1800)
+)  # 30 min default
 CACHE_WARMING_TIMEOUT = int(os.environ.get("DEADROP_CACHE_WARMING_TIMEOUT", 30))  # 30s default
 
 
@@ -440,6 +442,13 @@ def schedule_cache_warming() -> None:
         except asyncio.TimeoutError:
             logger.error(f"Initial cache warming timed out after {CACHE_WARMING_TIMEOUT}s")
             print(f"ERROR:    Initial cache warming timed out after {CACHE_WARMING_TIMEOUT}s")
+            from . import db as _db
+
+            try:
+                _db._replace_db_executor()
+                _db._reset_libsql_connection()
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Initial cache warming failed: {e}")
             print(f"ERROR:    Initial cache warming failed: {e}")
@@ -467,7 +476,15 @@ def schedule_cache_warming() -> None:
                     logger.debug(f"Cache refresh: {results}")
                 except asyncio.TimeoutError:
                     logger.error(f"Cache refresh timed out after {CACHE_WARMING_TIMEOUT}s")
-                    # Continue running - don't let refresh failures stop the loop
+                    # The executor thread is likely stuck on a hung Turso
+                    # query.  Replace it so API handlers can proceed.
+                    from . import db as _db
+
+                    try:
+                        _db._replace_db_executor()
+                        _db._reset_libsql_connection()
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.error(f"Cache refresh failed: {e}")
                     # Continue running - don't let refresh failures stop the loop
