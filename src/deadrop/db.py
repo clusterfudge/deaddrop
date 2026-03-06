@@ -136,9 +136,13 @@ def _reset_libsql_connection() -> None:
     try:
         if _conn is not None:
             try:
-                _conn.close()
+                _run_with_timeout(
+                    lambda: _conn.close(),  # type: ignore[union-attr]
+                    timeout=2.0,
+                    description="conn.close()",
+                )
             except Exception:
-                pass  # Ignore close errors on stale connection
+                pass  # Abandon the stale connection
             _conn = None
             _is_libsql = False
     finally:
@@ -160,6 +164,46 @@ def _is_hrana_stream_error(error: Exception) -> bool:
     )
 
 
+def _run_with_timeout(fn, timeout: float, description: str = "operation"):
+    """Run a blocking function in a daemon thread with a timeout.
+
+    This is used to wrap operations that may hang indefinitely on network
+    I/O (e.g. ``libsql.connect()``, ``conn.execute("SELECT 1")``).
+
+    Args:
+        fn: A zero-argument callable to run.
+        timeout: Maximum seconds to wait.
+        description: Human-readable label for error messages.
+
+    Returns:
+        The return value of ``fn()``.
+
+    Raises:
+        TimeoutError: If the function does not complete in time.
+        Exception: Any exception raised by ``fn``.
+    """
+    result: list[Any] = [None]
+    error: list[BaseException | None] = [None]
+
+    def _wrapper():
+        try:
+            result[0] = fn()
+        except BaseException as e:
+            error[0] = e
+
+    t = threading.Thread(target=_wrapper, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        raise TimeoutError(f"{description} timed out after {timeout}s")
+
+    if error[0] is not None:
+        raise error[0]
+
+    return result[0]
+
+
 def _health_check_conn(
     conn: sqlite3.Connection, timeout: float = LIBSQL_HEALTH_CHECK_TIMEOUT
 ) -> None:
@@ -177,25 +221,7 @@ def _health_check_conn(
         TimeoutError: If the health check does not complete in time.
         Exception: Any exception raised by the underlying ``execute``.
     """
-    error: list[BaseException | None] = [None]
-
-    def _probe():
-        try:
-            conn.execute("SELECT 1")
-        except BaseException as e:
-            error[0] = e
-
-    t = threading.Thread(target=_probe, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-
-    if t.is_alive():
-        raise TimeoutError(
-            f"Database health check timed out after {timeout}s. The connection is likely stale."
-        )
-
-    if error[0] is not None:
-        raise error[0]
+    _run_with_timeout(lambda: conn.execute("SELECT 1"), timeout, "Database health check")
 
 
 # --- Connection Management ---
@@ -255,10 +281,19 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
                 logging.info(f"Creating new libsql connection to {db_url[:50]}...")
                 try:
-                    _conn = libsql.connect(
-                        db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")
+                    _conn = _run_with_timeout(
+                        lambda: libsql.connect(
+                            db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")
+                        ),
+                        timeout=LIBSQL_CONNECT_TIMEOUT,
+                        description="libsql.connect()",
                     )
                     _is_libsql = True
+                except TimeoutError:
+                    logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
+                    raise RuntimeError(
+                        f"Timed out connecting to Turso database after {LIBSQL_CONNECT_TIMEOUT}s"
+                    )
                 except Exception as e:
                     logging.error(f"Failed to connect to libsql: {e}")
                     raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
@@ -279,10 +314,16 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
                     reason = "timed out" if is_timeout else "stale"
                     logging.warning(f"Libsql connection {reason}, reconnecting: {e}")
+                    # Close the stale connection with a timeout — close() itself
+                    # can hang on a dead TCP socket.
                     try:
-                        _conn.close()
+                        _run_with_timeout(
+                            lambda: _conn.close(),  # type: ignore[union-attr]
+                            timeout=2.0,
+                            description="conn.close()",
+                        )
                     except Exception:
-                        pass
+                        pass  # Abandon the stale connection
                     _conn = None
                     _is_libsql = False
                     # Release lock before recursive call to avoid deadlock
