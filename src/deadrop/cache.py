@@ -1,16 +1,20 @@
-"""In-memory caching with TTL for deadrop.
+"""In-memory caching with write-through invalidation for deadrop.
 
-This module provides a simple TTL-based cache that doesn't require external
-dependencies. It's designed for caching auth-related data to reduce database
-round-trips.
+This module provides a simple in-memory cache for auth-related data (rooms,
+memberships, identity hashes) to eliminate redundant database round-trips.
 
-For single-instance deployments, we use long TTLs and background cache warming:
-- Identity hashes NEVER change (identity must be deleted/recreated)
-- Room info rarely changes (only display_name updates)
-- Membership changes are explicitly invalidated on add/remove
+Strategy: warm-on-startup + cache-aside with write-through invalidation.
 
-Cache keys are designed to be invalidated when the underlying data changes.
-LRU eviction prevents unbounded memory growth.
+Since deaddrop is deployed as a single process with a single worker, there
+are no out-of-process writers.  Every mutation flows through our API handlers,
+so we can invalidate/update cache entries at write time and never need
+periodic background refreshes.
+
+- Startup: bulk-load all rooms, memberships, and identity hashes
+- Reads: check cache first, fall through to DB on miss, populate cache
+- Writes: API handlers call invalidation helpers after mutations
+- No TTL expiration needed (LRU eviction prevents unbounded memory growth)
+- Admin cache-bust endpoint available for manual recovery
 """
 
 from __future__ import annotations
@@ -32,48 +36,42 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Cache TTL configuration (can be overridden via environment)
-# For single-instance deployments with cache warming, these can be very long
-ROOM_CACHE_TTL = float(os.environ.get("DEADROP_ROOM_CACHE_TTL", 3600))  # 1 hour default
-MEMBERSHIP_CACHE_TTL = float(os.environ.get("DEADROP_MEMBERSHIP_CACHE_TTL", 3600))  # 1 hour default
-IDENTITY_CACHE_TTL = float(os.environ.get("DEADROP_IDENTITY_CACHE_TTL", 86400))  # 24 hours default
-
 # Cache size limits
 ROOM_CACHE_SIZE = int(os.environ.get("DEADROP_ROOM_CACHE_SIZE", 1000))
 MEMBERSHIP_CACHE_SIZE = int(os.environ.get("DEADROP_MEMBERSHIP_CACHE_SIZE", 10000))
 IDENTITY_CACHE_SIZE = int(os.environ.get("DEADROP_IDENTITY_CACHE_SIZE", 5000))
 
 # Cache warming configuration
-CACHE_WARMING_ENABLED = os.environ.get("DEADROP_CACHE_WARMING", "1").lower() in ("1", "true", "yes")
-CACHE_REFRESH_INTERVAL = int(
-    os.environ.get("DEADROP_CACHE_REFRESH_INTERVAL", 1800)
-)  # 30 min default
+CACHE_WARMING_ENABLED = os.environ.get("DEADROP_CACHE_WARMING", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 CACHE_WARMING_TIMEOUT = int(os.environ.get("DEADROP_CACHE_WARMING_TIMEOUT", 30))  # 30s default
 
 
 @dataclass
 class CacheEntry:
-    """A single cache entry with expiration."""
+    """A single cache entry."""
 
     value: Any
-    expires_at: float
-
-    def is_expired(self) -> bool:
-        return time.time() > self.expires_at
+    created_at: float
 
 
 @dataclass
 class TTLCache:
-    """Thread-safe TTL cache with LRU eviction.
+    """Thread-safe in-memory cache with LRU eviction.
+
+    With TTL=0 (default for single-process deployments), entries never
+    expire — they are only evicted by LRU when the cache is full, or
+    explicitly invalidated on write.
 
     Args:
         name: Name of the cache (for metrics)
-        default_ttl: Default TTL in seconds (0 = no expiration, rely on LRU)
         max_size: Maximum number of entries (LRU eviction when exceeded)
     """
 
     name: str
-    default_ttl: float = 3600.0
     max_size: int = 1000
     _data: dict[str, CacheEntry] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -91,14 +89,6 @@ class TTLCache:
                 metrics.record_cache_miss(self.name)
                 return False, None
 
-            # Check expiration (skip if TTL is 0 - no expiration)
-            if self.default_ttl > 0 and entry.is_expired():
-                del self._data[key]
-                if key in self._access_order:
-                    self._access_order.remove(key)
-                metrics.record_cache_miss(self.name)
-                return False, None
-
             # Update access order for LRU
             if key in self._access_order:
                 self._access_order.remove(key)
@@ -107,63 +97,46 @@ class TTLCache:
             metrics.record_cache_hit(self.name)
             return True, entry.value
 
-    def set(self, key: str, value: Any, ttl: float | None = None) -> None:
+    def set(self, key: str, value: Any, **_kwargs: Any) -> None:
         """Set a value in the cache.
 
         Args:
             key: Cache key
             value: Value to cache
-            ttl: TTL in seconds (uses default_ttl if not specified, 0 = no expiration)
         """
-        if ttl is None:
-            ttl = self.default_ttl
-
         with self._lock:
-            # Evict expired entries periodically
-            if len(self._data) >= self.max_size:
-                self._evict_expired()
-
-            # If still at max, evict LRU
+            # If at max, evict LRU
             while len(self._data) >= self.max_size and self._access_order:
                 oldest_key = self._access_order.pop(0)
                 self._data.pop(oldest_key, None)
 
-            # For TTL of 0, set expiration far in the future (effectively no expiration)
-            expires_at = time.time() + ttl if ttl > 0 else float("inf")
-
             self._data[key] = CacheEntry(
                 value=value,
-                expires_at=expires_at,
+                created_at=time.time(),
             )
             if key in self._access_order:
                 self._access_order.remove(key)
             self._access_order.append(key)
 
-    def set_bulk(self, items: dict[str, Any], ttl: float | None = None) -> int:
+    def set_bulk(self, items: dict[str, Any], **_kwargs: Any) -> int:
         """Set multiple values in the cache efficiently.
 
         Args:
             items: Dictionary of key -> value pairs
-            ttl: TTL in seconds (uses default_ttl if not specified)
 
         Returns:
             Number of items added
         """
-        if ttl is None:
-            ttl = self.default_ttl
-
-        expires_at = time.time() + ttl if ttl > 0 else float("inf")
         added = 0
+        now = time.time()
 
         with self._lock:
             for key, value in items.items():
-                if len(self._data) >= self.max_size:
-                    self._evict_expired()
-                    if len(self._data) >= self.max_size and self._access_order:
-                        oldest_key = self._access_order.pop(0)
-                        self._data.pop(oldest_key, None)
+                if len(self._data) >= self.max_size and self._access_order:
+                    oldest_key = self._access_order.pop(0)
+                    self._data.pop(oldest_key, None)
 
-                self._data[key] = CacheEntry(value=value, expires_at=expires_at)
+                self._data[key] = CacheEntry(value=value, created_at=now)
                 if key in self._access_order:
                     self._access_order.remove(key)
                 self._access_order.append(key)
@@ -205,43 +178,25 @@ class TTLCache:
             self._data.clear()
             self._access_order.clear()
 
-    def _evict_expired(self) -> None:
-        """Evict all expired entries. Must be called with lock held."""
-        now = time.time()
-        expired_keys = [k for k, v in self._data.items() if v.expires_at <= now]
-        for key in expired_keys:
-            del self._data[key]
-            if key in self._access_order:
-                self._access_order.remove(key)
-
     def stats(self) -> dict:
         """Get cache statistics."""
         with self._lock:
             return {
                 "size": len(self._data),
                 "max_size": self.max_size,
-                "ttl_seconds": self.default_ttl,
             }
 
 
-# Global cache instances with configurable TTLs
-room_cache = TTLCache(
-    name="room",
-    default_ttl=ROOM_CACHE_TTL,
-    max_size=ROOM_CACHE_SIZE,
-)
+# Global cache instances
+room_cache = TTLCache(name="room", max_size=ROOM_CACHE_SIZE)
+membership_cache = TTLCache(name="membership", max_size=MEMBERSHIP_CACHE_SIZE)
+identity_hash_cache = TTLCache(name="identity_hash", max_size=IDENTITY_CACHE_SIZE)
 
-membership_cache = TTLCache(
-    name="membership",
-    default_ttl=MEMBERSHIP_CACHE_TTL,
-    max_size=MEMBERSHIP_CACHE_SIZE,
-)
 
-identity_hash_cache = TTLCache(
-    name="identity_hash",
-    default_ttl=IDENTITY_CACHE_TTL,
-    max_size=IDENTITY_CACHE_SIZE,
-)
+# --- Write-through invalidation helpers ---
+# These MUST be called by API handlers after every mutation to rooms,
+# memberships, or identities.  Since we're a single-process server,
+# this is the only mechanism that keeps the cache consistent.
 
 
 def invalidate_room(room_id: str) -> None:
@@ -256,29 +211,32 @@ def invalidate_membership(room_id: str, identity_id: str) -> None:
 
 
 def invalidate_identity(ns: str, identity_id: str) -> None:
-    """Invalidate all caches related to an identity."""
+    """Invalidate all caches related to an identity.
+
+    This does a broad membership invalidation because an identity's
+    memberships span multiple rooms and we don't track which ones.
+    """
     identity_hash_cache.delete(f"identity:{ns}:{identity_id}")
-    # Invalidate all memberships for this identity
-    membership_cache.invalidate_prefix("member:")  # Broad invalidation
+    membership_cache.invalidate_prefix("member:")
 
 
 def clear_all_caches() -> None:
-    """Clear all caches (useful for testing)."""
+    """Clear all caches.  Used by the admin cache-bust endpoint and tests."""
     room_cache.clear()
     membership_cache.clear()
     identity_hash_cache.clear()
+    logger.info("All caches cleared")
 
 
-# --- Cache Warming ---
+# --- Startup Cache Warming ---
 
 
 async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
-    """Warm all caches by loading auth data from the database.
+    """Warm all caches by bulk-loading auth data from the database.
 
-    This runs as a background task on startup to pre-populate caches with:
-    - All rooms
-    - All room memberships
-    - All identity secret hashes
+    Called once at startup to pre-populate caches.  After this, the caches
+    are kept consistent via write-through invalidation — no periodic refresh
+    is needed.
 
     Args:
         conn: Optional database connection (uses global if not provided)
@@ -289,15 +247,6 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
     from . import db
 
     if conn is None:
-        # IMPORTANT: Get the connection via the shared DB executor to avoid
-        # both blocking the event loop AND concurrent access to the shared
-        # libsql connection.  For libsql/Turso, get_connection() acquires a
-        # threading lock and runs a network health check — both blocking
-        # operations that would freeze the entire server if executed on
-        # the event loop thread.  Using the DB executor (instead of the
-        # default threadpool) ensures cache warming is serialized with API
-        # handler DB operations, preventing thread-safety violations on the
-        # shared libsql connection.
         loop = asyncio.get_event_loop()
         executor = db.get_db_executor()
         conn = await loop.run_in_executor(executor, db.get_connection)
@@ -306,15 +255,12 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
     results = {"rooms": 0, "memberships": 0, "identities": 0}
 
     try:
-        # Warm room cache
         rooms_cached = await _warm_room_cache(conn)
         results["rooms"] = rooms_cached
 
-        # Warm membership cache
         memberships_cached = await _warm_membership_cache(conn)
         results["memberships"] = memberships_cached
 
-        # Warm identity hash cache
         identities_cached = await _warm_identity_cache(conn)
         results["identities"] = identities_cached
 
@@ -325,7 +271,6 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
             f"{results['identities']} identities"
         )
         logger.info(msg)
-        # Also print to ensure visibility in uvicorn logs
         print(f"INFO:     {msg}")
 
     except Exception as e:
@@ -340,9 +285,6 @@ async def _warm_room_cache(conn: sqlite3.Connection) -> int:
     """Load all rooms into cache."""
     from . import db
 
-    # Run DB query via the shared DB executor to serialize with API operations.
-    # Using the default threadpool here would cause concurrent access to the
-    # shared libsql connection, which is not thread-safe.
     loop = asyncio.get_event_loop()
     executor = db.get_db_executor()
     cursor = await loop.run_in_executor(
@@ -351,14 +293,12 @@ async def _warm_room_cache(conn: sqlite3.Connection) -> int:
     )
     rows = await loop.run_in_executor(executor, cursor.fetchall)
 
-    # Build cache entries
     items = {}
     for row in rows:
         room_data = db._row_to_dict(cursor.description, row)
         if room_data:
             items[f"room:{room_data['room_id']}"] = room_data
 
-    # Bulk insert
     return room_cache.set_bulk(items)
 
 
@@ -366,7 +306,6 @@ async def _warm_membership_cache(conn: sqlite3.Connection) -> int:
     """Load all room memberships into cache."""
     from . import db
 
-    # Run DB query via the shared DB executor to serialize with API operations
     loop = asyncio.get_event_loop()
     executor = db.get_db_executor()
     cursor = await loop.run_in_executor(
@@ -375,12 +314,9 @@ async def _warm_membership_cache(conn: sqlite3.Connection) -> int:
     )
     rows = await loop.run_in_executor(executor, cursor.fetchall)
 
-    # Build cache entries (membership is just a boolean - True if member)
     items = {}
     for row in rows:
-        room_id = row[0]
-        identity_id = row[1]
-        items[f"member:{room_id}:{identity_id}"] = True
+        items[f"member:{row[0]}:{row[1]}"] = True
 
     return membership_cache.set_bulk(items)
 
@@ -389,7 +325,6 @@ async def _warm_identity_cache(conn: sqlite3.Connection) -> int:
     """Load all identity secret hashes into cache."""
     from . import db
 
-    # Run DB query via the shared DB executor to serialize with API operations
     loop = asyncio.get_event_loop()
     executor = db.get_db_executor()
     cursor = await loop.run_in_executor(
@@ -398,45 +333,28 @@ async def _warm_identity_cache(conn: sqlite3.Connection) -> int:
     )
     rows = await loop.run_in_executor(executor, cursor.fetchall)
 
-    # Build cache entries
     items = {}
     for row in rows:
-        ns = row[0]
-        identity_id = row[1]
-        secret_hash = row[2]
-        items[f"identity:{ns}:{identity_id}"] = secret_hash
+        items[f"identity:{row[0]}:{row[1]}"] = row[2]
 
     return identity_hash_cache.set_bulk(items)
 
 
-# Global flag to signal shutdown to background tasks
-_shutdown_event: asyncio.Event | None = None
-
-
 def schedule_cache_warming() -> None:
-    """Schedule cache warming as a background task with periodic refresh.
+    """Schedule one-time cache warming as a background task on startup.
 
-    This should be called during application startup. It:
-    1. Runs initial cache warming after a short delay (non-blocking)
-    2. Schedules periodic refresh to pick up new data
-
-    The refresh interval is controlled by DEADROP_CACHE_REFRESH_INTERVAL (default: 300s).
+    No periodic refresh — the cache is kept consistent via write-through
+    invalidation in the API handlers.
     """
-    global _shutdown_event
-
     if not CACHE_WARMING_ENABLED:
         logger.info("Cache warming disabled via DEADROP_CACHE_WARMING=0")
         print("INFO:     Cache warming disabled via DEADROP_CACHE_WARMING=0")
         return
 
-    async def _warm_and_refresh():
-        global _shutdown_event
-        _shutdown_event = asyncio.Event()
-
+    async def _warm_on_startup():
         # Small delay to let the server fully start
         await asyncio.sleep(0.5)
 
-        # Initial warming (with timeout to prevent blocking on startup)
         try:
             await asyncio.wait_for(warm_caches(), timeout=CACHE_WARMING_TIMEOUT)
         except asyncio.TimeoutError:
@@ -453,58 +371,15 @@ def schedule_cache_warming() -> None:
             logger.error(f"Initial cache warming failed: {e}")
             print(f"ERROR:    Initial cache warming failed: {e}")
 
-        # Periodic refresh loop
-        if CACHE_REFRESH_INTERVAL > 0:
-            print(f"INFO:     Cache refresh scheduled every {CACHE_REFRESH_INTERVAL}s")
-            while not _shutdown_event.is_set():
-                try:
-                    # Wait for the refresh interval or shutdown signal
-                    await asyncio.wait_for(
-                        _shutdown_event.wait(),
-                        timeout=CACHE_REFRESH_INTERVAL,
-                    )
-                    # If we get here, shutdown was signaled
-                    break
-                except asyncio.TimeoutError:
-                    # Timeout means it's time to refresh
-                    pass
-
-                # Refresh caches (with timeout to prevent blocking the event loop
-                # if the Turso connection is stale or the network is unreachable)
-                try:
-                    results = await asyncio.wait_for(warm_caches(), timeout=CACHE_WARMING_TIMEOUT)
-                    logger.debug(f"Cache refresh: {results}")
-                except asyncio.TimeoutError:
-                    logger.error(f"Cache refresh timed out after {CACHE_WARMING_TIMEOUT}s")
-                    # The executor thread is likely stuck on a hung Turso
-                    # query.  Replace it so API handlers can proceed.
-                    from . import db as _db
-
-                    try:
-                        _db._replace_db_executor()
-                        _db._reset_libsql_connection()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.error(f"Cache refresh failed: {e}")
-                    # Continue running - don't let refresh failures stop the loop
-
-    # Get or create event loop and schedule the task
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_warm_and_refresh())
-        logger.info("Cache warming scheduled as background task")
+        loop.create_task(_warm_on_startup())
+        logger.info("Cache warming scheduled (one-time, no periodic refresh)")
     except RuntimeError:
-        # No running loop - we're probably in a sync context
         logger.warning("No event loop available for cache warming")
         print("WARNING:  No event loop available for cache warming")
 
 
 def stop_cache_warming() -> None:
-    """Signal the cache warming background task to stop.
-
-    Should be called during application shutdown.
-    """
-    global _shutdown_event
-    if _shutdown_event is not None:
-        _shutdown_event.set()
+    """No-op — kept for backward compatibility with startup/shutdown hooks."""
+    pass

@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import db
+from . import cache, db
 from .auth import derive_id
 from .auth_provider import (
     extract_bearer_token,
@@ -577,6 +577,9 @@ def delete_namespace(
     require_admin(authorization, x_admin_token)
     if not db.delete_namespace(ns):
         raise HTTPException(404, "Namespace not found")
+    # Namespace deletion cascades to all rooms, memberships, and identities.
+    # Clear everything rather than trying to enumerate.
+    cache.clear_all_caches()
     return {"ok": True}
 
 
@@ -627,7 +630,29 @@ def admin_delete_identity(
     require_admin(authorization, x_admin_token)
     if not db.delete_identity(ns, identity_id):
         raise HTTPException(404, "Identity not found")
+    cache.invalidate_identity(ns, identity_id)
     return {"ok": True}
+
+
+@app.post("/admin/cache/bust")
+async def admin_bust_cache(
+    authorization: Annotated[str | None, Header()] = None,
+    x_admin_token: Annotated[str | None, Header()] = None,
+):
+    """Clear all caches and re-warm from the database.
+
+    Use this if cache state is suspected to be inconsistent, or after
+    manual database changes outside the API.
+    """
+    require_admin(authorization, x_admin_token)
+    cache.clear_all_caches()
+    try:
+        results = await asyncio.wait_for(cache.warm_caches(), timeout=30)
+        return {"ok": True, "warmed": results}
+    except asyncio.TimeoutError:
+        return {"ok": True, "warmed": None, "warning": "Cache warming timed out"}
+    except Exception as e:
+        return {"ok": True, "warmed": None, "warning": f"Cache warming failed: {e}"}
 
 
 # --- Namespace Owner Endpoints ---
@@ -751,6 +776,7 @@ def delete_identity(
 
     if not db.delete_identity(ns, identity_id):
         raise HTTPException(404, "Identity not found")
+    cache.invalidate_identity(ns, identity_id)
     return {"ok": True}
 
 
@@ -1772,7 +1798,6 @@ def get_metrics(
     require_admin(authorization, x_admin_token)
 
     from .cache import (
-        CACHE_REFRESH_INTERVAL,
         CACHE_WARMING_ENABLED,
         identity_hash_cache,
         membership_cache,
@@ -1784,7 +1809,7 @@ def get_metrics(
         **metrics.to_dict(),
         "caches": {
             "warming_enabled": CACHE_WARMING_ENABLED,
-            "refresh_interval_seconds": CACHE_REFRESH_INTERVAL,
+            "strategy": "warm-on-startup + write-through invalidation",
             "room": room_cache.stats(),
             "membership": membership_cache.stats(),
             "identity_hash": identity_hash_cache.stats(),
