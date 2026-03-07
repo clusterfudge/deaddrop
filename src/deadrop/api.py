@@ -415,7 +415,11 @@ async def _require_active_namespace(ns: str) -> None:
 
 
 async def _require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str | None) -> str:
-    """Async variant of require_inbox_secret."""
+    """Async variant of require_inbox_secret.
+
+    Tries the identity hash cache first (no executor needed).
+    Only falls through to the DB executor on cache miss.
+    """
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
@@ -423,6 +427,17 @@ async def _require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str |
     if derived_id != identity_id:
         raise HTTPException(403, "Secret does not match identity")
 
+    from .auth import verify_secret
+    from .cache import identity_hash_cache
+
+    # Fast path: check cache without touching the executor
+    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
+    if cache_hit and cached_hash:
+        if not verify_secret(x_inbox_secret, cached_hash):
+            raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
+        return identity_id
+
+    # Slow path: cache miss, go through executor
     verified = await _run_sync(db.verify_identity_secret, ns, identity_id, x_inbox_secret)
     if not verified:
         raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
@@ -431,24 +446,61 @@ async def _require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str |
 
 
 async def _require_inbox_secret_any(ns: str, x_inbox_secret: str | None) -> str:
-    """Async variant of require_inbox_secret_any."""
+    """Async variant of require_inbox_secret_any.
+
+    Tries the identity hash cache first (no executor needed).
+    Only falls through to the DB executor on cache miss.
+    """
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    identity_id = await _run_sync(db.verify_identity_in_namespace, ns, x_inbox_secret)
-    if not identity_id:
-        raise HTTPException(403, "Invalid inbox secret or not in namespace")
-
-    return identity_id
-
-
-async def _require_room_member(room_id: str, x_inbox_secret: str | None) -> tuple[dict, str]:
-    """Async variant of require_room_member."""
-    if not x_inbox_secret:
-        raise HTTPException(401, "X-Inbox-Secret header required")
+    from .auth import verify_secret
+    from .cache import identity_hash_cache
 
     identity_id = derive_id(x_inbox_secret)
 
+    # Fast path: check cache without touching the executor
+    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
+    if cache_hit and cached_hash:
+        if verify_secret(x_inbox_secret, cached_hash):
+            return identity_id
+        raise HTTPException(403, "Invalid inbox secret or not in namespace")
+
+    # Slow path: cache miss, go through executor
+    result = await _run_sync(db.verify_identity_in_namespace, ns, x_inbox_secret)
+    if not result:
+        raise HTTPException(403, "Invalid inbox secret or not in namespace")
+
+    return result
+
+
+async def _require_room_member(room_id: str, x_inbox_secret: str | None) -> tuple[dict, str]:
+    """Async variant of require_room_member.
+
+    Tries all three caches first (room, membership, identity hash).
+    Only falls through to the DB executor on cache miss.
+    """
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    from .auth import verify_secret
+    from .cache import identity_hash_cache, membership_cache, room_cache
+
+    identity_id = derive_id(x_inbox_secret)
+
+    # Fast path: check all caches without touching the executor
+    cache_hit, cached_room = room_cache.get(f"room:{room_id}")
+    if cache_hit and cached_room:
+        membership_hit, is_member = membership_cache.get(f"member:{room_id}:{identity_id}")
+        if membership_hit and is_member:
+            ns = cached_room["ns"]
+            hash_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
+            if hash_hit and cached_hash:
+                if verify_secret(x_inbox_secret, cached_hash):
+                    return cached_room, identity_id
+                raise HTTPException(403, "Invalid inbox secret")
+
+    # Slow path: cache miss, go through executor
     import functools
 
     room, error = await _run_sync(
