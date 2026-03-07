@@ -238,33 +238,50 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
     are kept consistent via write-through invalidation — no periodic refresh
     is needed.
 
+    All DB operations run on a single executor thread to ensure connection
+    thread-safety (each libsql connection is thread-local).
+
     Args:
-        conn: Optional database connection (uses global if not provided)
+        conn: Optional database connection (uses thread-local if not provided)
 
     Returns:
         Dictionary with counts of items cached
     """
     from . import db
 
-    if conn is None:
-        loop = asyncio.get_event_loop()
-        executor = db.get_db_executor()
-        conn = await loop.run_in_executor(executor, db.get_connection)
+    def _warm_all_sync() -> dict[str, int]:
+        """Run all cache warming on a single executor thread."""
+        c = conn if conn is not None else db.get_connection()
+        start = time.perf_counter()
+        results = {"rooms": 0, "memberships": 0, "identities": 0}
 
-    start_time = time.perf_counter()
-    results = {"rooms": 0, "memberships": 0, "identities": 0}
+        # Warm room cache
+        cursor = c.execute("SELECT room_id, ns, display_name, created_by, created_at FROM rooms")
+        rows = cursor.fetchall()
+        room_items = {}
+        for row in rows:
+            room_data = db._row_to_dict(cursor.description, row)
+            if room_data:
+                room_items[f"room:{room_data['room_id']}"] = room_data
+        results["rooms"] = room_cache.set_bulk(room_items)
 
-    try:
-        rooms_cached = await _warm_room_cache(conn)
-        results["rooms"] = rooms_cached
+        # Warm membership cache
+        cursor = c.execute("SELECT room_id, identity_id FROM room_members")
+        rows = cursor.fetchall()
+        member_items = {}
+        for row in rows:
+            member_items[f"member:{row[0]}:{row[1]}"] = True
+        results["memberships"] = membership_cache.set_bulk(member_items)
 
-        memberships_cached = await _warm_membership_cache(conn)
-        results["memberships"] = memberships_cached
+        # Warm identity hash cache
+        cursor = c.execute("SELECT ns, id, secret_hash FROM identities")
+        rows = cursor.fetchall()
+        identity_items = {}
+        for row in rows:
+            identity_items[f"identity:{row[0]}:{row[1]}"] = row[2]
+        results["identities"] = identity_hash_cache.set_bulk(identity_items)
 
-        identities_cached = await _warm_identity_cache(conn)
-        results["identities"] = identities_cached
-
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        elapsed_ms = (time.perf_counter() - start) * 1000
         msg = (
             f"Cache warming complete in {elapsed_ms:.0f}ms: "
             f"{results['rooms']} rooms, {results['memberships']} memberships, "
@@ -273,71 +290,17 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
         logger.info(msg)
         print(f"INFO:     {msg}")
 
+        return results
+
+    loop = asyncio.get_event_loop()
+    executor = db.get_db_executor()
+
+    try:
+        return await loop.run_in_executor(executor, _warm_all_sync)
     except Exception as e:
         logger.error(f"Cache warming failed: {e}")
         print(f"ERROR:    Cache warming failed: {e}")
         raise
-
-    return results
-
-
-async def _warm_room_cache(conn: sqlite3.Connection) -> int:
-    """Load all rooms into cache."""
-    from . import db
-
-    loop = asyncio.get_event_loop()
-    executor = db.get_db_executor()
-    cursor = await loop.run_in_executor(
-        executor,
-        lambda: conn.execute("SELECT room_id, ns, display_name, created_by, created_at FROM rooms"),
-    )
-    rows = await loop.run_in_executor(executor, cursor.fetchall)
-
-    items = {}
-    for row in rows:
-        room_data = db._row_to_dict(cursor.description, row)
-        if room_data:
-            items[f"room:{room_data['room_id']}"] = room_data
-
-    return room_cache.set_bulk(items)
-
-
-async def _warm_membership_cache(conn: sqlite3.Connection) -> int:
-    """Load all room memberships into cache."""
-    from . import db
-
-    loop = asyncio.get_event_loop()
-    executor = db.get_db_executor()
-    cursor = await loop.run_in_executor(
-        executor,
-        lambda: conn.execute("SELECT room_id, identity_id FROM room_members"),
-    )
-    rows = await loop.run_in_executor(executor, cursor.fetchall)
-
-    items = {}
-    for row in rows:
-        items[f"member:{row[0]}:{row[1]}"] = True
-
-    return membership_cache.set_bulk(items)
-
-
-async def _warm_identity_cache(conn: sqlite3.Connection) -> int:
-    """Load all identity secret hashes into cache."""
-    from . import db
-
-    loop = asyncio.get_event_loop()
-    executor = db.get_db_executor()
-    cursor = await loop.run_in_executor(
-        executor,
-        lambda: conn.execute("SELECT ns, id, secret_hash FROM identities"),
-    )
-    rows = await loop.run_in_executor(executor, cursor.fetchall)
-
-    items = {}
-    for row in rows:
-        items[f"identity:{row[0]}:{row[1]}"] = row[2]
-
-    return identity_hash_cache.set_bulk(items)
 
 
 def schedule_cache_warming() -> None:
