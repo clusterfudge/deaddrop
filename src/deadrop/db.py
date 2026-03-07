@@ -995,12 +995,24 @@ def archive_namespace(ns: str, conn: sqlite3.Connection | None = None) -> bool:
     return cursor.rowcount > 0
 
 
+_namespace_ttl_cache: dict[str, int] = {}
+
+
 def get_namespace_ttl_hours(ns: str, conn: sqlite3.Connection | None = None) -> int:
-    """Get the TTL hours for a namespace. Returns default for persistent namespaces."""
+    """Get the TTL hours for a namespace. Returns default for persistent namespaces.
+
+    Cached in-process — namespace TTL never changes after creation.
+    """
+    cached = _namespace_ttl_cache.get(ns)
+    if cached is not None:
+        return cached
+
     conn = _get_conn(conn)
     cursor = conn.execute("SELECT ttl_hours FROM namespaces WHERE ns = ?", (ns,))
     row = _row_to_dict(cursor.description, cursor.fetchone())
-    return row["ttl_hours"] if row else DEFAULT_TTL_HOURS
+    ttl = row["ttl_hours"] if row else DEFAULT_TTL_HOURS
+    _namespace_ttl_cache[ns] = ttl
+    return ttl
 
 
 def list_namespaces(conn: sqlite3.Connection | None = None) -> list[dict]:
@@ -1147,10 +1159,24 @@ def verify_identity_secret(
     secret: str,
     conn: sqlite3.Connection | None = None,
 ) -> bool:
-    """Verify an identity secret."""
+    """Verify an identity secret.
+
+    Uses the identity_hash_cache to avoid a Turso round-trip on every request.
+    The cache is populated at startup and kept consistent via write-through
+    invalidation when identities are created or deleted.
+    """
     if derive_id(secret) != identity_id:
         return False
 
+    from .auth import verify_secret
+    from .cache import identity_hash_cache
+
+    # Try cache first — avoids a Turso round-trip per request
+    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
+    if cache_hit and cached_hash:
+        return verify_secret(secret, cached_hash)
+
+    # Cache miss — fall through to DB
     conn = _get_conn(conn)
     cursor = conn.execute(
         "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
@@ -1160,7 +1186,8 @@ def verify_identity_secret(
     if not row:
         return False
 
-    from .auth import verify_secret
+    # Populate cache for next time
+    identity_hash_cache.set(f"identity:{ns}:{identity_id}", row["secret_hash"])
 
     return verify_secret(secret, row["secret_hash"])
 
@@ -1170,9 +1197,23 @@ def verify_identity_in_namespace(
     secret: str,
     conn: sqlite3.Connection | None = None,
 ) -> str | None:
-    """Verify a secret belongs to some identity in the namespace. Returns identity ID or None."""
+    """Verify a secret belongs to some identity in the namespace. Returns identity ID or None.
+
+    Uses the identity_hash_cache to avoid a Turso round-trip on every request.
+    """
     identity_id = derive_id(secret)
 
+    from .auth import verify_secret
+    from .cache import identity_hash_cache
+
+    # Try cache first
+    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
+    if cache_hit and cached_hash:
+        if verify_secret(secret, cached_hash):
+            return identity_id
+        return None
+
+    # Cache miss — fall through to DB
     conn = _get_conn(conn)
     cursor = conn.execute(
         "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
@@ -1182,7 +1223,8 @@ def verify_identity_in_namespace(
     if not row:
         return None
 
-    from .auth import verify_secret
+    # Populate cache
+    identity_hash_cache.set(f"identity:{ns}:{identity_id}", row["secret_hash"])
 
     if verify_secret(secret, row["secret_hash"]):
         return identity_id

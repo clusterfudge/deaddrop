@@ -38,6 +38,10 @@ TEMPLATES_DIR = PACKAGE_DIR / "templates"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup database, and warm caches."""
+    from .logging import configure_logging
+
+    configure_logging()
+
     db.init_db()
 
     # Schedule cache warming as background task (non-blocking)
@@ -65,8 +69,10 @@ app = FastAPI(
 
 @app.middleware("http")
 async def add_timing_middleware(request: Request, call_next):
-    """Middleware to track request timing for metrics."""
+    """Middleware to track request timing and log every request via structlog."""
     import time
+
+    import structlog
 
     from .metrics import metrics
 
@@ -76,14 +82,11 @@ async def add_timing_middleware(request: Request, call_next):
 
     duration_ms = (time.perf_counter() - start_time) * 1000
 
-    # Extract endpoint pattern (simplified - uses path)
-    # For rooms endpoints, normalize the IDs
+    # Extract endpoint pattern for metrics aggregation
     path = request.url.path
     if "/rooms/" in path:
-        # Normalize room endpoints for aggregation
         parts = path.split("/")
         if len(parts) >= 4 and parts[2] == "rooms":
-            # /{ns}/rooms/{room_id}/... -> /rooms/{action}
             action = parts[4] if len(parts) > 4 else "info"
             endpoint = f"rooms/{action}"
         else:
@@ -93,7 +96,7 @@ async def add_timing_middleware(request: Request, call_next):
     elif path.startswith("/admin"):
         endpoint = "admin"
     elif path in ("/health", "/metrics"):
-        endpoint = path[1:]  # Remove leading slash
+        endpoint = path[1:]
     else:
         endpoint = "other"
 
@@ -101,6 +104,20 @@ async def add_timing_middleware(request: Request, call_next):
 
     # Add timing header for debugging
     response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+
+    # Structured request log — skip static assets and health checks
+    if not path.startswith("/static") and path != "/health":
+        log = structlog.get_logger("deadrop.access")
+        log_method = log.warning if duration_ms > 2000 else log.info
+        log_method(
+            "request",
+            method=request.method,
+            path=path,
+            status=response.status_code,
+            duration_ms=round(duration_ms, 1),
+            client=request.client.host if request.client else None,
+            endpoint=endpoint,
+        )
 
     return response
 
@@ -693,7 +710,7 @@ def create_identity(
 
 
 @app.get("/{ns}/identities", response_model=list[IdentityInfo])
-def list_identities(
+async def list_identities(
     ns: str,
     x_namespace_secret: Annotated[str | None, Header()] = None,
     x_inbox_secret: Annotated[str | None, Header()] = None,
@@ -706,15 +723,18 @@ def list_identities(
     """
     # Either namespace secret OR inbox secret works
     if x_namespace_secret:
-        if not db.verify_namespace_secret(ns, x_namespace_secret):
+        verified = await _run_sync(db.verify_namespace_secret, ns, x_namespace_secret)
+        if not verified:
             raise HTTPException(403, "Invalid namespace secret")
     elif x_inbox_secret:
-        if not db.verify_identity_in_namespace(ns, x_inbox_secret):
+        identity_id = await _run_sync(db.verify_identity_in_namespace, ns, x_inbox_secret)
+        if not identity_id:
             raise HTTPException(403, "Invalid inbox secret or not in namespace")
     else:
         raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
 
-    return [IdentityInfo(**identity) for identity in db.list_identities(ns)]
+    identities = await _run_sync(db.list_identities, ns)
+    return [IdentityInfo(**identity) for identity in identities]
 
 
 @app.get("/{ns}/identities/{identity_id}", response_model=IdentityInfo)
@@ -1240,7 +1260,7 @@ def require_room_member(room_id: str, x_inbox_secret: str | None) -> tuple[dict,
 
 
 @app.post("/{ns}/rooms", response_model=RoomInfo)
-def create_room(
+async def create_room(
     ns: str,
     request: CreateRoomRequest | None = None,
     x_inbox_secret: Annotated[str | None, Header()] = None,
@@ -1250,15 +1270,15 @@ def create_room(
     The caller becomes the first member of the room.
     Requires inbox secret of an identity in the namespace.
     """
-    require_active_namespace(ns)
+    await _require_active_namespace(ns)
 
     # Verify caller is in namespace
-    created_by = require_inbox_secret_any(ns, x_inbox_secret)
+    created_by = await _require_inbox_secret_any(ns, x_inbox_secret)
 
     display_name = request.display_name if request else None
 
     try:
-        room = db.create_room(ns, created_by, display_name=display_name)
+        room = await _run_sync(db.create_room, ns, created_by, display_name)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -1266,7 +1286,7 @@ def create_room(
 
 
 @app.get("/{ns}/rooms", response_model=list[RoomWithMemberInfo])
-def list_my_rooms(
+async def list_my_rooms(
     ns: str,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
@@ -1274,20 +1294,20 @@ def list_my_rooms(
 
     Returns rooms with membership info (joined_at, last_read_mid).
     """
-    identity_id = require_inbox_secret_any(ns, x_inbox_secret)
+    identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
 
-    rooms = db.list_rooms_for_identity(ns, identity_id)
+    rooms = await _run_sync(db.list_rooms_for_identity, ns, identity_id)
     return [RoomWithMemberInfo(**r) for r in rooms]
 
 
 @app.get("/{ns}/rooms/{room_id}", response_model=RoomInfo)
-def get_room(
+async def get_room(
     ns: str,
     room_id: str,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get room details. Requires membership."""
-    room, _ = require_room_member(room_id, x_inbox_secret)
+    room, _ = await _require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
@@ -1322,23 +1342,23 @@ def delete_room_endpoint(
 
 
 @app.get("/{ns}/rooms/{room_id}/members", response_model=list[RoomMemberInfo])
-def list_room_members(
+async def list_room_members(
     ns: str,
     room_id: str,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """List members of a room. Requires membership."""
-    room, _ = require_room_member(room_id, x_inbox_secret)
+    room, _ = await _require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    members = db.list_room_members(room_id)
+    members = await _run_sync(db.list_room_members, room_id)
     return [RoomMemberInfo(**m) for m in members]
 
 
 @app.post("/{ns}/rooms/{room_id}/members", response_model=RoomMemberInfo)
-def add_room_member(
+async def add_room_member(
     ns: str,
     room_id: str,
     request: AddRoomMemberRequest,
@@ -1348,22 +1368,19 @@ def add_room_member(
 
     Any room member can invite other identities from the same namespace.
     """
-    room, _ = require_room_member(room_id, x_inbox_secret)
+    room, _ = await _require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
     try:
-        db.add_room_member(room_id, request.identity_id)
-        # Invalidate membership cache for the new member
-        from .cache import invalidate_membership
-
-        invalidate_membership(room_id, request.identity_id)
+        await _run_sync(db.add_room_member, room_id, request.identity_id)
+        cache.invalidate_membership(room_id, request.identity_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
     # Get full member info with metadata
-    member_info = db.get_room_member_info(room_id, request.identity_id)
+    member_info = await _run_sync(db.get_room_member_info, room_id, request.identity_id)
     if not member_info:
         raise HTTPException(500, "Failed to get member info")
 
@@ -1492,7 +1509,7 @@ async def send_room_message(
 
 
 @app.post("/{ns}/rooms/{room_id}/read")
-def update_read_cursor(
+async def update_read_cursor(
     ns: str,
     room_id: str,
     request: UpdateReadCursorRequest,
@@ -1502,12 +1519,14 @@ def update_read_cursor(
 
     The cursor tracks the last message the user has read.
     """
-    room, identity_id = require_room_member(room_id, x_inbox_secret)
+    room, identity_id = await _require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    result = db.update_room_read_cursor(room_id, identity_id, request.last_read_mid)
+    result = await _run_sync(
+        db.update_room_read_cursor, room_id, identity_id, request.last_read_mid
+    )
     if not result:
         raise HTTPException(400, "Failed to update read cursor")
 
@@ -1515,18 +1534,18 @@ def update_read_cursor(
 
 
 @app.get("/{ns}/rooms/{room_id}/unread")
-def get_unread_count(
+async def get_unread_count(
     ns: str,
     room_id: str,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get the count of unread messages for the calling user."""
-    room, identity_id = require_room_member(room_id, x_inbox_secret)
+    room, identity_id = await _require_room_member(room_id, x_inbox_secret)
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    count = db.get_room_unread_count(room_id, identity_id)
+    count = await _run_sync(db.get_room_unread_count, room_id, identity_id)
     return {"unread_count": count, "room_id": room_id}
 
 
