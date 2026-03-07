@@ -84,15 +84,20 @@ _db_executor = None
 _db_executor_lock = threading.Lock()
 
 
+DB_POOL_SIZE = int(os.environ.get("DEADROP_DB_POOL_SIZE", "4"))
+
+
 def get_db_executor():
     """Get the shared executor for database operations.
 
-    Returns a single-threaded executor when using libsql/Turso (which uses
-    a single shared connection that isn't thread-safe), or None to use the
-    default threadpool for local SQLite (which uses thread-local connections).
+    For libsql/Turso: uses a thread pool with DB_POOL_SIZE workers (default 4).
+    Each worker thread gets its own libsql connection via thread-local storage,
+    enabling concurrent Turso requests.
 
-    This MUST be used by all async code that accesses the database, including
-    cache warming, API handlers, and any other background tasks.
+    For local SQLite: returns None to use the default threadpool with
+    thread-local connections.
+
+    This MUST be used by all async code that accesses the database.
     """
     global _db_executor
 
@@ -109,8 +114,10 @@ def get_db_executor():
 
             import logging
 
-            _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
-            logging.getLogger(__name__).info("Using serialized DB executor for libsql/Turso")
+            _db_executor = ThreadPoolExecutor(max_workers=DB_POOL_SIZE, thread_name_prefix="db")
+            logging.getLogger(__name__).info(
+                f"Using DB executor pool with {DB_POOL_SIZE} workers for libsql/Turso"
+            )
 
     return _db_executor
 
@@ -143,37 +150,22 @@ def _replace_db_executor():
 
 
 def _reset_libsql_connection() -> None:
-    """Reset the global libsql connection.
+    """Reset the thread-local libsql connection.
 
     Called when the connection is detected as stale (e.g., Hrana stream expired).
-    Thread-safe - uses a lock to prevent multiple threads from reconnecting simultaneously.
-
-    Raises:
-        TimeoutError: If unable to acquire lock within timeout.
+    Only affects the calling thread's connection.
     """
-    global _conn, _is_libsql
-
-    lock_acquired = _libsql_lock.acquire(timeout=LIBSQL_CONNECT_TIMEOUT)
-    if not lock_acquired:
-        import logging
-
-        logging.warning("Timeout acquiring lock to reset libsql connection")
-        return  # Can't reset, but don't block indefinitely
-
-    try:
-        if _conn is not None:
-            try:
-                _run_with_timeout(
-                    lambda: _conn.close(),  # type: ignore[union-attr]
-                    timeout=2.0,
-                    description="conn.close()",
-                )
-            except Exception:
-                pass  # Abandon the stale connection
-            _conn = None
-            _is_libsql = False
-    finally:
-        _libsql_lock.release()
+    conn = getattr(_local, "libsql_conn", None)
+    if conn is not None:
+        try:
+            _run_with_timeout(
+                lambda: conn.close(),
+                timeout=2.0,
+                description="conn.close()",
+            )
+        except Exception:
+            pass  # Abandon the stale connection
+        _local.libsql_conn = None
 
 
 def _is_hrana_stream_error(error: Exception) -> bool:
@@ -288,50 +280,17 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         return conn
 
-    # Check for Turso/libsql (uses single global connection, not thread-local)
+    # Check for Turso/libsql — each thread gets its own connection via
+    # thread-local storage, enabling concurrent Turso requests from the
+    # DB executor pool.
     db_url = os.environ.get("TURSO_URL", "")
     if db_url.startswith("libsql://"):
-        # Use non-blocking lock acquisition with timeout to prevent deadlocks
-        lock_acquired = _libsql_lock.acquire(timeout=LIBSQL_CONNECT_TIMEOUT)
-        if not lock_acquired:
-            raise TimeoutError(
-                f"Timeout acquiring database connection lock after {LIBSQL_CONNECT_TIMEOUT}s. "
-                "Another connection attempt may be hanging."
-            )
-
-        # Track whether we need to release the lock (for reconnection path)
-        should_release_lock = True
-        try:
-            if _conn is None:
-                import libsql_experimental as libsql  # type: ignore[import-not-found]
-                import logging
-
-                logging.info(f"Creating new libsql connection to {db_url[:50]}...")
-                try:
-                    _conn = _run_with_timeout(
-                        lambda: libsql.connect(
-                            db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")
-                        ),
-                        timeout=LIBSQL_CONNECT_TIMEOUT,
-                        description="libsql.connect()",
-                    )
-                    _is_libsql = True
-                except TimeoutError:
-                    logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
-                    raise RuntimeError(
-                        f"Timed out connecting to Turso database after {LIBSQL_CONNECT_TIMEOUT}s"
-                    )
-                except Exception as e:
-                    logging.error(f"Failed to connect to libsql: {e}")
-                    raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
-
-            # Test connection health with a simple query
-            # This catches stale Hrana streams before they cause operation failures.
-            # We run the health check in a separate thread with a timeout to prevent
-            # indefinite hangs on stale TCP connections (which can freeze the event
-            # loop if get_connection() is called from the main thread).
+        # Check thread-local connection
+        if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
+            # Health check existing connection
             try:
-                _health_check_conn(_conn, timeout=LIBSQL_HEALTH_CHECK_TIMEOUT)
+                _health_check_conn(_local.libsql_conn, timeout=LIBSQL_HEALTH_CHECK_TIMEOUT)
+                return _local.libsql_conn
             except (TimeoutError, Exception) as e:
                 is_timeout = isinstance(e, TimeoutError)
                 is_hrana = not is_timeout and _is_hrana_stream_error(e)
@@ -340,30 +299,47 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                     import logging
 
                     reason = "timed out" if is_timeout else "stale"
-                    logging.warning(f"Libsql connection {reason}, reconnecting: {e}")
-                    # Close the stale connection with a timeout — close() itself
-                    # can hang on a dead TCP socket.
+                    logging.warning(
+                        f"Libsql connection {reason} on {threading.current_thread().name}, "
+                        f"reconnecting: {e}"
+                    )
+                    stale_conn = _local.libsql_conn
                     try:
                         _run_with_timeout(
-                            lambda: _conn.close(),  # type: ignore[union-attr]
+                            lambda: stale_conn.close(),
                             timeout=2.0,
                             description="conn.close()",
                         )
                     except Exception:
-                        pass  # Abandon the stale connection
-                    _conn = None
-                    _is_libsql = False
-                    # Release lock before recursive call to avoid deadlock
-                    _libsql_lock.release()
-                    should_release_lock = False
-                    # Recursive call to create fresh connection
-                    return get_connection(db_path)
-                raise
+                        pass
+                    _local.libsql_conn = None
+                    # Fall through to create new connection
+                else:
+                    raise
 
-            return _conn
-        finally:
-            if should_release_lock:
-                _libsql_lock.release()
+        # Create new thread-local connection
+        import libsql_experimental as libsql  # type: ignore[import-not-found]
+        import logging
+
+        thread_name = threading.current_thread().name
+        logging.info(f"Creating libsql connection on {thread_name} to {db_url[:50]}...")
+        try:
+            _local.libsql_conn = _run_with_timeout(
+                lambda: libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")),
+                timeout=LIBSQL_CONNECT_TIMEOUT,
+                description=f"libsql.connect() on {thread_name}",
+            )
+            _is_libsql = True
+        except TimeoutError:
+            logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
+            raise RuntimeError(
+                f"Timed out connecting to Turso database after {LIBSQL_CONNECT_TIMEOUT}s"
+            )
+        except Exception as e:
+            logging.error(f"Failed to connect to libsql: {e}")
+            raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
+
+        return _local.libsql_conn
 
     # Thread-local connection for SQLite
     # Each thread gets its own connection to avoid concurrency issues
@@ -425,17 +401,23 @@ def scoped_connection(db_path: str | Path) -> Iterator[sqlite3.Connection]:
 def close_db():
     """Close database connections.
 
-    Closes both the thread-local connection (if any) and the global connection
-    (used for libsql/Turso).
+    Closes thread-local connections (SQLite and libsql).
+    For libsql with a thread pool, each worker thread's connection is
+    cleaned up when the executor shuts down.
     """
     global _conn, _is_libsql
 
-    # Close thread-local connection
+    # Close thread-local SQLite connection
     if hasattr(_local, "conn") and _local.conn is not None:
         _local.conn.close()
         _local.conn = None
 
-    # Close global connection (libsql)
+    # Close thread-local libsql connection
+    if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
+        _local.libsql_conn.close()
+        _local.libsql_conn = None
+
+    # Close legacy global connection (if any)
     if _conn:
         _conn.close()
         _conn = None
