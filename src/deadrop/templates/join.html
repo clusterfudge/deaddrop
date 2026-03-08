@@ -135,7 +135,14 @@
             
             setTimeout(() => {
                 const slug = result.namespace_slug || result.ns;
-                window.location.href = `/app/${slug}`;
+                // Check for a saved deep link destination (e.g. user clicked
+                // a room link, got sent to namespace list, claimed invite)
+                const savedDest = sessionStorage.getItem('deadrop_deep_link');
+                if (savedDest && savedDest.startsWith(`/app/${slug}`)) {
+                    window.location.href = savedDest;
+                } else {
+                    window.location.href = `/app/${slug}`;
+                }
             }, 1500);
             
         } catch (e) {

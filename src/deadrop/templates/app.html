@@ -15,6 +15,11 @@
             
             <div id="namespace-list"></div>
             
+            <div id="deep-link-banner" class="card hidden" style="margin-bottom: 16px; background: #fff3cd; border-left: 4px solid #ffc107;">
+                <p style="margin: 0;"><strong>🔗 You followed a link to <span id="deep-link-target"></span></strong></p>
+                <p style="margin: 4px 0 0 0; color: #666;">Claim an invite to this namespace to continue, or select it below if you already have access.</p>
+            </div>
+
             <div id="no-namespaces" class="empty-state hidden">
                 <div class="empty-state-icon">📭</div>
                 <div class="empty-state-title">No namespaces yet</div>
@@ -379,9 +384,12 @@
         currentSlug = slug;
         credentials = CredentialStore.getCredentials(slug);
         if (!credentials) {
-            alert('Credentials not found');
+            alert('Credentials not found for namespace: ' + slug);
             return;
         }
+        
+        // Hide deep link banner if showing
+        document.getElementById('deep-link-banner').classList.add('hidden');
         
         history.pushState({}, '', `/app/${slug}`);
         
@@ -1343,9 +1351,15 @@
     // ==================== INITIALIZE ====================
     
     function init() {
+        // Check for a saved deep link destination (set after invite claim)
+        const savedDestination = sessionStorage.getItem('deadrop_deep_link');
+        
         if (currentSlug) {
             credentials = CredentialStore.getCredentials(currentSlug);
             if (credentials) {
+                // Clear any saved destination since we have credentials now
+                sessionStorage.removeItem('deadrop_deep_link');
+                
                 if (currentView === 'archived') {
                     document.getElementById('inbox-title').textContent = 
                         CredentialStore.getNamespace(currentSlug)?.displayName || currentSlug;
@@ -1360,9 +1374,55 @@
                     openNamespace(currentSlug);
                 }
             } else {
+                // No credentials for this namespace — save the deep link URL
+                // so we can navigate there after the user claims an invite
+                sessionStorage.setItem('deadrop_deep_link', window.location.pathname);
+                
+                // Show helpful banner
+                const banner = document.getElementById('deep-link-banner');
+                const target = document.getElementById('deep-link-target');
+                target.textContent = currentSlug;
+                banner.classList.remove('hidden');
+                
                 showView('namespaces');
                 renderNamespaceList();
             }
+        } else if (savedDestination) {
+            // We landed on /app after an invite claim — check if we can
+            // navigate to the saved destination now
+            sessionStorage.removeItem('deadrop_deep_link');
+            
+            // Parse the saved path and try to navigate
+            const roomMatch = savedDestination.match(/^\/app\/([^/]+)\/room\/([^/]+)$/);
+            const peerMatch = savedDestination.match(/^\/app\/([^/]+)\/([^/]+)$/);
+            const nsMatch = savedDestination.match(/^\/app\/([^/]+)$/);
+            
+            if (roomMatch) {
+                const [, slug, roomId] = roomMatch;
+                credentials = CredentialStore.getCredentials(slug);
+                if (credentials) {
+                    openNamespace(slug).then(() => openRoom(roomId));
+                    return;
+                }
+            } else if (peerMatch) {
+                const [, slug, peerId] = peerMatch;
+                credentials = CredentialStore.getCredentials(slug);
+                if (credentials) {
+                    openNamespace(slug).then(() => openConversation(peerId));
+                    return;
+                }
+            } else if (nsMatch) {
+                const [, slug] = nsMatch;
+                credentials = CredentialStore.getCredentials(slug);
+                if (credentials) {
+                    openNamespace(slug);
+                    return;
+                }
+            }
+            
+            // Couldn't navigate — show namespace list
+            showView('namespaces');
+            renderNamespaceList();
         } else {
             showView('namespaces');
             renderNamespaceList();
