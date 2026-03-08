@@ -78,11 +78,26 @@ const CredentialStore = {
     },
 
     /**
-     * Get namespace by slug.
+     * Resolve a slug to the actual storage key in data.namespaces.
+     * Handles legacy entries keyed by ns hash instead of slug.
+     * @returns {string|null} The storage key, or null if not found.
+     */
+    _resolveKey(slug, data = null) {
+        data = data || this.getAll();
+        if (data.namespaces[slug]) return slug;
+        // Fallback: find entry whose slug field matches
+        const entry = Object.entries(data.namespaces).find(([, ns]) => ns.slug === slug);
+        return entry ? entry[0] : null;
+    },
+
+    /**
+     * Get namespace by slug (or ns hash).
+     * Falls back to searching by slug field if direct key lookup fails.
      */
     getNamespace(slug) {
         const data = this.getAll();
-        return data.namespaces[slug] || null;
+        const key = this._resolveKey(slug, data);
+        return key ? data.namespaces[key] : null;
     },
 
     /**
@@ -109,7 +124,8 @@ const CredentialStore = {
      */
     getCredentials(slug, identityId = null) {
         const data = this.getAll();
-        const ns = data.namespaces[slug];
+        const key = this._resolveKey(slug, data);
+        const ns = key ? data.namespaces[key] : null;
         if (!ns) return null;
         
         const id = identityId || ns.activeIdentity;
@@ -132,8 +148,9 @@ const CredentialStore = {
      */
     setActiveIdentity(slug, identityId) {
         const data = this.getAll();
-        if (data.namespaces[slug] && data.namespaces[slug].identities[identityId]) {
-            data.namespaces[slug].activeIdentity = identityId;
+        const key = this._resolveKey(slug, data);
+        if (key && data.namespaces[key].identities[identityId]) {
+            data.namespaces[key].activeIdentity = identityId;
             this.save(data);
             return true;
         }
@@ -145,8 +162,10 @@ const CredentialStore = {
      */
     removeIdentity(slug, identityId) {
         const data = this.getAll();
-        const ns = data.namespaces[slug];
-        if (!ns || !ns.identities[identityId]) return false;
+        const key = this._resolveKey(slug, data);
+        if (!key) return false;
+        const ns = data.namespaces[key];
+        if (!ns.identities[identityId]) return false;
         
         delete ns.identities[identityId];
         
@@ -158,7 +177,7 @@ const CredentialStore = {
         
         // Remove namespace if no identities left
         if (Object.keys(ns.identities).length === 0) {
-            delete data.namespaces[slug];
+            delete data.namespaces[key];
         }
         
         this.save(data);
@@ -170,8 +189,9 @@ const CredentialStore = {
      */
     removeNamespace(slug) {
         const data = this.getAll();
-        if (data.namespaces[slug]) {
-            delete data.namespaces[slug];
+        const key = this._resolveKey(slug, data);
+        if (key) {
+            delete data.namespaces[key];
             this.save(data);
             return true;
         }
