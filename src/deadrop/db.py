@@ -43,7 +43,7 @@ from .auth import derive_id, generate_secret, hash_secret
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -624,11 +624,29 @@ def _migrate_003_add_reference_mid(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_004_add_mid_indexes(conn: sqlite3.Connection) -> None:
+    """Migration 004: Add mid-based indexes for efficient polling queries.
+
+    Room messages: queries use WHERE room_id = ? AND mid > ? ORDER BY mid,
+    but the existing index is on (room_id, created_at). Without the proper
+    index every room message fetch scans all rows for the room.
+
+    Inbox messages: queries use WHERE ns = ? AND to_id = ? ORDER BY mid,
+    but the existing index is on (ns, to_id, created_at). Same scan problem.
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_room_mid ON room_messages(room_id, mid)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_inbox_mid ON messages(ns, to_id, mid)")
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
     (2, "Add rooms tables for group communication", _migrate_002_add_rooms),
     (3, "Add reference_mid to room_messages for reactions", _migrate_003_add_reference_mid),
+    (4, "Add mid-based indexes for room_messages and messages", _migrate_004_add_mid_indexes),
 ]
 
 
