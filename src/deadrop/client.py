@@ -22,12 +22,23 @@ Usage:
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 from typing import Any
 
-from .backends import Backend, InMemoryBackend, LocalBackend, RemoteBackend
+from .backends import (
+    AuthenticationError,
+    Backend,
+    DeaddropAPIError,
+    InMemoryBackend,
+    LocalBackend,
+    RemoteBackend,
+)
 from .discovery import DeaddropNotFound, discover_backend, get_deaddrop_init_path
 from .options import DeaddropOptions
+
+logger = logging.getLogger(__name__)
 
 
 class Deaddrop:
@@ -777,11 +788,18 @@ class Deaddrop:
         secret: str,
         topics: dict[str, str | None],
         timeout: int = 30,
+        max_retries: int = 0,
+        on_error: str = "raise",
     ):
         """Generator that yields topic change events across multiple topics.
 
         Uses poll-mode subscribe in a loop, yielding (topic, latest_mid) tuples.
         Automatically updates cursors to avoid re-reporting the same change.
+
+        Implements exponential backoff for transient errors. Authentication
+        errors (401/403) are retried with backoff up to ``max_retries`` times
+        before being raised, since they typically indicate revoked credentials
+        that won't recover.
 
         This is the recommended way to monitor multiple topics (inbox + rooms)
         simultaneously.
@@ -791,9 +809,18 @@ class Deaddrop:
             secret: Caller's inbox secret.
             topics: Map of topic_key -> last_seen_mid (None = never seen).
             timeout: Long-poll timeout per iteration (1-60 seconds).
+            max_retries: Max consecutive errors before giving up (0 = fail fast
+                on auth errors, retry transient errors indefinitely).
+            on_error: Error handling strategy:
+                - ``"raise"``: Re-raise after max_retries (default).
+                - ``"log"``: Log errors and continue retrying forever.
 
         Yields:
             Tuples of (topic_key, latest_mid).
+
+        Raises:
+            AuthenticationError: When auth fails and max_retries is exceeded.
+            DeaddropAPIError: When server errors exhaust retries.
 
         Example:
             topics = {
@@ -810,9 +837,47 @@ class Deaddrop:
                     messages = client.get_room_messages(ns, room_id, secret, after_mid=mid)
         """
         cursors = dict(topics)
+        consecutive_errors = 0
+        # Backoff params: start at 1s, double each time, cap at 5 minutes
+        base_delay = 1.0
+        max_delay = 300.0
 
         while True:
-            result = self.subscribe(ns, secret, cursors, timeout)
+            try:
+                result = self.subscribe(ns, secret, cursors, timeout)
+                # Success — reset error counter
+                consecutive_errors = 0
+            except AuthenticationError as e:
+                consecutive_errors += 1
+                delay = min(base_delay * (2 ** (consecutive_errors - 1)), max_delay)
+                logger.warning(
+                    "subscribe auth error (%d/%s), backing off %.1fs: %s",
+                    consecutive_errors,
+                    max_retries or "∞",
+                    delay,
+                    e,
+                )
+                if max_retries and consecutive_errors >= max_retries:
+                    if on_error == "raise":
+                        raise
+                    # on_error == "log": continue with backoff
+                time.sleep(delay)
+                continue
+            except (DeaddropAPIError, OSError) as e:
+                # Transient server/network errors — always retry with backoff
+                consecutive_errors += 1
+                delay = min(base_delay * (2 ** (consecutive_errors - 1)), max_delay)
+                logger.warning(
+                    "subscribe error (%d), backing off %.1fs: %s",
+                    consecutive_errors,
+                    delay,
+                    e,
+                )
+                if max_retries and consecutive_errors >= max_retries:
+                    if on_error == "raise":
+                        raise
+                time.sleep(delay)
+                continue
 
             for topic, mid in result.get("events", {}).items():
                 cursors[topic] = mid
