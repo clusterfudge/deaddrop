@@ -22,6 +22,25 @@ from .auth import derive_id
 from .discovery import ensure_gitignore, get_deaddrop_init_path
 
 
+class DeaddropAPIError(Exception):
+    """Base exception for Deaddrop API errors."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class AuthenticationError(DeaddropAPIError):
+    """Raised when authentication fails (401/403).
+
+    Callers should implement exponential backoff when receiving this
+    error in a polling loop, as retrying immediately will not help
+    and wastes server resources.
+    """
+
+    pass
+
+
 @dataclass
 class BackendInfo:
     """Information about a backend instance."""
@@ -1241,7 +1260,12 @@ class RemoteBackend(Backend):
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> Any:
-        """Make an HTTP request."""
+        """Make an HTTP request.
+
+        Raises:
+            AuthenticationError: For 401/403 responses.
+            DeaddropAPIError: For other 4xx/5xx responses.
+        """
         url = f"{self._url}{path}"
         request_headers = headers or {}
 
@@ -1253,8 +1277,17 @@ class RemoteBackend(Backend):
             timeout=timeout,
         )
 
+        if response.status_code in (401, 403):
+            raise AuthenticationError(
+                f"Authentication failed ({response.status_code}): {response.text}",
+                status_code=response.status_code,
+            )
+
         if response.status_code >= 400:
-            raise RuntimeError(f"API error {response.status_code}: {response.text}")
+            raise DeaddropAPIError(
+                f"API error {response.status_code}: {response.text}",
+                status_code=response.status_code,
+            )
 
         if response.status_code == 204 or not response.content:
             return None
@@ -1312,8 +1345,8 @@ class RemoteBackend(Backend):
                 f"/admin/namespaces/{ns}",
                 headers=self._admin_headers(),
             )
-        except RuntimeError as e:
-            if "404" in str(e):
+        except DeaddropAPIError as e:
+            if e.status_code == 404:
                 return None
             raise
 
@@ -1325,7 +1358,7 @@ class RemoteBackend(Backend):
                 headers=self._admin_headers(),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     def archive_namespace(self, ns: str, secret: str) -> bool:
@@ -1336,7 +1369,7 @@ class RemoteBackend(Backend):
                 headers=self._ns_headers(secret),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     # --- Identity Operations ---
@@ -1375,7 +1408,7 @@ class RemoteBackend(Backend):
         headers = {"X-Namespace-Secret": secret}
         try:
             return self._request("GET", f"/{ns}/identities", headers=headers)
-        except RuntimeError:
+        except DeaddropAPIError:
             headers = {"X-Inbox-Secret": secret}
             return self._request("GET", f"/{ns}/identities", headers=headers)
 
@@ -1400,7 +1433,7 @@ class RemoteBackend(Backend):
                 headers=self._ns_headers(ns_secret),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     # --- Message Operations ---
@@ -1470,7 +1503,7 @@ class RemoteBackend(Backend):
                 headers=self._inbox_headers(secret),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     def archive_message(
@@ -1487,7 +1520,7 @@ class RemoteBackend(Backend):
                 headers=self._inbox_headers(secret),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     def get_archived_messages(
@@ -1545,8 +1578,8 @@ class RemoteBackend(Backend):
                 f"/{ns}/rooms/{room_id}",
                 headers=self._inbox_headers(secret),
             )
-        except RuntimeError as e:
-            if "404" in str(e) or "403" in str(e):
+        except DeaddropAPIError as e:
+            if e.status_code in (403, 404):
                 return None
             raise
 
@@ -1563,7 +1596,7 @@ class RemoteBackend(Backend):
                 headers=self._ns_headers(ns_secret),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     def add_room_member(
@@ -1594,7 +1627,7 @@ class RemoteBackend(Backend):
                 headers=self._inbox_headers(secret),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     def list_room_members(
@@ -1671,7 +1704,7 @@ class RemoteBackend(Backend):
                 headers=self._inbox_headers(secret),
             )
             return True
-        except RuntimeError:
+        except DeaddropAPIError:
             return False
 
     def get_room_unread_count(
@@ -1766,7 +1799,14 @@ class RemoteBackend(Backend):
         topics: dict[str, str | None],
         timeout: int = 30,
     ) -> dict[str, Any]:
-        """Subscribe to topic changes via the HTTP API (poll mode)."""
+        """Subscribe to topic changes via the HTTP API (poll mode).
+
+        Raises:
+            AuthenticationError: For 401/403 responses. Callers should
+                implement exponential backoff rather than retrying immediately.
+            DeaddropAPIError: For other server errors.
+            ValueError: For client-side validation errors (400 responses).
+        """
         response = self._client.post(
             f"{self._url}/{ns}/subscribe",
             headers={"X-Inbox-Secret": secret},
@@ -1774,9 +1814,21 @@ class RemoteBackend(Backend):
             timeout=max(30.0, timeout + 5),
         )
 
-        if response.status_code != 200:
+        if response.status_code in (401, 403):
             error = response.json().get("detail", response.text)
-            raise ValueError(f"Subscribe failed: {error}")
+            raise AuthenticationError(
+                f"Subscribe authentication failed ({response.status_code}): {error}",
+                status_code=response.status_code,
+            )
+
+        if response.status_code >= 400:
+            error = response.json().get("detail", response.text)
+            if response.status_code < 500:
+                raise ValueError(f"Subscribe failed: {error}")
+            raise DeaddropAPIError(
+                f"Subscribe server error ({response.status_code}): {error}",
+                status_code=response.status_code,
+            )
 
         return response.json()
 

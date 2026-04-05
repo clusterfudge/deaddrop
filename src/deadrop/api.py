@@ -866,8 +866,14 @@ async def send_message(
 
     Messages are delivered instantly. Optionally set ttl_hours for ephemeral
     messages that expire from creation time (instead of read time).
+
+    Implicit idempotency: if the same sender sends an identical message to
+    the same recipient within a short window (network retry), the original
+    message is returned with a ``Dedup-Status: deduplicated`` header.
     """
     import functools
+
+    from fastapi.responses import JSONResponse
 
     from .events import get_event_bus
 
@@ -889,13 +895,22 @@ async def send_message(
     except ValueError as e:
         raise HTTPException(404, str(e))
 
-    # Notify subscribers that the recipient's inbox has a new message
-    try:
-        await get_event_bus().publish(ns, f"inbox:{request.to}", result["mid"], sender_id=from_id)
-    except Exception:
-        logger.warning("Failed to publish inbox event", exc_info=True)
+    deduplicated = result.pop("deduplicated", False)
 
-    return result
+    # Only publish events for genuinely new messages
+    if not deduplicated:
+        try:
+            await get_event_bus().publish(
+                ns, f"inbox:{request.to}", result["mid"], sender_id=from_id
+            )
+        except Exception:
+            logger.warning("Failed to publish inbox event", exc_info=True)
+
+    headers = {}
+    if deduplicated:
+        headers["Dedup-Status"] = "deduplicated"
+
+    return JSONResponse(content=result, headers=headers)
 
 
 @app.get("/{ns}/inbox/{identity_id}")
@@ -1520,15 +1535,22 @@ async def get_room_messages(
     }
 
 
-@app.post("/{ns}/rooms/{room_id}/messages", response_model=RoomMessageInfo)
+@app.post("/{ns}/rooms/{room_id}/messages")
 async def send_room_message(
     ns: str,
     room_id: str,
     request: SendRoomMessageRequest,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
-    """Send a message to a room. Requires membership."""
+    """Send a message to a room. Requires membership.
+
+    Implicit idempotency: if the same sender sends an identical message to
+    the same room within a short window (network retry), the original
+    message is returned with a ``Dedup-Status: deduplicated`` header.
+    """
     import functools
+
+    from fastapi.responses import JSONResponse
 
     from .events import get_event_bus
 
@@ -1551,13 +1573,22 @@ async def send_room_message(
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # Notify subscribers that this room has a new message
-    try:
-        await get_event_bus().publish(ns, f"room:{room_id}", message["mid"], sender_id=from_id)
-    except Exception:
-        logger.warning("Failed to publish room event", exc_info=True)
+    deduplicated = message.pop("deduplicated", False)
 
-    return RoomMessageInfo.from_db(message)
+    # Only publish events for genuinely new messages
+    if not deduplicated:
+        try:
+            await get_event_bus().publish(ns, f"room:{room_id}", message["mid"], sender_id=from_id)
+        except Exception:
+            logger.warning("Failed to publish room event", exc_info=True)
+
+    response_data = RoomMessageInfo.from_db(message).model_dump()
+
+    headers = {}
+    if deduplicated:
+        headers["Dedup-Status"] = "deduplicated"
+
+    return JSONResponse(content=response_data, headers=headers)
 
 
 @app.post("/{ns}/rooms/{room_id}/read")

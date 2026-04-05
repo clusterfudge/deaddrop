@@ -1,7 +1,10 @@
 """Tests for subscribe methods on the Python client."""
 
+from unittest.mock import patch
+
 import pytest
 
+from deadrop.backends import AuthenticationError, DeaddropAPIError
 from deadrop.client import Deaddrop
 from deadrop.events import reset_event_bus
 
@@ -168,3 +171,195 @@ class TestListenAll:
 
         assert topic == f"room:{data['room']['room_id']}"
         assert latest_mid == mid
+
+
+class TestListenAllBackoff:
+    """Tests for exponential backoff in listen_all."""
+
+    def test_auth_error_raises_immediately_by_default(self, client, setup):
+        """With default max_retries=0, auth errors cause immediate failure on first retry."""
+        data = setup
+        # max_retries=0 means: fail fast on auth errors (no retries)
+        # But we need at least 1 retry attempt to trigger the raise.
+        # Actually, max_retries=0 means the check `if max_retries and ...` is False
+        # so it will retry forever. Let's use max_retries=1 for fail-fast.
+
+        with patch.object(client, "subscribe") as mock_sub:
+            mock_sub.side_effect = AuthenticationError("Forbidden", status_code=403)
+
+            gen = client.listen_all(
+                data["ns"],
+                data["alice"]["secret"],
+                {f"room:{data['room']['room_id']}": None},
+                timeout=1,
+                max_retries=1,
+            )
+
+            with pytest.raises(AuthenticationError):
+                next(gen)
+
+    @patch("deadrop.client.time.sleep")
+    def test_auth_error_backoff_timing(self, mock_sleep, client, setup):
+        """Auth errors trigger exponential backoff before retries."""
+        data = setup
+
+        call_count = 0
+
+        def fail_then_succeed(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 3:
+                raise AuthenticationError("Forbidden", status_code=403)
+            # 4th call succeeds
+            return {
+                "events": {f"room:{data['room']['room_id']}": "mid-1"},
+                "timeout": False,
+            }
+
+        with patch.object(client, "subscribe", side_effect=fail_then_succeed):
+            gen = client.listen_all(
+                data["ns"],
+                data["alice"]["secret"],
+                {f"room:{data['room']['room_id']}": None},
+                timeout=1,
+                # max_retries=0 means retry indefinitely
+            )
+            topic, mid = next(gen)
+
+        assert topic == f"room:{data['room']['room_id']}"
+        assert mid == "mid-1"
+
+        # Should have slept 3 times with exponential backoff: 1s, 2s, 4s
+        assert mock_sleep.call_count == 3
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays == [1.0, 2.0, 4.0]
+
+    @patch("deadrop.client.time.sleep")
+    def test_backoff_caps_at_max_delay(self, mock_sleep, client, setup):
+        """Backoff delay caps at 300 seconds."""
+        data = setup
+
+        call_count = 0
+
+        def fail_many_then_succeed(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 12:
+                raise DeaddropAPIError("Server Error", status_code=500)
+            return {
+                "events": {f"room:{data['room']['room_id']}": "mid-1"},
+                "timeout": False,
+            }
+
+        with patch.object(client, "subscribe", side_effect=fail_many_then_succeed):
+            gen = client.listen_all(
+                data["ns"],
+                data["alice"]["secret"],
+                {f"room:{data['room']['room_id']}": None},
+                timeout=1,
+            )
+            next(gen)
+
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        # After 9 retries, 2^8 = 256s. After 10, min(512, 300) = 300
+        assert all(d <= 300.0 for d in delays)
+        # The last few should all be 300
+        assert delays[-1] == 300.0
+
+    @patch("deadrop.client.time.sleep")
+    def test_success_resets_error_counter(self, mock_sleep, client, setup):
+        """A successful subscribe resets the consecutive error counter."""
+        data = setup
+
+        call_count = 0
+
+        def alternating(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise DeaddropAPIError("Server Error", status_code=500)
+            if call_count == 2:
+                return {
+                    "events": {f"room:{data['room']['room_id']}": "mid-1"},
+                    "timeout": False,
+                }
+            if call_count == 3:
+                raise DeaddropAPIError("Server Error", status_code=500)
+            if call_count == 4:
+                return {
+                    "events": {f"room:{data['room']['room_id']}": "mid-2"},
+                    "timeout": False,
+                }
+            raise StopIteration  # shouldn't reach here
+
+        with patch.object(client, "subscribe", side_effect=alternating):
+            gen = client.listen_all(
+                data["ns"],
+                data["alice"]["secret"],
+                {f"room:{data['room']['room_id']}": None},
+                timeout=1,
+            )
+            topic1, mid1 = next(gen)
+            topic2, mid2 = next(gen)
+
+        assert mid1 == "mid-1"
+        assert mid2 == "mid-2"
+
+        # Both errors should have delay of 1.0 (reset after success)
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays == [1.0, 1.0]
+
+    @patch("deadrop.client.time.sleep")
+    def test_max_retries_raises_after_limit(self, mock_sleep, client, setup):
+        """Raises after max_retries consecutive errors."""
+        data = setup
+
+        with patch.object(client, "subscribe") as mock_sub:
+            mock_sub.side_effect = AuthenticationError("Forbidden", status_code=403)
+
+            gen = client.listen_all(
+                data["ns"],
+                data["alice"]["secret"],
+                {f"room:{data['room']['room_id']}": None},
+                timeout=1,
+                max_retries=3,
+            )
+
+            with pytest.raises(AuthenticationError):
+                next(gen)
+
+            # Should have called subscribe 3 times
+            assert mock_sub.call_count == 3
+            # Sleeps happen between retries: after attempt 1, after attempt 2,
+            # but on attempt 3 we hit max_retries and raise before sleeping
+            assert mock_sleep.call_count == 2
+
+    @patch("deadrop.client.time.sleep")
+    def test_network_errors_trigger_backoff(self, mock_sleep, client, setup):
+        """OSError (network errors) also trigger backoff."""
+        data = setup
+
+        call_count = 0
+
+        def network_then_ok(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                raise OSError("Connection refused")
+            return {
+                "events": {f"room:{data['room']['room_id']}": "mid-1"},
+                "timeout": False,
+            }
+
+        with patch.object(client, "subscribe", side_effect=network_then_ok):
+            gen = client.listen_all(
+                data["ns"],
+                data["alice"]["secret"],
+                {f"room:{data['room']['room_id']}": None},
+                timeout=1,
+            )
+            next(gen)
+
+        assert mock_sleep.call_count == 2
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays == [1.0, 2.0]

@@ -24,13 +24,16 @@ Usage:
 """
 
 from deadrop._version import __version__
+from deadrop.backends import AuthenticationError, DeaddropAPIError
 from deadrop.client import Deaddrop
 from deadrop.discovery import DeaddropNotFound
 from deadrop.options import DeaddropConfigError, DeaddropOptions
 
 __all__ = [
     "__version__",
+    "AuthenticationError",
     "Deaddrop",
+    "DeaddropAPIError",
     "DeaddropOptions",
     "DeaddropNotFound",
     "DeaddropConfigError",

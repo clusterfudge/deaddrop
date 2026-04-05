@@ -39,11 +39,16 @@ from uuid_extensions import uuid7 as make_uuid7
 
 from .auth import derive_id, generate_secret, hash_secret
 
+# Deduplication window in seconds — messages with the same sender,
+# destination, and content hash within this window are considered
+# duplicates and silently de-duplicated.
+DEDUP_WINDOW_SECONDS = 60
+
 # Default TTL in hours when messages are read
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -641,12 +646,40 @@ def _migrate_004_add_mid_indexes(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_005_add_content_hash(conn: sqlite3.Connection) -> None:
+    """Migration 005: Add content_hash for implicit message deduplication.
+
+    Network timeouts can cause clients to retry sends, producing duplicate
+    messages. We add a content_hash column to both messages and room_messages
+    and create indexes that support efficient duplicate lookups within a
+    time window based on (sender, destination, content_hash).
+    """
+    # Direct messages
+    if not _column_exists(conn, "messages", "content_hash"):
+        conn.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_dedup "
+        "ON messages(ns, from_id, to_id, content_hash)"
+    )
+
+    # Room messages
+    if not _column_exists(conn, "room_messages", "content_hash"):
+        conn.execute("ALTER TABLE room_messages ADD COLUMN content_hash TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_dedup "
+        "ON room_messages(room_id, from_id, content_hash)"
+    )
+
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
     (2, "Add rooms tables for group communication", _migrate_002_add_rooms),
     (3, "Add reference_mid to room_messages for reactions", _migrate_003_add_reference_mid),
     (4, "Add mid-based indexes for room_messages and messages", _migrate_004_add_mid_indexes),
+    (5, "Add content_hash for implicit message deduplication", _migrate_005_add_content_hash),
 ]
 
 
@@ -704,6 +737,7 @@ SCHEMA_SQL = """
         from_id TEXT NOT NULL,
         body TEXT NOT NULL,
         content_type TEXT DEFAULT 'text/plain',
+        content_hash TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         read_at TIMESTAMP,
         expires_at TIMESTAMP,
@@ -717,6 +751,8 @@ SCHEMA_SQL = """
         ON messages(expires_at) WHERE expires_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_messages_archived
         ON messages(ns, to_id, archived_at) WHERE archived_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_messages_dedup
+        ON messages(ns, from_id, to_id, content_hash);
     
     CREATE TABLE IF NOT EXISTS invites (
         invite_id TEXT PRIMARY KEY,
@@ -772,10 +808,13 @@ SCHEMA_SQL = """
         from_id TEXT NOT NULL,
         body TEXT NOT NULL,
         content_type TEXT DEFAULT 'text/plain',
+        content_hash TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
     CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_room_messages_dedup
+        ON room_messages(room_id, from_id, content_hash);
 """
 
 
@@ -1259,6 +1298,25 @@ def update_identity_metadata(
     return cursor.rowcount > 0
 
 
+# --- Content Hash for Deduplication ---
+
+
+def _compute_content_hash(body: str, content_type: str, reference_mid: str | None = None) -> str:
+    """Compute a short hash of message content for deduplication.
+
+    Uses SHA-256 truncated to 16 hex chars (64 bits) — sufficient for
+    detecting retries within a narrow time window while keeping the index
+    compact.
+    """
+    import hashlib
+
+    parts = [body, content_type]
+    if reference_mid:
+        parts.append(reference_mid)
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
 # --- Message Operations ---
 
 
@@ -1271,7 +1329,13 @@ def send_message(
     ttl_hours: int | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> dict:
-    """Send a message. Returns message info."""
+    """Send a message. Returns message info.
+
+    Implements implicit idempotency: if the same sender sends an identical
+    message (same body, content_type) to the same recipient within
+    DEDUP_WINDOW_SECONDS, the original message is returned instead of
+    creating a duplicate.
+    """
     conn = _get_conn(conn)
 
     # Verify recipient exists
@@ -1281,17 +1345,41 @@ def send_message(
     if not row:
         raise ValueError(f"Recipient {to_id} not found in namespace {ns}")
 
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    content_hash = _compute_content_hash(body, content_type)
+
+    # Check for recent duplicate within the dedup window
+    window_start = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS)).isoformat()
+    cursor = conn.execute(
+        """SELECT mid, from_id, to_id, content_type, created_at
+           FROM messages
+           WHERE ns = ? AND from_id = ? AND to_id = ? AND content_hash = ?
+             AND created_at > ?
+           ORDER BY created_at DESC LIMIT 1""",
+        (ns, from_id, to_id, content_hash, window_start),
+    )
+    existing = _row_to_dict(cursor.description, cursor.fetchone())
+    if existing:
+        return {
+            "mid": existing["mid"],
+            "from": existing["from_id"],
+            "to": existing["to_id"],
+            "content_type": existing["content_type"],
+            "created_at": existing["created_at"],
+            "deduplicated": True,
+        }
+
     mid = str(make_uuid7())
-    now = datetime.now(timezone.utc).isoformat()
 
     expires_at = None
     if ttl_hours is not None and ttl_hours > 0:
-        expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
+        expires_at = (now + timedelta(hours=ttl_hours)).isoformat()
 
     conn.execute(
-        """INSERT INTO messages (mid, ns, to_id, from_id, body, content_type, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (mid, ns, to_id, from_id, body, content_type, now, expires_at),
+        """INSERT INTO messages (mid, ns, to_id, from_id, body, content_type, content_hash, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mid, ns, to_id, from_id, body, content_type, content_hash, now_iso, expires_at),
     )
     conn.commit()
 
@@ -1300,7 +1388,7 @@ def send_message(
         "from": from_id,
         "to": to_id,
         "content_type": content_type,
-        "created_at": now,
+        "created_at": now_iso,
     }
 
 
@@ -2097,6 +2185,11 @@ def send_room_message(
 ) -> dict:
     """Send a message to a room.
 
+    Implements implicit idempotency: if the same sender sends an identical
+    message (same body, content_type, reference_mid) to the same room
+    within DEDUP_WINDOW_SECONDS, the original message is returned instead
+    of creating a duplicate.
+
     Args:
         room_id: Room ID
         from_id: Sender identity ID (must be a member)
@@ -2122,14 +2215,40 @@ def send_room_message(
     if not is_room_member(room_id, from_id, conn=conn):
         raise ValueError(f"Identity {from_id} is not a member of room {room_id}")
 
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    content_hash = _compute_content_hash(body, content_type, reference_mid)
+
+    # Check for recent duplicate within the dedup window
+    window_start = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS)).isoformat()
+    cursor = conn.execute(
+        """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
+           FROM room_messages
+           WHERE room_id = ? AND from_id = ? AND content_hash = ?
+             AND created_at > ?
+           ORDER BY created_at DESC LIMIT 1""",
+        (room_id, from_id, content_hash, window_start),
+    )
+    existing = _row_to_dict(cursor.description, cursor.fetchone())
+    if existing:
+        return {
+            "mid": existing["mid"],
+            "room_id": existing["room_id"],
+            "from": existing["from_id"],
+            "body": existing["body"],
+            "content_type": existing.get("content_type") or "text/plain",
+            "reference_mid": existing.get("reference_mid"),
+            "created_at": existing["created_at"],
+            "deduplicated": True,
+        }
+
     mid = str(make_uuid7())
-    now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
         """INSERT INTO room_messages
-               (mid, room_id, from_id, body, content_type, reference_mid, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (mid, room_id, from_id, body, content_type, reference_mid, now),
+               (mid, room_id, from_id, body, content_type, content_hash, reference_mid, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mid, room_id, from_id, body, content_type, content_hash, reference_mid, now_iso),
     )
     conn.commit()
 
@@ -2140,7 +2259,7 @@ def send_room_message(
         "body": body,
         "content_type": content_type,
         "reference_mid": reference_mid,
-        "created_at": now,
+        "created_at": now_iso,
     }
 
 
