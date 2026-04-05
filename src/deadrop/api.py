@@ -1578,9 +1578,7 @@ async def send_room_message(
     # Only publish events for genuinely new messages
     if not deduplicated:
         try:
-            await get_event_bus().publish(
-                ns, f"room:{room_id}", message["mid"], sender_id=from_id
-            )
+            await get_event_bus().publish(ns, f"room:{room_id}", message["mid"], sender_id=from_id)
         except Exception:
             logger.warning("Failed to publish room event", exc_info=True)
 
