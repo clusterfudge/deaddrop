@@ -102,7 +102,10 @@
         
         <div id="room-message-list" class="message-list"></div>
         
+        <div id="room-attachment-preview" class="attachment-preview hidden"></div>
         <div class="compose-area">
+            <button id="room-attach-btn" class="btn btn-icon" title="Attach image">📎</button>
+            <input type="file" id="room-file-input" accept="image/*" multiple style="display:none">
             <textarea id="room-message-input" class="compose-input" 
                       placeholder="Type a message..." rows="1" enterkeyhint="send"></textarea>
             <button id="room-send-btn" class="btn btn-primary">Send ➤</button>
@@ -313,6 +316,95 @@
      * Apply syntax highlighting to all code blocks in a container.
      * Call after inserting rendered markdown HTML into the DOM.
      */
+    // ==================== ATTACHMENTS ====================
+
+    // Pending attachments for the current compose
+    let pendingAttachments = [];
+
+    function renderAttachments(msg) {
+        if (!msg.attachments || msg.attachments.length === 0) return '';
+        const parts = msg.attachments.map(att => {
+            if (att.content_type && att.content_type.startsWith('image/')) {
+                // Image: render inline thumbnail (click to load full via lightbox)
+                return `<img src="data:${escapeHtml(att.content_type)};base64,${att._data || ''}"
+                             alt="${escapeHtml(att.filename || 'image')}"
+                             data-attachment-id="${att.id}"
+                             onclick="loadAndShowAttachment(this, '${att.id}')"
+                             style="${att._data ? '' : 'min-height:40px;background:var(--surface,#eee);'}"
+                             loading="lazy">`;
+            } else {
+                return `<div class="file-attachment">📄 ${escapeHtml(att.filename || 'file')} (${formatFileSize(att.size)})</div>`;
+            }
+        });
+        return `<div class="message-attachments">${parts.join('')}</div>`;
+    }
+
+    function formatFileSize(bytes) {
+        if (!bytes) return '0B';
+        if (bytes < 1024) return bytes + 'B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
+        return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+    }
+
+    async function loadAndShowAttachment(imgEl, attachmentId) {
+        // If already loaded, just open lightbox
+        if (imgEl.dataset.loaded === 'true') {
+            openLightbox(imgEl);
+            return;
+        }
+        try {
+            const att = await DeadropAPI.getAttachment(credentials, attachmentId);
+            imgEl.src = `data:${att.content_type};base64,${att.data}`;
+            imgEl.dataset.loaded = 'true';
+            openLightbox(imgEl);
+        } catch (e) {
+            console.error('Failed to load attachment:', e);
+        }
+    }
+
+    function addFileToPreview(file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const dataUrl = e.target.result;
+            const base64 = dataUrl.split(',')[1];
+            const mime = dataUrl.split(':')[1].split(';')[0];
+            const att = { filename: file.name, content_type: mime, data: base64, size: file.size };
+            pendingAttachments.push(att);
+            renderAttachmentPreview();
+        };
+        reader.readAsDataURL(file);
+    }
+
+    function removeAttachment(idx) {
+        pendingAttachments.splice(idx, 1);
+        renderAttachmentPreview();
+    }
+
+    function renderAttachmentPreview() {
+        const preview = document.getElementById('room-attachment-preview');
+        if (!preview) return;
+        if (pendingAttachments.length === 0) {
+            preview.classList.add('hidden');
+            preview.innerHTML = '';
+            return;
+        }
+        preview.classList.remove('hidden');
+        preview.innerHTML = pendingAttachments.map((att, i) => {
+            const isImage = att.content_type.startsWith('image/');
+            const thumbContent = isImage
+                ? `<img src="data:${att.content_type};base64,${att.data}" alt="${escapeHtml(att.filename)}">`
+                : `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:24px;">📄</div>`;
+            return `<div class="thumb">
+                ${thumbContent}
+                <button class="remove-btn" onclick="removeAttachment(${i})">✕</button>
+            </div>`;
+        }).join('');
+    }
+
+    // Make removeAttachment available globally for onclick
+    window.removeAttachment = removeAttachment;
+    window.loadAndShowAttachment = loadAndShowAttachment;
+
     function highlightCodeBlocks(container) {
         if (typeof hljs === 'undefined') return;
         container.querySelectorAll('pre code').forEach(block => {
@@ -814,6 +906,7 @@
                 <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}" data-mid="${msg.mid}">
                     <div class="sender-name">${getMemberName(msg.from_id)}</div>
                     <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
+                    ${renderAttachments(msg)}
                     ${renderReactionBadges(msg.mid, reactionMap)}
                     <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
                 </div>
@@ -863,10 +956,18 @@
         const input = document.getElementById('room-message-input');
         const sendBtn = document.getElementById('room-send-btn');
         const body = input.value.trim();
-        if (!body) return;
+        const hasAttachments = pendingAttachments.length > 0;
+        if (!body && !hasAttachments) return;
+        
+        // Capture attachments before clearing
+        const attachmentsToSend = hasAttachments
+            ? pendingAttachments.map(a => ({ filename: a.filename, content_type: a.content_type, data: a.data }))
+            : null;
         
         // Immediately clear input and disable button
         input.value = '';
+        pendingAttachments = [];
+        renderAttachmentPreview();
         sendBtn.disabled = true;
         sendBtn.textContent = 'Sending...';
         
@@ -874,7 +975,7 @@
         const optimisticMsg = {
             mid: 'pending-' + Date.now(),
             from_id: credentials.id,
-            body: body,
+            body: body || (hasAttachments ? '📎' : ''),
             created_at: new Date().toISOString(),
             pending: true
         };
@@ -884,7 +985,10 @@
         const startTime = performance.now();
         
         try {
-            const result = await DeadropAPI.sendRoomMessage(credentials, currentRoomId, body);
+            const result = await DeadropAPI.sendRoomMessage(
+                credentials, currentRoomId, body || '📎',
+                'text/markdown', null, attachmentsToSend
+            );
             const elapsed = Math.round(performance.now() - startTime);
             console.log(`Room message sent in ${elapsed}ms`);
             
@@ -1200,6 +1304,30 @@
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendRoomMessage();
+        }
+    });
+
+    // Attach button
+    document.getElementById('room-attach-btn').addEventListener('click', () => {
+        document.getElementById('room-file-input').click();
+    });
+    document.getElementById('room-file-input').addEventListener('change', (e) => {
+        for (const file of e.target.files) {
+            addFileToPreview(file);
+        }
+        e.target.value = '';  // Reset so same file can be re-selected
+    });
+
+    // Paste handler for images
+    document.getElementById('room-message-input').addEventListener('paste', (e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        for (const item of items) {
+            if (item.type.startsWith('image/')) {
+                e.preventDefault();
+                const file = item.getAsFile();
+                if (file) addFileToPreview(file);
+            }
         }
     });
     

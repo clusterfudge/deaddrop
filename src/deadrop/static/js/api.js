@@ -148,13 +148,21 @@ const DeadropAPI = {
     /**
      * Send a message to a room.
      */
-    async sendRoomMessage(credentials, roomId, body, contentType = 'text/plain', referenceMid = null) {
+    async sendRoomMessage(credentials, roomId, body, contentType = 'text/plain', referenceMid = null, attachments = null) {
         const payload = { body, content_type: contentType };
         if (referenceMid) payload.reference_mid = referenceMid;
+        if (attachments && attachments.length > 0) payload.attachments = attachments;
         return this.request('POST', `/${credentials.ns}/rooms/${roomId}/messages`, {
             body: payload,
             credentials,
         });
+    },
+
+    /**
+     * Fetch a single attachment with its base64 data.
+     */
+    async getAttachment(credentials, attachmentId) {
+        return this.request('GET', `/${credentials.ns}/attachments/${attachmentId}`, { credentials });
     },
 
     /**
