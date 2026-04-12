@@ -1971,6 +1971,41 @@ def get_room(
     return row
 
 
+def update_room(
+    room_id: str,
+    display_name: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Update room properties.
+
+    Args:
+        room_id: Room ID
+        display_name: New display name (None = no change)
+        conn: Optional database connection
+
+    Returns:
+        Updated room info dict or None if not found
+    """
+    conn = _get_conn(conn)
+
+    updates = []
+    params = []
+    if display_name is not None:
+        updates.append("display_name = ?")
+        params.append(display_name)
+
+    if not updates:
+        return get_room(room_id, conn=conn)
+
+    params.append(room_id)
+    conn.execute(
+        f"UPDATE rooms SET {', '.join(updates)} WHERE room_id = ?",
+        params,
+    )
+    conn.commit()
+    return get_room(room_id, conn=conn)
+
+
 def list_rooms(
     ns: str,
     conn: sqlite3.Connection | None = None,

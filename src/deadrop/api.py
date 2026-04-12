@@ -1419,6 +1419,34 @@ async def get_room(
     return RoomInfo(**room)
 
 
+class UpdateRoomRequest(BaseModel):
+    display_name: str | None = None
+
+
+@app.patch("/{ns}/rooms/{room_id}", response_model=RoomInfo)
+async def update_room_endpoint(
+    ns: str,
+    room_id: str,
+    request: UpdateRoomRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Update room properties. Requires membership."""
+    room, _ = await _require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    import functools
+
+    updated = await _run_sync(
+        functools.partial(db.update_room, room_id, display_name=request.display_name)
+    )
+    if not updated:
+        raise HTTPException(404, "Room not found")
+
+    return RoomInfo(**updated)
+
+
 @app.delete("/{ns}/rooms/{room_id}")
 def delete_room_endpoint(
     ns: str,
