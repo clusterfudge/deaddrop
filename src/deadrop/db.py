@@ -683,7 +683,8 @@ def _migrate_006_add_attachments(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY,
-            message_mid TEXT NOT NULL,
+            message_mid TEXT NOT NULL
+                REFERENCES room_messages(mid) ON DELETE CASCADE,
             filename TEXT,
             content_type TEXT NOT NULL,
             data TEXT NOT NULL,
@@ -2914,4 +2915,53 @@ def get_message_attachments(
             att["size"] = row[4]
             att["created_at"] = row[5]
         results.append(att)
+    return results
+
+
+def get_batch_message_attachments(
+    message_mids: list[str],
+    include_data: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, list[dict]]:
+    """Get attachments for multiple messages in a single query.
+
+    Args:
+        message_mids: List of message mids to fetch attachments for.
+        include_data: Whether to include base64 data (default False for listings).
+        conn: Optional database connection.
+
+    Returns:
+        Dict mapping message_mid -> list of attachment dicts.
+    """
+    if not message_mids:
+        return {}
+
+    conn = _get_conn(conn)
+    if include_data:
+        cols = "id, message_mid, filename, content_type, data, size, created_at"
+    else:
+        cols = "id, message_mid, filename, content_type, size, created_at"
+
+    placeholders = ",".join("?" for _ in message_mids)
+    cursor = conn.execute(
+        f"SELECT {cols} FROM attachments WHERE message_mid IN ({placeholders}) ORDER BY created_at",
+        message_mids,
+    )
+
+    results: dict[str, list[dict]] = {}
+    for row in cursor.fetchall():
+        att = {
+            "id": row[0],
+            "message_mid": row[1],
+            "filename": row[2],
+            "content_type": row[3],
+        }
+        if include_data:
+            att["data"] = row[4]
+            att["size"] = row[5]
+            att["created_at"] = row[6]
+        else:
+            att["size"] = row[4]
+            att["created_at"] = row[5]
+        results.setdefault(att["message_mid"], []).append(att)
     return results

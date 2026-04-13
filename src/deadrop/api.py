@@ -1256,6 +1256,20 @@ class RoomMemberInfo(BaseModel):
     metadata: dict[str, Any]
 
 
+# Allowed MIME types for attachments
+ALLOWED_ATTACHMENT_TYPES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "application/pdf",
+})
+
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10MB per attachment
+MAX_ATTACHMENTS_PER_MESSAGE = 10
+MAX_TOTAL_ATTACHMENT_SIZE = 25 * 1024 * 1024  # 25MB total per message
+
+
 class AttachmentRequest(BaseModel):
     filename: str | None = None
     content_type: str  # e.g. "image/png"
@@ -1566,17 +1580,20 @@ async def get_room_messages(
         )
     )
 
-    # Enrich messages with attachment metadata (without data)
-    enriched = []
-    for m in messages:
-        atts = await _run_sync(
-            functools.partial(
-                db.get_message_attachments,
-                m["mid"],
-                include_data=False,
-            )
+    # Batch-fetch attachment metadata for all messages (avoids N+1)
+    mids = [m["mid"] for m in messages]
+    attachments_by_mid = await _run_sync(
+        functools.partial(
+            db.get_batch_message_attachments,
+            mids,
+            include_data=False,
         )
-        enriched.append(RoomMessageInfo.from_db(m, atts or None).model_dump())
+    )
+
+    enriched = [
+        RoomMessageInfo.from_db(m, attachments_by_mid.get(m["mid"]) or None).model_dump()
+        for m in messages
+    ]
 
     return {
         "messages": enriched,
@@ -1608,21 +1625,43 @@ async def send_room_message(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    # Validate attachment sizes
+    # Validate attachments: count, content-type allowlist, sizes
+    validated_attachments: list[tuple] = []  # (att, raw_size)
     if request.attachments:
         import base64
 
-        MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10MB per attachment
+        if len(request.attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise HTTPException(
+                400,
+                f"Too many attachments: {len(request.attachments)} (max {MAX_ATTACHMENTS_PER_MESSAGE})",
+            )
+
+        total_size = 0
         for att in request.attachments:
+            # Content-type allowlist
+            if att.content_type not in ALLOWED_ATTACHMENT_TYPES:
+                raise HTTPException(
+                    400,
+                    f"Unsupported attachment type: {att.content_type!r}. "
+                    f"Allowed: {', '.join(sorted(ALLOWED_ATTACHMENT_TYPES))}",
+                )
             try:
                 raw = base64.b64decode(att.data, validate=True)
             except Exception:
                 raise HTTPException(400, "Invalid base64 data in attachment")
-            if len(raw) > MAX_ATTACHMENT_SIZE:
+            raw_size = len(raw)
+            if raw_size > MAX_ATTACHMENT_SIZE:
                 raise HTTPException(
-                    400,
-                    f"Attachment too large: {len(raw)} bytes (max {MAX_ATTACHMENT_SIZE})",
+                    413,
+                    f"Attachment too large: {raw_size} bytes (max {MAX_ATTACHMENT_SIZE})",
                 )
+            total_size += raw_size
+            if total_size > MAX_TOTAL_ATTACHMENT_SIZE:
+                raise HTTPException(
+                    413,
+                    f"Total attachment size too large: {total_size} bytes (max {MAX_TOTAL_ATTACHMENT_SIZE})",
+                )
+            validated_attachments.append((att, raw_size))
 
     try:
         message = await _run_sync(
@@ -1640,13 +1679,10 @@ async def send_room_message(
 
     deduplicated = message.pop("deduplicated", False)
 
-    # Store attachments for genuinely new messages
+    # Store attachments for genuinely new messages (reuse validated sizes)
     attachment_records = []
-    if not deduplicated and request.attachments:
-        import base64
-
-        for att in request.attachments:
-            raw_size = len(base64.b64decode(att.data))
+    if not deduplicated and validated_attachments:
+        for att, raw_size in validated_attachments:
             record = await _run_sync(
                 functools.partial(
                     db.add_attachment,

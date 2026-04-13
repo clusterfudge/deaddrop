@@ -385,6 +385,206 @@ class TestAttachmentAPI:
 
 
 # ---------------------------------------------------------------------------
+# Validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestAttachmentValidation:
+    def test_reject_html_content_type(self, client, room_setup):
+        """Stored XSS: text/html must be rejected."""
+        s = room_setup
+        import base64
+        html_b64 = base64.b64encode(b"<script>alert(1)</script>").decode()
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "XSS attempt",
+                "attachments": [
+                    {"filename": "evil.html", "content_type": "text/html", "data": html_b64},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 400
+        assert "Unsupported attachment type" in resp.json()["detail"]
+
+    def test_reject_svg_content_type(self, client, room_setup):
+        """SVG can contain scripts — must be rejected."""
+        s = room_setup
+        import base64
+        svg_b64 = base64.b64encode(b"<svg onload='alert(1)'/>").decode()
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "SVG XSS",
+                "attachments": [
+                    {"filename": "evil.svg", "content_type": "image/svg+xml", "data": svg_b64},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 400
+
+    def test_reject_javascript_content_type(self, client, room_setup):
+        s = room_setup
+        import base64
+        js_b64 = base64.b64encode(b"alert(1)").decode()
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "JS",
+                "attachments": [
+                    {"filename": "evil.js", "content_type": "application/javascript", "data": js_b64},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 400
+
+    def test_allow_pdf(self, client, room_setup):
+        """application/pdf should be allowed."""
+        s = room_setup
+        import base64
+        pdf_b64 = base64.b64encode(b"%PDF-1.4 fake content").decode()
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "PDF",
+                "attachments": [
+                    {"filename": "doc.pdf", "content_type": "application/pdf", "data": pdf_b64},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+
+    def test_too_many_attachments(self, client, room_setup):
+        """More than 10 attachments must be rejected."""
+        s = room_setup
+        png = _make_png_b64()
+        attachments = [
+            {"filename": f"img{i}.png", "content_type": "image/png", "data": png}
+            for i in range(11)
+        ]
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={"body": "Too many", "attachments": attachments},
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 400
+        assert "Too many attachments" in resp.json()["detail"]
+
+    def test_exactly_max_attachments_ok(self, client, room_setup):
+        """Exactly 10 attachments should succeed."""
+        s = room_setup
+        png = _make_png_b64()
+        attachments = [
+            {"filename": f"img{i}.png", "content_type": "image/png", "data": png}
+            for i in range(10)
+        ]
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={"body": "Max ok", "attachments": attachments},
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()["attachments"]) == 10
+
+    def test_oversized_attachment_returns_413(self, client, room_setup):
+        """Attachment over 10MB should return 413."""
+        s = room_setup
+        import base64
+        # 10MB + 1 byte
+        big_data = base64.b64encode(b"x" * (10 * 1024 * 1024 + 1)).decode()
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "Too big",
+                "attachments": [
+                    {"filename": "huge.png", "content_type": "image/png", "data": big_data},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# Batch query tests
+# ---------------------------------------------------------------------------
+
+
+class TestBatchAttachmentQuery:
+    def test_batch_fetch(self, client, room_setup):
+        """get_batch_message_attachments returns grouped results."""
+        s = room_setup
+        # Send two messages with attachments
+        r1 = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "msg1",
+                "attachments": [
+                    {"filename": "a.png", "content_type": "image/png", "data": _make_png_b64()},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        r2 = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "msg2",
+                "attachments": [
+                    {"filename": "b.jpg", "content_type": "image/jpeg", "data": _make_jpeg_b64()},
+                    {"filename": "c.png", "content_type": "image/png", "data": _make_png_b64()},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        mid1 = r1.json()["mid"]
+        mid2 = r2.json()["mid"]
+
+        result = db.get_batch_message_attachments([mid1, mid2])
+        assert mid1 in result
+        assert mid2 in result
+        assert len(result[mid1]) == 1
+        assert len(result[mid2]) == 2
+
+    def test_batch_empty_list(self, client, room_setup):
+        result = db.get_batch_message_attachments([])
+        assert result == {}
+
+    def test_listing_uses_batch(self, client, room_setup):
+        """GET /messages should work correctly with batch query."""
+        s = room_setup
+        client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "with att",
+                "attachments": [
+                    {"filename": "test.png", "content_type": "image/png", "data": _make_png_b64()},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={"body": "no att"},
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        resp = client.get(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        msgs = resp.json()["messages"]
+        assert len(msgs) == 2
+        with_att = [m for m in msgs if m["attachments"]]
+        without_att = [m for m in msgs if not m["attachments"]]
+        assert len(with_att) == 1
+        assert len(without_att) == 1
+
+
+# ---------------------------------------------------------------------------
 # Migration tests
 # ---------------------------------------------------------------------------
 
@@ -403,3 +603,13 @@ class TestAttachmentMigration:
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_attachments_mid'"
         )
         assert cursor.fetchone() is not None
+
+    def test_foreign_key_constraint(self, client, room_setup):
+        """attachments.message_mid should reference room_messages(mid)."""
+        conn = db.get_connection()
+        fks = conn.execute("PRAGMA foreign_key_list(attachments)").fetchall()
+        # FK should reference room_messages.mid
+        assert len(fks) >= 1
+        fk = fks[0]
+        assert fk[2] == "room_messages"  # table
+        assert fk[4] == "mid"  # to column
