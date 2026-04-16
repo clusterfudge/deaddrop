@@ -1257,13 +1257,15 @@ class RoomMemberInfo(BaseModel):
 
 
 # Allowed MIME types for attachments
-ALLOWED_ATTACHMENT_TYPES = frozenset({
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-    "application/pdf",
-})
+ALLOWED_ATTACHMENT_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "application/pdf",
+    }
+)
 
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10MB per attachment
 MAX_ATTACHMENTS_PER_MESSAGE = 10

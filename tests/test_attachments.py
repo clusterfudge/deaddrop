@@ -394,6 +394,7 @@ class TestAttachmentValidation:
         """Stored XSS: text/html must be rejected."""
         s = room_setup
         import base64
+
         html_b64 = base64.b64encode(b"<script>alert(1)</script>").decode()
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
@@ -412,6 +413,7 @@ class TestAttachmentValidation:
         """SVG can contain scripts — must be rejected."""
         s = room_setup
         import base64
+
         svg_b64 = base64.b64encode(b"<svg onload='alert(1)'/>").decode()
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
@@ -428,13 +430,18 @@ class TestAttachmentValidation:
     def test_reject_javascript_content_type(self, client, room_setup):
         s = room_setup
         import base64
+
         js_b64 = base64.b64encode(b"alert(1)").decode()
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
             json={
                 "body": "JS",
                 "attachments": [
-                    {"filename": "evil.js", "content_type": "application/javascript", "data": js_b64},
+                    {
+                        "filename": "evil.js",
+                        "content_type": "application/javascript",
+                        "data": js_b64,
+                    },
                 ],
             },
             headers={"X-Inbox-Secret": s["alice_secret"]},
@@ -445,6 +452,7 @@ class TestAttachmentValidation:
         """application/pdf should be allowed."""
         s = room_setup
         import base64
+
         pdf_b64 = base64.b64encode(b"%PDF-1.4 fake content").decode()
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
@@ -463,8 +471,7 @@ class TestAttachmentValidation:
         s = room_setup
         png = _make_png_b64()
         attachments = [
-            {"filename": f"img{i}.png", "content_type": "image/png", "data": png}
-            for i in range(11)
+            {"filename": f"img{i}.png", "content_type": "image/png", "data": png} for i in range(11)
         ]
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
@@ -479,8 +486,7 @@ class TestAttachmentValidation:
         s = room_setup
         png = _make_png_b64()
         attachments = [
-            {"filename": f"img{i}.png", "content_type": "image/png", "data": png}
-            for i in range(10)
+            {"filename": f"img{i}.png", "content_type": "image/png", "data": png} for i in range(10)
         ]
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
@@ -494,6 +500,7 @@ class TestAttachmentValidation:
         """Attachment over 10MB should return 413."""
         s = room_setup
         import base64
+
         # 10MB + 1 byte
         big_data = base64.b64encode(b"x" * (10 * 1024 * 1024 + 1)).decode()
         resp = client.post(
