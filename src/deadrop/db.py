@@ -2945,7 +2945,7 @@ def get_batch_message_attachments(
     placeholders = ",".join("?" for _ in message_mids)
     cursor = conn.execute(
         f"SELECT {cols} FROM attachments WHERE message_mid IN ({placeholders}) ORDER BY created_at",
-        message_mids,
+        tuple(message_mids),
     )
 
     results: dict[str, list[dict]] = {}
