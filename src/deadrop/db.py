@@ -48,7 +48,7 @@ DEDUP_WINDOW_SECONDS = 60
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -673,6 +673,29 @@ def _migrate_005_add_content_hash(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_006_add_attachments(conn: sqlite3.Connection) -> None:
+    """Migration 006: Add attachments table for binary content on messages.
+
+    Attachments are stored separately from messages to keep message payloads
+    lightweight. Each attachment belongs to exactly one message (via message_mid)
+    and stores its content as base64-encoded text.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attachments (
+            id TEXT PRIMARY KEY,
+            message_mid TEXT NOT NULL
+                REFERENCES room_messages(mid) ON DELETE CASCADE,
+            filename TEXT,
+            content_type TEXT NOT NULL,
+            data TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_mid ON attachments(message_mid)")
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
@@ -680,6 +703,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (3, "Add reference_mid to room_messages for reactions", _migrate_003_add_reference_mid),
     (4, "Add mid-based indexes for room_messages and messages", _migrate_004_add_mid_indexes),
     (5, "Add content_hash for implicit message deduplication", _migrate_005_add_content_hash),
+    (6, "Add attachments table for binary content on messages", _migrate_006_add_attachments),
 ]
 
 
@@ -2757,3 +2781,187 @@ def is_room_member_cached(
 
     membership_cache.set(cache_key, is_member)
     return is_member
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+
+def add_attachment(
+    message_mid: str,
+    content_type: str,
+    data: str,
+    size: int,
+    filename: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Store an attachment for a message.
+
+    Args:
+        message_mid: The mid of the message this attachment belongs to.
+        content_type: MIME type (e.g. "image/png").
+        data: Base64-encoded content.
+        size: Raw byte size before base64 encoding.
+        filename: Optional original filename.
+        conn: Optional database connection.
+
+    Returns:
+        Attachment info dict with id, message_mid, filename, content_type, size, created_at.
+    """
+    conn = _get_conn(conn)
+    import uuid as _uuid
+
+    attachment_id = str(_uuid.uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """INSERT INTO attachments (id, message_mid, filename, content_type, data, size, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (attachment_id, message_mid, filename, content_type, data, size, now_iso),
+    )
+    conn.commit()
+
+    return {
+        "id": attachment_id,
+        "message_mid": message_mid,
+        "filename": filename,
+        "content_type": content_type,
+        "size": size,
+        "created_at": now_iso,
+    }
+
+
+def get_attachment(
+    attachment_id: str,
+    include_data: bool = True,
+    conn: sqlite3.Connection | None = None,
+) -> dict | None:
+    """Retrieve an attachment by ID.
+
+    Args:
+        attachment_id: The attachment ID.
+        include_data: Whether to include the base64 data (default True).
+        conn: Optional database connection.
+
+    Returns:
+        Attachment dict or None if not found.
+    """
+    conn = _get_conn(conn)
+    cols = (
+        "id, message_mid, filename, content_type, data, size, created_at"
+        if include_data
+        else "id, message_mid, filename, content_type, size, created_at"
+    )
+    cursor = conn.execute(f"SELECT {cols} FROM attachments WHERE id = ?", (attachment_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+
+    result = {
+        "id": row[0],
+        "message_mid": row[1],
+        "filename": row[2],
+        "content_type": row[3],
+    }
+    if include_data:
+        result["data"] = row[4]
+        result["size"] = row[5]
+        result["created_at"] = row[6]
+    else:
+        result["size"] = row[4]
+        result["created_at"] = row[5]
+    return result
+
+
+def get_message_attachments(
+    message_mid: str,
+    include_data: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """Get all attachments for a message.
+
+    Args:
+        message_mid: The message mid.
+        include_data: Whether to include base64 data (default False for listings).
+        conn: Optional database connection.
+
+    Returns:
+        List of attachment dicts.
+    """
+    conn = _get_conn(conn)
+    if include_data:
+        cols = "id, message_mid, filename, content_type, data, size, created_at"
+    else:
+        cols = "id, message_mid, filename, content_type, size, created_at"
+
+    cursor = conn.execute(
+        f"SELECT {cols} FROM attachments WHERE message_mid = ? ORDER BY created_at",
+        (message_mid,),
+    )
+    results = []
+    for row in cursor.fetchall():
+        att = {
+            "id": row[0],
+            "message_mid": row[1],
+            "filename": row[2],
+            "content_type": row[3],
+        }
+        if include_data:
+            att["data"] = row[4]
+            att["size"] = row[5]
+            att["created_at"] = row[6]
+        else:
+            att["size"] = row[4]
+            att["created_at"] = row[5]
+        results.append(att)
+    return results
+
+
+def get_batch_message_attachments(
+    message_mids: list[str],
+    include_data: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, list[dict]]:
+    """Get attachments for multiple messages in a single query.
+
+    Args:
+        message_mids: List of message mids to fetch attachments for.
+        include_data: Whether to include base64 data (default False for listings).
+        conn: Optional database connection.
+
+    Returns:
+        Dict mapping message_mid -> list of attachment dicts.
+    """
+    if not message_mids:
+        return {}
+
+    conn = _get_conn(conn)
+    if include_data:
+        cols = "id, message_mid, filename, content_type, data, size, created_at"
+    else:
+        cols = "id, message_mid, filename, content_type, size, created_at"
+
+    placeholders = ",".join("?" for _ in message_mids)
+    cursor = conn.execute(
+        f"SELECT {cols} FROM attachments WHERE message_mid IN ({placeholders}) ORDER BY created_at",
+        message_mids,
+    )
+
+    results: dict[str, list[dict]] = {}
+    for row in cursor.fetchall():
+        att = {
+            "id": row[0],
+            "message_mid": row[1],
+            "filename": row[2],
+            "content_type": row[3],
+        }
+        if include_data:
+            att["data"] = row[4]
+            att["size"] = row[5]
+            att["created_at"] = row[6]
+        else:
+            att["size"] = row[4]
+            att["created_at"] = row[5]
+        results.setdefault(att["message_mid"], []).append(att)
+    return results

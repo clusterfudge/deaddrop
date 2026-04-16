@@ -1256,10 +1256,48 @@ class RoomMemberInfo(BaseModel):
     metadata: dict[str, Any]
 
 
+# Allowed MIME types for attachments
+ALLOWED_ATTACHMENT_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "application/pdf",
+    }
+)
+
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10MB per attachment
+MAX_ATTACHMENTS_PER_MESSAGE = 10
+MAX_TOTAL_ATTACHMENT_SIZE = 25 * 1024 * 1024  # 25MB total per message
+
+
+class AttachmentRequest(BaseModel):
+    filename: str | None = None
+    content_type: str  # e.g. "image/png"
+    data: str  # base64-encoded content
+
+
 class SendRoomMessageRequest(BaseModel):
     body: str
     content_type: str = "text/plain"
     reference_mid: str | None = None
+    attachments: list[AttachmentRequest] | None = None
+
+
+class AttachmentInfo(BaseModel):
+    id: str
+    message_mid: str
+    filename: str | None = None
+    content_type: str
+    size: int
+    created_at: str
+
+
+class AttachmentDataInfo(AttachmentInfo):
+    """Attachment info with base64 data included."""
+
+    data: str
 
 
 class RoomMessageInfo(BaseModel):
@@ -1270,10 +1308,24 @@ class RoomMessageInfo(BaseModel):
     content_type: str
     reference_mid: str | None = None
     created_at: str
+    attachments: list[AttachmentInfo] | None = None
 
     @classmethod
-    def from_db(cls, data: dict) -> "RoomMessageInfo":
+    def from_db(cls, data: dict, attachments: list[dict] | None = None) -> "RoomMessageInfo":
         """Create from db result which uses 'from' key."""
+        att_infos = None
+        if attachments:
+            att_infos = [
+                AttachmentInfo(
+                    id=a["id"],
+                    message_mid=a["message_mid"],
+                    filename=a.get("filename"),
+                    content_type=a["content_type"],
+                    size=a.get("size", 0),
+                    created_at=a.get("created_at", ""),
+                )
+                for a in attachments
+            ]
         return cls(
             mid=data["mid"],
             room_id=data["room_id"],
@@ -1282,6 +1334,7 @@ class RoomMessageInfo(BaseModel):
             content_type=data.get("content_type", "text/plain"),
             reference_mid=data.get("reference_mid"),
             created_at=data["created_at"],
+            attachments=att_infos,
         )
 
 
@@ -1529,8 +1582,23 @@ async def get_room_messages(
         )
     )
 
+    # Batch-fetch attachment metadata for all messages (avoids N+1)
+    mids = [m["mid"] for m in messages]
+    attachments_by_mid = await _run_sync(
+        functools.partial(
+            db.get_batch_message_attachments,
+            mids,
+            include_data=False,
+        )
+    )
+
+    enriched = [
+        RoomMessageInfo.from_db(m, attachments_by_mid.get(m["mid"]) or None).model_dump()
+        for m in messages
+    ]
+
     return {
-        "messages": [RoomMessageInfo.from_db(m).model_dump() for m in messages],
+        "messages": enriched,
         "room_id": room_id,
     }
 
@@ -1559,6 +1627,44 @@ async def send_room_message(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
+    # Validate attachments: count, content-type allowlist, sizes
+    validated_attachments: list[tuple] = []  # (att, raw_size)
+    if request.attachments:
+        import base64
+
+        if len(request.attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise HTTPException(
+                400,
+                f"Too many attachments: {len(request.attachments)} (max {MAX_ATTACHMENTS_PER_MESSAGE})",
+            )
+
+        total_size = 0
+        for att in request.attachments:
+            # Content-type allowlist
+            if att.content_type not in ALLOWED_ATTACHMENT_TYPES:
+                raise HTTPException(
+                    400,
+                    f"Unsupported attachment type: {att.content_type!r}. "
+                    f"Allowed: {', '.join(sorted(ALLOWED_ATTACHMENT_TYPES))}",
+                )
+            try:
+                raw = base64.b64decode(att.data, validate=True)
+            except Exception:
+                raise HTTPException(400, "Invalid base64 data in attachment")
+            raw_size = len(raw)
+            if raw_size > MAX_ATTACHMENT_SIZE:
+                raise HTTPException(
+                    413,
+                    f"Attachment too large: {raw_size} bytes (max {MAX_ATTACHMENT_SIZE})",
+                )
+            total_size += raw_size
+            if total_size > MAX_TOTAL_ATTACHMENT_SIZE:
+                raise HTTPException(
+                    413,
+                    f"Total attachment size too large: {total_size} bytes (max {MAX_TOTAL_ATTACHMENT_SIZE})",
+                )
+            validated_attachments.append((att, raw_size))
+
     try:
         message = await _run_sync(
             functools.partial(
@@ -1575,6 +1681,22 @@ async def send_room_message(
 
     deduplicated = message.pop("deduplicated", False)
 
+    # Store attachments for genuinely new messages (reuse validated sizes)
+    attachment_records = []
+    if not deduplicated and validated_attachments:
+        for att, raw_size in validated_attachments:
+            record = await _run_sync(
+                functools.partial(
+                    db.add_attachment,
+                    message_mid=message["mid"],
+                    content_type=att.content_type,
+                    data=att.data,
+                    size=raw_size,
+                    filename=att.filename,
+                )
+            )
+            attachment_records.append(record)
+
     # Only publish events for genuinely new messages
     if not deduplicated:
         try:
@@ -1582,7 +1704,7 @@ async def send_room_message(
         except Exception:
             logger.warning("Failed to publish room event", exc_info=True)
 
-    response_data = RoomMessageInfo.from_db(message).model_dump()
+    response_data = RoomMessageInfo.from_db(message, attachment_records or None).model_dump()
 
     headers = {}
     if deduplicated:
@@ -1692,6 +1814,57 @@ def _validate_subscription_topics_sync(
                 400,
                 f"Unknown topic type: {topic_type!r}. Supported: 'inbox', 'room'",
             )
+
+
+@app.get("/{ns}/attachments/{attachment_id}")
+async def get_attachment(
+    ns: str,
+    attachment_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Fetch a single attachment with its base64 data.
+
+    The caller must be a member of the room the attachment's message belongs to.
+    Returns the full attachment including base64-encoded data.
+    """
+    import functools
+
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    attachment = await _run_sync(
+        functools.partial(db.get_attachment, attachment_id, include_data=True)
+    )
+    if not attachment:
+        raise HTTPException(404, "Attachment not found")
+
+    # Verify caller has access via room membership
+    # Look up the message's room_id directly from room_messages table
+    message_mid = attachment["message_mid"]
+    conn = db.get_connection()
+    cursor = conn.execute("SELECT room_id FROM room_messages WHERE mid = ?", (message_mid,))
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(404, "Attachment not found")
+
+    room_id = row[0]
+    room = db.get_room(room_id)
+    if not room or room["ns"] != ns:
+        raise HTTPException(404, "Attachment not found")
+
+    caller_id = derive_id(x_inbox_secret)
+    if not db.is_room_member(room_id, caller_id):
+        raise HTTPException(403, "Not a room member")
+
+    return AttachmentDataInfo(
+        id=attachment["id"],
+        message_mid=attachment["message_mid"],
+        filename=attachment.get("filename"),
+        content_type=attachment["content_type"],
+        size=attachment.get("size", 0),
+        created_at=attachment.get("created_at", ""),
+        data=attachment["data"],
+    ).model_dump()
 
 
 @app.post("/{ns}/subscribe")
