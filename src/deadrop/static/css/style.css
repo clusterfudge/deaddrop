@@ -879,12 +879,15 @@ button:disabled {
     background: var(--surface, #f5f5f5);
     border-top: 1px solid var(--border, #e0e0e0);
     overflow-x: auto;
+    max-width: 100%;
+    box-sizing: border-box;
 }
 .attachment-preview.hidden { display: none; }
 .attachment-preview .thumb {
     position: relative;
     width: 60px;
     height: 60px;
+    min-width: 60px;
     border-radius: 6px;
     overflow: hidden;
     flex-shrink: 0;
@@ -915,14 +918,17 @@ button:disabled {
 /* Inline image attachments in messages */
 .message-attachments {
     margin-top: 6px;
+    max-width: 100%;
+    overflow: hidden;
 }
 .message-attachments img {
-    max-width: 300px;
+    max-width: min(300px, 100%);
     max-height: 260px;
     border-radius: 8px;
     cursor: pointer;
     display: block;
     margin: 4px 0;
+    object-fit: contain;
 }
 .message-attachments .file-attachment {
     display: inline-flex;
