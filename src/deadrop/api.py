@@ -54,10 +54,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Failed to enforce namespace TTLs on startup", exc_info=True)
 
-    # Schedule cache warming as background task (non-blocking)
-    from .cache import schedule_cache_warming, stop_cache_warming
+    # Warm caches synchronously before accepting requests
+    from .cache import stop_cache_warming, warm_caches
 
-    schedule_cache_warming()
+    try:
+        await warm_caches()
+    except Exception:
+        logger.warning("Cache warming failed on startup", exc_info=True)
 
     yield
 
