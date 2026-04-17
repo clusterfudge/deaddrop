@@ -544,15 +544,31 @@ async def _validate_subscription_topics(
                     f"Cannot subscribe to another identity's inbox: {topic_key}",
                 )
         elif topic_type == "room":
-            is_member = await _run_sync(db.is_room_member, topic_id, caller_id)
-            if not is_member:
-                raise HTTPException(
-                    403,
-                    f"Not a member of room: {topic_id}",
-                )
-            room = await _run_sync(db.get_room, topic_id)
-            if room is None or room.get("ns") != ns:
-                raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
+            # Use the same cache fast-path as _require_room_member to avoid
+            # hitting the DB executor on warm-cache subscription requests.
+            from .cache import membership_cache, room_cache
+
+            cache_hit, cached_room = room_cache.get(f"room:{topic_id}")
+            membership_hit, is_member_cached = membership_cache.get(
+                f"member:{topic_id}:{caller_id}"
+            )
+            if cache_hit and cached_room and membership_hit:
+                # Both room and membership are cached — no DB call needed
+                if not is_member_cached:
+                    raise HTTPException(403, f"Not a member of room: {topic_id}")
+                if cached_room.get("ns") != ns:
+                    raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
+            else:
+                # Cache miss — fall back to DB
+                is_member = await _run_sync(db.is_room_member, topic_id, caller_id)
+                if not is_member:
+                    raise HTTPException(
+                        403,
+                        f"Not a member of room: {topic_id}",
+                    )
+                room = await _run_sync(db.get_room, topic_id)
+                if room is None or room.get("ns") != ns:
+                    raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
         else:
             raise HTTPException(
                 400,
@@ -1582,19 +1598,10 @@ async def get_room_messages(
         )
     )
 
-    # Batch-fetch attachment metadata for all messages (avoids N+1)
-    mids = [m["mid"] for m in messages]
-    attachments_by_mid = await _run_sync(
-        functools.partial(
-            db.get_batch_message_attachments,
-            mids,
-            include_data=False,
-        )
-    )
-
+    # Attachment metadata is already JOINed into each message dict by
+    # get_room_messages — no second round-trip needed.
     enriched = [
-        RoomMessageInfo.from_db(m, attachments_by_mid.get(m["mid"]) or None).model_dump()
-        for m in messages
+        RoomMessageInfo.from_db(m, m.get("attachments") or None).model_dump() for m in messages
     ]
 
     return {
@@ -1724,14 +1731,59 @@ async def update_read_cursor(
 
     The cursor tracks the last message the user has read.
     """
-    room, identity_id = await _require_room_member(room_id, x_inbox_secret)
+    # Fast-path: if caches are warm, auth is free and we only need one
+    # executor dispatch (for the write).  On cache miss we combine auth+write
+    # into a single _run_sync to avoid two sequential round-trips.
+    import functools
 
-    if room["ns"] != ns:
-        raise HTTPException(404, "Room not found in this namespace")
+    from .auth import verify_secret
+    from .cache import identity_hash_cache, membership_cache, room_cache
 
-    result = await _run_sync(
-        db.update_room_read_cursor, room_id, identity_id, request.last_read_mid
-    )
+    identity_id = derive_id(x_inbox_secret) if x_inbox_secret else None
+    if not identity_id:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    cache_hit, cached_room = room_cache.get(f"room:{room_id}")
+    membership_hit, is_member = membership_cache.get(f"member:{room_id}:{identity_id}")
+    if cache_hit and cached_room and membership_hit and is_member:
+        cached_ns = cached_room["ns"]
+        hash_hit, cached_hash = identity_hash_cache.get(f"identity:{cached_ns}:{identity_id}")
+        if hash_hit and cached_hash and verify_secret(x_inbox_secret, cached_hash):
+            # All caches hit — auth is free, just do the write
+            if cached_room["ns"] != ns:
+                raise HTTPException(404, "Room not found in this namespace")
+            result = await _run_sync(
+                functools.partial(
+                    db.update_room_read_cursor, room_id, identity_id, request.last_read_mid
+                )
+            )
+            if not result:
+                raise HTTPException(400, "Failed to update read cursor")
+            return {"ok": True, "last_read_mid": request.last_read_mid}
+
+    # Cache miss — combine auth + write in a single executor dispatch
+    def _auth_and_update():
+        room, error = db.verify_room_access(room_id, identity_id, x_inbox_secret)
+        if error or room is None:
+            return None, None, error or "Unknown error"
+        if room["ns"] != ns:
+            return None, None, "namespace_mismatch"
+        ok = db.update_room_read_cursor(room_id, identity_id, request.last_read_mid)
+        return room, ok, None
+
+    room, result, error = await _run_sync(_auth_and_update)
+
+    if error:
+        if error == "namespace_mismatch":
+            raise HTTPException(404, "Room not found in this namespace")
+        error_lower = error.lower()
+        if "not found" in error_lower:
+            raise HTTPException(404, error)
+        elif "not a member" in error_lower or "invalid" in error_lower:
+            raise HTTPException(403, error)
+        else:
+            raise HTTPException(400, error)
+
     if not result:
         raise HTTPException(400, "Failed to update read cursor")
 

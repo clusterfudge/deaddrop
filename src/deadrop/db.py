@@ -2325,7 +2325,7 @@ def get_room_messages(
     limit: int = 100,
     conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
-    """Get messages from a room.
+    """Get messages from a room with attachment metadata via LEFT JOIN.
 
     Supports both forward and backward pagination:
     - ``after_mid``: messages newer than this ID (forward / polling)
@@ -2338,6 +2338,10 @@ def get_room_messages(
     Results are always returned in chronological (ascending mid) order
     regardless of pagination direction.
 
+    Attachment metadata (id, filename, content_type, size, created_at) is
+    LEFT JOINed inline so no second round-trip is needed.  The ``attachments``
+    key on each message dict is a list of attachment dicts (may be empty).
+
     Args:
         room_id: Room ID
         after_mid: Only get messages after this message ID (forward pagination)
@@ -2346,23 +2350,22 @@ def get_room_messages(
         conn: Optional database connection
 
     Returns:
-        List of message dicts ordered by creation time (ascending)
+        List of message dicts ordered by creation time (ascending).
+        Each dict contains an ``attachments`` key (list, possibly empty).
     """
     conn = _get_conn(conn)
 
-    query = """
-        SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
-        FROM room_messages
-        WHERE room_id = ?
-    """
+    # Subquery wraps the pagination so we JOIN attachments only on the
+    # page of messages that will actually be returned.
+    subquery = "SELECT mid FROM room_messages WHERE room_id = ?"
     params: list[Any] = [room_id]
 
     if after_mid:
-        query += " AND mid > ?"
+        subquery += " AND mid > ?"
         params.append(after_mid)
 
     if before_mid:
-        query += " AND mid < ?"
+        subquery += " AND mid < ?"
         params.append(before_mid)
 
     # Determine sort direction:
@@ -2372,26 +2375,61 @@ def get_room_messages(
     use_desc = not after_mid or (before_mid and not after_mid)
 
     if use_desc:
-        query += " ORDER BY mid DESC LIMIT ?"
+        subquery += " ORDER BY mid DESC LIMIT ?"
     else:
-        query += " ORDER BY mid LIMIT ?"
+        subquery += " ORDER BY mid LIMIT ?"
     params.append(limit)
+
+    # Duplicate params for the outer query (subquery uses them once)
+    query = f"""
+        SELECT
+            rm.mid, rm.room_id, rm.from_id, rm.body, rm.content_type,
+            rm.reference_mid, rm.created_at,
+            a.id        AS att_id,
+            a.filename  AS att_filename,
+            a.content_type AS att_content_type,
+            a.size      AS att_size,
+            a.created_at AS att_created_at
+        FROM room_messages rm
+        LEFT JOIN attachments a ON a.message_mid = rm.mid
+        WHERE rm.mid IN ({subquery})
+        ORDER BY rm.mid {"DESC" if use_desc else "ASC"}, a.created_at
+    """
 
     cursor = conn.execute(query, tuple(params))
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
-    messages = [
-        {
-            "mid": row["mid"],
-            "room_id": row["room_id"],
-            "from": row["from_id"],
-            "body": row["body"],
-            "content_type": row.get("content_type") or "text/plain",
-            "reference_mid": row.get("reference_mid"),
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
+    # Collapse multi-row JOIN results into one message dict per mid
+    messages_by_mid: dict[str, dict] = {}
+    mid_order: list[str] = []
+
+    for row in rows:
+        mid = row["mid"]
+        if mid not in messages_by_mid:
+            mid_order.append(mid)
+            messages_by_mid[mid] = {
+                "mid": mid,
+                "room_id": row["room_id"],
+                "from": row["from_id"],
+                "body": row["body"],
+                "content_type": row.get("content_type") or "text/plain",
+                "reference_mid": row.get("reference_mid"),
+                "created_at": row["created_at"],
+                "attachments": [],
+            }
+        if row.get("att_id") is not None:
+            messages_by_mid[mid]["attachments"].append(
+                {
+                    "id": row["att_id"],
+                    "message_mid": mid,
+                    "filename": row["att_filename"],
+                    "content_type": row["att_content_type"],
+                    "size": row["att_size"],
+                    "created_at": row["att_created_at"],
+                }
+            )
+
+    messages = [messages_by_mid[mid] for mid in mid_order]
 
     # DESC rows need reversing so callers always get chronological order.
     if use_desc:
