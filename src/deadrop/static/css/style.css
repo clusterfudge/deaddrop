@@ -574,6 +574,11 @@ textarea.form-input {
     margin: 0.4em 0;
 }
 
+/* Single-paragraph messages in bubbles: strip all vertical margin */
+.room-message.from-me .message-body.markdown-body p:only-child {
+    margin: 0;
+}
+
 /* Inline code */
 .message-body.markdown-body code {
     background: rgba(0, 0, 0, 0.06);
@@ -793,7 +798,7 @@ textarea.form-input {
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    padding-bottom: 2px;
+
 }
 
 .room-message.from-me .sender-name {
