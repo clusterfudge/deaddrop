@@ -1,182 +1,188 @@
-"""Simple metrics and telemetry for deadrop.
+"""Lightweight statsd + in-memory metrics for deadrop.
 
-This module provides:
-- Request timing middleware
-- Database operation timing
-- Cache hit/miss tracking
-- Simple in-memory metrics that can be exposed via an endpoint
+Configurable via environment variables:
+    STATSD_HOST: StatsD host (default: None = no-op for statsd)
+    STATSD_PORT: StatsD port (default: 8125)
+    STATSD_PREFIX: Metric prefix (default: deadrop)
 
-Metrics are designed to be lightweight and not require external dependencies.
+When STATSD_HOST is not set, statsd calls are no-ops.
+In-memory metrics (for /admin/metrics endpoint) are always collected.
 """
 
-from __future__ import annotations
-
-import logging
+import os
+import socket
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from functools import wraps
-from threading import Lock
-from typing import Any, Callable, TypeVar
+from typing import Generator
 
-logger = logging.getLogger(__name__)
+# --- StatsD transport ---
 
-# Type variable for generic function decoration
-F = TypeVar("F", bound=Callable[..., Any])
-
-
-@dataclass
-class TimingStats:
-    """Statistics for a timed operation."""
-
-    count: int = 0
-    total_ms: float = 0.0
-    min_ms: float = float("inf")
-    max_ms: float = 0.0
-
-    def record(self, duration_ms: float) -> None:
-        """Record a timing measurement."""
-        self.count += 1
-        self.total_ms += duration_ms
-        self.min_ms = min(self.min_ms, duration_ms)
-        self.max_ms = max(self.max_ms, duration_ms)
-
-    @property
-    def avg_ms(self) -> float:
-        """Average duration in milliseconds."""
-        return self.total_ms / self.count if self.count > 0 else 0.0
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "count": self.count,
-            "total_ms": round(self.total_ms, 2),
-            "avg_ms": round(self.avg_ms, 2),
-            "min_ms": round(self.min_ms, 2) if self.count > 0 else 0,
-            "max_ms": round(self.max_ms, 2),
-        }
+_STATSD_HOST = os.environ.get("STATSD_HOST")
+_STATSD_PORT = int(os.environ.get("STATSD_PORT", "8125"))
+_PREFIX = os.environ.get("STATSD_PREFIX", "deadrop")
+_sock: socket.socket | None = None
 
 
-@dataclass
-class CacheStats:
-    """Statistics for cache operations."""
-
-    hits: int = 0
-    misses: int = 0
-
-    def record_hit(self) -> None:
-        self.hits += 1
-
-    def record_miss(self) -> None:
-        self.misses += 1
-
-    @property
-    def hit_rate(self) -> float:
-        """Cache hit rate as a percentage."""
-        total = self.hits + self.misses
-        return (self.hits / total * 100) if total > 0 else 0.0
-
-    def to_dict(self) -> dict:
-        return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "hit_rate_pct": round(self.hit_rate, 2),
-        }
+def _get_sock() -> socket.socket | None:
+    global _sock
+    if _STATSD_HOST is None:
+        return None
+    if _sock is None:
+        _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return _sock
 
 
-@dataclass
+def _statsd_send(metric: str, value: str, metric_type: str, sample_rate: float = 1.0) -> None:
+    sock = _get_sock()
+    if sock is None:
+        return
+    try:
+        key = f"{_PREFIX}.{metric}" if _PREFIX else metric
+        payload = f"{key}:{value}|{metric_type}"
+        if sample_rate < 1.0:
+            payload += f"|@{sample_rate}"
+        sock.sendto(payload.encode(), (_STATSD_HOST, _STATSD_PORT))
+    except Exception:
+        pass
+
+
+def statsd_incr(metric: str, count: int = 1) -> None:
+    _statsd_send(metric, str(count), "c")
+
+
+def statsd_gauge(metric: str, value: int | float) -> None:
+    _statsd_send(metric, str(value), "g")
+
+
+def statsd_timing(metric: str, ms: float) -> None:
+    _statsd_send(metric, f"{ms:.1f}", "ms")
+
+
+# --- In-memory metrics (always active) ---
+
+
 class Metrics:
-    """Global metrics collector."""
+    """Thread-safe in-memory metrics collector + statsd emitter."""
 
-    _lock: Lock = field(default_factory=Lock)
-    db_operations: dict[str, TimingStats] = field(default_factory=lambda: defaultdict(TimingStats))
-    cache_stats: dict[str, CacheStats] = field(default_factory=lambda: defaultdict(CacheStats))
-    request_stats: dict[str, TimingStats] = field(default_factory=lambda: defaultdict(TimingStats))
-    _start_time: float = field(default_factory=time.time)
+    def __init__(self) -> None:
+        self._request_counts: dict[str, int] = defaultdict(int)
+        self._request_durations: dict[str, list[float]] = defaultdict(list)
+        self._status_counts: dict[str, int] = defaultdict(int)
+        self._cache_hits: dict[str, int] = defaultdict(int)
+        self._cache_misses: dict[str, int] = defaultdict(int)
+        self._db_operation_counts: dict[str, int] = defaultdict(int)
+        self._db_operation_durations: dict[str, list[float]] = defaultdict(list)
+        self._counters: dict[str, int] = defaultdict(int)
+        self._start_time = time.time()
 
-    def record_db_operation(self, operation: str, duration_ms: float) -> None:
-        """Record a database operation timing."""
-        with self._lock:
-            self.db_operations[operation].record(duration_ms)
+    def record_request(self, endpoint: str, duration_ms: float, status: int = 200) -> None:
+        self._request_counts[endpoint] += 1
+        self._request_durations[endpoint].append(duration_ms)
+        # Keep only last 1000 durations per endpoint
+        if len(self._request_durations[endpoint]) > 1000:
+            self._request_durations[endpoint] = self._request_durations[endpoint][-500:]
+        self._status_counts[f"{status}"] += 1
+
+        # StatsD
+        statsd_timing(f"request.{endpoint}", duration_ms)
+        statsd_incr(f"request.{endpoint}.count")
+        statsd_incr(f"response.{status}")
 
     def record_cache_hit(self, cache_name: str) -> None:
-        """Record a cache hit."""
-        with self._lock:
-            self.cache_stats[cache_name].record_hit()
+        self._cache_hits[cache_name] += 1
+        statsd_incr(f"cache.{cache_name}.hit")
 
     def record_cache_miss(self, cache_name: str) -> None:
-        """Record a cache miss."""
-        with self._lock:
-            self.cache_stats[cache_name].record_miss()
+        self._cache_misses[cache_name] += 1
+        statsd_incr(f"cache.{cache_name}.miss")
 
-    def record_request(self, endpoint: str, duration_ms: float) -> None:
-        """Record a request timing."""
-        with self._lock:
-            self.request_stats[endpoint].record(duration_ms)
+    def record_db_operation(self, operation: str, duration_ms: float) -> None:
+        self._db_operation_counts[operation] += 1
+        self._db_operation_durations[operation].append(duration_ms)
+        if len(self._db_operation_durations[operation]) > 1000:
+            self._db_operation_durations[operation] = self._db_operation_durations[operation][-500:]
+        statsd_timing(f"db.{operation}", duration_ms)
+
+    def incr(self, key: str, count: int = 1) -> None:
+        self._counters[key] += count
+        statsd_incr(key, count)
+
+    def gauge(self, key: str, value: int | float) -> None:
+        statsd_gauge(key, value)
 
     def to_dict(self) -> dict:
-        """Export metrics as a dictionary."""
-        with self._lock:
+        """Export metrics for the /admin/metrics endpoint."""
+
+        def _summarize_durations(durations: list[float]) -> dict:
+            if not durations:
+                return {"count": 0}
+            sorted_d = sorted(durations)
+            n = len(sorted_d)
             return {
-                "uptime_seconds": round(time.time() - self._start_time, 1),
-                "db_operations": {k: v.to_dict() for k, v in self.db_operations.items()},
-                "cache": {k: v.to_dict() for k, v in self.cache_stats.items()},
-                "requests": {k: v.to_dict() for k, v in self.request_stats.items()},
+                "count": n,
+                "avg_ms": round(sum(sorted_d) / n, 1),
+                "p50_ms": round(sorted_d[n // 2], 1),
+                "p95_ms": round(sorted_d[int(n * 0.95)], 1) if n >= 20 else None,
+                "p99_ms": round(sorted_d[int(n * 0.99)], 1) if n >= 100 else None,
+                "max_ms": round(sorted_d[-1], 1),
             }
 
-    def reset(self) -> None:
-        """Reset all metrics (useful for testing)."""
-        with self._lock:
-            self.db_operations.clear()
-            self.cache_stats.clear()
-            self.request_stats.clear()
-            self._start_time = time.time()
+        result: dict = {
+            "uptime_seconds": round(time.time() - self._start_time),
+            "statsd_enabled": _STATSD_HOST is not None,
+        }
+
+        if self._request_counts:
+            result["requests"] = {
+                endpoint: {
+                    "count": self._request_counts[endpoint],
+                    **_summarize_durations(self._request_durations.get(endpoint, [])),
+                }
+                for endpoint in sorted(self._request_counts)
+            }
+
+        if self._status_counts:
+            result["status_codes"] = dict(sorted(self._status_counts.items()))
+
+        if self._cache_hits or self._cache_misses:
+            all_caches = set(self._cache_hits) | set(self._cache_misses)
+            result["cache"] = {}
+            for name in sorted(all_caches):
+                hits = self._cache_hits.get(name, 0)
+                misses = self._cache_misses.get(name, 0)
+                total = hits + misses
+                result["cache"][name] = {
+                    "hits": hits,
+                    "misses": misses,
+                    "hit_rate": round(hits / total, 3) if total > 0 else 0,
+                }
+
+        if self._db_operation_counts:
+            result["db_operations"] = {
+                op: {
+                    "count": self._db_operation_counts[op],
+                    **_summarize_durations(self._db_operation_durations.get(op, [])),
+                }
+                for op in sorted(self._db_operation_counts)
+            }
+
+        if self._counters:
+            result["counters"] = dict(sorted(self._counters.items()))
+
+        return result
 
 
-# Global metrics instance
+# Singleton
 metrics = Metrics()
 
 
 @contextmanager
-def timed_db_operation(operation: str):
-    """Context manager to time a database operation.
-
-    Usage:
-        with timed_db_operation("get_room"):
-            cursor = conn.execute(...)
-    """
+def timed_db_operation(operation: str) -> Generator[None, None, None]:
+    """Context manager to time a DB operation and record metrics."""
     start = time.perf_counter()
     try:
         yield
     finally:
-        duration_ms = (time.perf_counter() - start) * 1000
-        metrics.record_db_operation(operation, duration_ms)
-        if duration_ms > 100:  # Log slow queries
-            logger.warning(f"Slow DB operation: {operation} took {duration_ms:.1f}ms")
-
-
-def timed_operation(operation_name: str) -> Callable[[F], F]:
-    """Decorator to time a function and record as a DB operation.
-
-    Usage:
-        @timed_operation("get_room")
-        def get_room(room_id: str) -> dict | None:
-            ...
-    """
-
-    def decorator(func: F) -> F:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            start = time.perf_counter()
-            try:
-                return func(*args, **kwargs)
-            finally:
-                duration_ms = (time.perf_counter() - start) * 1000
-                metrics.record_db_operation(operation_name, duration_ms)
-                if duration_ms > 100:
-                    logger.warning(f"Slow operation: {operation_name} took {duration_ms:.1f}ms")
-
-        return wrapper  # type: ignore
-
-    return decorator
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        metrics.record_db_operation(operation, elapsed_ms)

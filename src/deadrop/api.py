@@ -113,7 +113,7 @@ async def add_timing_middleware(request: Request, call_next):
     else:
         endpoint = "other"
 
-    metrics.record_request(endpoint, duration_ms)
+    metrics.record_request(endpoint, duration_ms, status=response.status_code)
 
     # Add timing header for debugging
     response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
