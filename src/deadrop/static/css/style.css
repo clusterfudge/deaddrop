@@ -793,6 +793,7 @@ textarea.form-input {
     display: flex;
     flex-direction: column;
     align-items: flex-end;
+    padding-bottom: 2px;
 }
 
 .room-message.from-me .sender-name {
