@@ -325,13 +325,23 @@
         if (!msg.attachments || msg.attachments.length === 0) return '';
         const parts = msg.attachments.map(att => {
             if (att.content_type && att.content_type.startsWith('image/')) {
-                // Image: render inline thumbnail (click to load full via lightbox)
-                return `<img src="data:${escapeHtml(att.content_type)};base64,${att._data || ''}"
-                             alt="${escapeHtml(att.filename || 'image')}"
-                             data-attachment-id="${att.id}"
-                             onclick="loadAndShowAttachment(this, '${att.id}')"
-                             style="${att._data ? '' : 'min-height:40px;background:var(--surface,#eee);'}"
-                             loading="lazy">`;
+                if (att._data) {
+                    // Image with data already loaded — show inline
+                    return `<img src="data:${escapeHtml(att.content_type)};base64,${att._data}"
+                                 alt="${escapeHtml(att.filename || 'image')}"
+                                 data-attachment-id="${att.id}"
+                                 data-loaded="true"
+                                 onclick="loadAndShowAttachment(this, '${att.id}')"
+                                 loading="lazy">`;
+                } else {
+                    // Image without data — show clickable placeholder that auto-loads
+                    return `<div class="image-placeholder" 
+                                 data-attachment-id="${att.id}"
+                                 onclick="loadImageInline(this, '${att.id}')"
+                                 style="min-width:80px;min-height:60px;max-width:min(300px,100%);background:var(--surface,#eee);border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:8px;gap:6px;font-size:13px;color:var(--text-secondary,#666);border:1px solid var(--border,#ddd);">
+                                 🖼️ ${escapeHtml(att.filename || 'image')} (${formatFileSize(att.size)})
+                            </div>`;
+                }
             } else {
                 return `<div class="file-attachment">📄 ${escapeHtml(att.filename || 'file')} (${formatFileSize(att.size)})</div>`;
             }
@@ -344,6 +354,27 @@
         if (bytes < 1024) return bytes + 'B';
         if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
         return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+    }
+
+    async function loadImageInline(placeholderEl, attachmentId) {
+        // Replace placeholder with actual image
+        placeholderEl.innerHTML = '⏳ Loading...';
+        placeholderEl.style.opacity = '0.6';
+        try {
+            const att = await DeadropAPI.getAttachment(credentials, attachmentId);
+            const img = document.createElement('img');
+            img.src = `data:${att.content_type};base64,${att.data}`;
+            img.alt = att.filename || 'image';
+            img.dataset.attachmentId = attachmentId;
+            img.dataset.loaded = 'true';
+            img.onclick = () => openLightbox(img);
+            img.style.cursor = 'pointer';
+            placeholderEl.replaceWith(img);
+        } catch (e) {
+            placeholderEl.innerHTML = '❌ Failed to load';
+            placeholderEl.style.opacity = '1';
+            console.error('Failed to load image:', e);
+        }
     }
 
     async function loadAndShowAttachment(imgEl, attachmentId) {
@@ -917,6 +948,12 @@
         
         // Apply syntax highlighting to code blocks
         highlightCodeBlocks(list);
+        
+        // Auto-load image placeholders
+        list.querySelectorAll('.image-placeholder').forEach(el => {
+            const attId = el.dataset.attachmentId;
+            if (attId) loadImageInline(el, attId);
+        });
         
         // Only update read cursor if the newest message is actually visible
         // (i.e. the user hasn't scrolled up away from the bottom).
