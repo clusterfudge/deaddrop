@@ -1623,7 +1623,6 @@ async def send_room_message(
     the same room within a short window (network retry), the original
     message is returned with a ``Dedup-Status: deduplicated`` header.
     """
-    import functools
 
     from fastapi.responses import JSONResponse
 
@@ -1672,37 +1671,33 @@ async def send_room_message(
                 )
             validated_attachments.append((att, raw_size))
 
-    try:
-        message = await _run_sync(
-            functools.partial(
-                db.send_room_message,
-                room_id=room_id,
-                from_id=from_id,
-                body=request.body,
-                content_type=request.content_type,
-                reference_mid=request.reference_mid,
-            )
+    # Batch send + attachment storage into a single executor call
+    def _send_with_attachments():
+        msg = db.send_room_message(
+            room_id=room_id,
+            from_id=from_id,
+            body=request.body,
+            content_type=request.content_type,
+            reference_mid=request.reference_mid,
         )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    deduplicated = message.pop("deduplicated", False)
-
-    # Store attachments for genuinely new messages (reuse validated sizes)
-    attachment_records = []
-    if not deduplicated and validated_attachments:
-        for att, raw_size in validated_attachments:
-            record = await _run_sync(
-                functools.partial(
-                    db.add_attachment,
-                    message_mid=message["mid"],
+        deduped = msg.pop("deduplicated", False)
+        att_records = []
+        if not deduped and validated_attachments:
+            for att, raw_size in validated_attachments:
+                record = db.add_attachment(
+                    message_mid=msg["mid"],
                     content_type=att.content_type,
                     data=att.data,
                     size=raw_size,
                     filename=att.filename,
                 )
-            )
-            attachment_records.append(record)
+                att_records.append(record)
+        return msg, deduped, att_records
+
+    try:
+        message, deduplicated, attachment_records = await _run_sync(_send_with_attachments)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     # Only publish events for genuinely new messages
     if not deduplicated:
