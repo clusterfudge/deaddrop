@@ -44,6 +44,16 @@ async def lifespan(app: FastAPI):
 
     db.init_db()
 
+    # Enforce namespace TTLs on startup (archive expired namespaces)
+    from . import jobs
+
+    try:
+        count = jobs.enforce_namespace_ttl()
+        if count > 0:
+            logger.info(f"Archived {count} expired namespace(s) on startup")
+    except Exception:
+        logger.warning("Failed to enforce namespace TTLs on startup", exc_info=True)
+
     # Schedule cache warming as background task (non-blocking)
     from .cache import schedule_cache_warming, stop_cache_warming
 

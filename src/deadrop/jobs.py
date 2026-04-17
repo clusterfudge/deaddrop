@@ -20,6 +20,18 @@ from pathlib import Path
 from . import db
 
 
+def enforce_namespace_ttl(dry_run: bool = False) -> int:
+    """Archive namespaces that are past their TTL.
+
+    Returns number of namespaces archived.
+    """
+    if dry_run:
+        expired = db.get_expired_namespaces()
+        return len(expired)
+
+    return db.archive_expired_namespaces()
+
+
 def process_ttl(
     archive_path: str | None = None,
     delete: bool = True,

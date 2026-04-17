@@ -1813,6 +1813,45 @@ def cleanup_expired_invites(conn: sqlite3.Connection | None = None) -> int:
 # --- TTL and Archive Operations ---
 
 
+def get_expired_namespaces(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Get namespaces past their TTL that haven't been archived yet.
+
+    Returns namespaces where:
+    - ttl_hours > 0 (0 means persistent/no expiry)
+    - archived_at IS NULL (not already archived)
+    - created_at + ttl_hours < now (past expiry)
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT ns, slug, ttl_hours, created_at,
+                  ROUND((julianday('now') - julianday(created_at)) * 24, 1) as age_hours
+           FROM namespaces
+           WHERE archived_at IS NULL
+             AND ttl_hours > 0
+             AND datetime(created_at, '+' || ttl_hours || ' hours') < datetime('now')
+           ORDER BY created_at""",
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+def archive_expired_namespaces(conn: sqlite3.Connection | None = None) -> int:
+    """Archive all namespaces that are past their TTL.
+
+    Returns number of namespaces archived.
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """UPDATE namespaces SET archived_at = ?
+           WHERE archived_at IS NULL
+             AND ttl_hours > 0
+             AND datetime(created_at, '+' || ttl_hours || ' hours') < datetime('now')""",
+        (now,),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 def get_expired_messages(
     limit: int = 1000,
     conn: sqlite3.Connection | None = None,
