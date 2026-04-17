@@ -815,6 +815,11 @@ textarea.form-input {
     white-space: pre-wrap;
 }
 
+/* Markdown content inside bubbles: don't preserve trailing whitespace from marked output */
+.room-message.from-me .message-body.markdown-body {
+    white-space: normal;
+}
+
 .room-message.from-me .message-time {
     color: var(--text-muted);
 }
