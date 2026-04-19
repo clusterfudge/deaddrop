@@ -70,7 +70,7 @@ async def run_test():
         try:
             httpx.get("http://127.0.0.1:18926/", timeout=1)
             break
-        except:
+        except Exception:
             time.sleep(0.25)
 
     base_url = "http://127.0.0.1:18926"

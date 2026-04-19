@@ -1747,7 +1747,9 @@ async def update_read_cursor(
     from .auth import verify_secret
     from .cache import identity_hash_cache, membership_cache, room_cache
 
-    identity_id = derive_id(x_inbox_secret) if x_inbox_secret else None
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+    identity_id = derive_id(x_inbox_secret)
     if not identity_id:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
