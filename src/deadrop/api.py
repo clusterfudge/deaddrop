@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -2113,6 +2113,43 @@ def app_settings_page(request: Request, slug: str):
             },
         )
     return HTMLResponse(f"<h1>Settings</h1><p>Namespace: {slug}</p>")
+
+
+# --- PWA assets (served at root for correct scope) ---
+
+
+@app.get("/manifest.webmanifest")
+def pwa_manifest():
+    """Serve the PWA manifest at root (required for install banners).
+
+    The manifest itself lives under static/ for easy editing; this route
+    proxies it to the root URL so iOS Safari and Android Chrome find it.
+    """
+    manifest_path = STATIC_DIR / "manifest.webmanifest"
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail="manifest not found")
+    return FileResponse(
+        manifest_path,
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/sw.js")
+def pwa_service_worker():
+    """Serve the service worker at root (required for root-scope control)."""
+    sw_path = STATIC_DIR / "sw.js"
+    if not sw_path.exists():
+        raise HTTPException(status_code=404, detail="service worker not found")
+    return FileResponse(
+        sw_path,
+        media_type="application/javascript",
+        headers={
+            # Service workers should always revalidate so updates propagate fast.
+            "Cache-Control": "no-cache",
+            "Service-Worker-Allowed": "/",
+        },
+    )
 
 
 # --- Health Check ---
