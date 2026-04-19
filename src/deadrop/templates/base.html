@@ -2,8 +2,18 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>{% block title %}Deadrop{% endblock %}</title>
+
+    <!-- PWA metadata -->
+    <link rel="manifest" href="/manifest.webmanifest">
+    <meta name="theme-color" content="#1a73e8">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Deadrop">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
+
     <link rel="stylesheet" href="/static/css/style.css">
     <!-- Markdown rendering: highlight.js theme -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github.min.css" />
@@ -11,7 +21,7 @@
 </head>
 <body>
     {% block body %}{% endblock %}
-    
+
     <!-- Markdown rendering libraries -->
     <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/highlight.min.js"></script>
@@ -21,5 +31,50 @@
     <script src="/static/js/credentials.js"></script>
     <script src="/static/js/api.js"></script>
     {% block scripts %}{% endblock %}
+
+    <!-- Service worker registration (PWA) -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js', { scope: '/' }).then((reg) => {
+                    // Listen for a new SW waiting to activate → show update banner.
+                    reg.addEventListener('updatefound', () => {
+                        const newWorker = reg.installing;
+                        newWorker.addEventListener('statechange', () => {
+                            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                                _showUpdateBanner();
+                            }
+                        });
+                    });
+                }).catch((err) => {
+                    console.warn('[pwa] service worker registration failed:', err);
+                });
+
+                // Detect controller change (new SW claimed page) → reload to apply.
+                let refreshing = false;
+                navigator.serviceWorker.addEventListener('controllerchange', () => {
+                    if (!refreshing) { refreshing = true; window.location.reload(); }
+                });
+            });
+        }
+
+        function _showUpdateBanner() {
+            if (document.getElementById('pwa-update-banner')) return;
+            const banner = document.createElement('div');
+            banner.id = 'pwa-update-banner';
+            banner.style.cssText = [
+                'position:fixed', 'bottom:1rem', 'left:50%', 'transform:translateX(-50%)',
+                'background:#1a73e8', 'color:#fff', 'padding:0.6rem 1.2rem',
+                'border-radius:8px', 'font-size:0.9rem', 'z-index:9999',
+                'display:flex', 'gap:0.75rem', 'align-items:center',
+                'box-shadow:0 4px 12px rgba(0,0,0,0.3)', 'cursor:pointer'
+            ].join(';');
+            banner.innerHTML = '🔄 Update available \u2014 <strong>tap to reload</strong>';
+            banner.addEventListener('click', () => {
+                navigator.serviceWorker.controller?.postMessage('skipWaiting');
+            });
+            document.body.appendChild(banner);
+        }
+    </script>
 </body>
 </html>
