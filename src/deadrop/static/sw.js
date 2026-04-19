@@ -3,11 +3,13 @@
 // Strategy:
 //   - Cache the app shell (HTML templates + static JS/CSS) on install.
 //   - Network-first for same-origin GET requests; fall back to cache.
-//   - Skip API requests (anything under /{ns}/send, /inbox, /admin) — those
-//     must always hit the network (fresh state + auth).
+//   - Skip all API/dynamic routes — those must always hit the network
+//     (fresh state + auth). See NO_CACHE_PATTERNS below.
 //   - Don't cache POST/PUT/DELETE or cross-origin requests.
+//
+// Cache version: bump CACHE_NAME when shell assets change to force update.
 
-const CACHE_NAME = 'deadrop-shell-v1';
+const CACHE_NAME = 'deadrop-shell-v2';
 const APP_SHELL = [
   '/app',
   '/static/css/style.css',
@@ -45,14 +47,30 @@ self.addEventListener('activate', (event) => {
 });
 
 // Paths that should always bypass cache (API + dynamic data).
+//
+// Deaddrop API route map (GET endpoints that must be fresh):
+//   /admin/**                      — admin API
+//   /api/invites/**                — invite lookup (dynamic)
+//   /{ns}/inbox/**                 — message inbox (dynamic)
+//   /{ns}/identities/**            — identity directory (dynamic)
+//   /{ns}/invites/**               — invite list (dynamic)
+//   /{ns}/rooms/**                 — room list + messages + unread (dynamic)
+//   /{ns}/attachments/**           — binary attachment data (dynamic)
+//   /health, /metrics              — ops endpoints
+//
+// HTML shell routes (/app/**, /, /join/**) are intentionally cacheable
+// because they're the server-rendered shell, not live data.
 const NO_CACHE_PATTERNS = [
   /^\/admin(\/|$)/,
+  /^\/api\//,
   /^\/[^/]+\/send$/,
-  /^\/[^/]+\/inbox/,
-  /^\/[^/]+\/identities/,
-  /^\/[^/]+\/archive$/,
-  /^\/events/,
+  /^\/[^/]+\/inbox(\/|$)/,
+  /^\/[^/]+\/identities(\/|$)/,
+  /^\/[^/]+\/invites(\/|$)/,
+  /^\/[^/]+\/rooms(\/|$)/,
+  /^\/[^/]+\/attachments(\/|$)/,
   /^\/health$/,
+  /^\/metrics$/,
 ];
 
 function shouldBypass(path) {
@@ -88,4 +106,12 @@ self.addEventListener('fetch', (event) => {
         }),
       ),
   );
+});
+
+// Notify open clients when a new SW version is waiting to activate.
+// The UI can listen for this and show a "Reload to update" banner.
+self.addEventListener('message', (event) => {
+  if (event.data === 'skipWaiting') {
+    self.skipWaiting();
+  }
 });

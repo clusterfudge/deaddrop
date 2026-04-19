@@ -1,4 +1,5 @@
 {
+  "id": "/app",
   "name": "Deadrop",
   "short_name": "Deadrop",
   "description": "End-to-end encrypted messaging for humans and their agents.",
@@ -37,9 +38,11 @@
   ],
   "shortcuts": [
     {
-      "name": "Open App",
-      "short_name": "App",
-      "url": "/app"
+      "name": "Fritz twin inbox",
+      "short_name": "fritz",
+      "description": "Open the fritz twin namespace",
+      "url": "/app/fritz",
+      "icons": [{ "src": "/static/icons/icon-192.png", "sizes": "192x192" }]
     }
   ]
 }
