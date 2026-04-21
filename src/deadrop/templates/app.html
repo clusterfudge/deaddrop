@@ -48,7 +48,8 @@
                 <h1 id="inbox-title">Namespace</h1>
                 <div class="subtitle" id="inbox-subtitle">as Identity</div>
             </div>
-            <div style="margin-left: auto;">
+            <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
+                <button class="theme-toggle" id="theme-toggle-btn-inbox" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
                 <a href="#" id="inbox-settings" class="btn btn-icon">⚙️</a>
             </div>
         </div>
@@ -79,6 +80,9 @@
         <div class="header">
             <a href="#" class="back-link" id="conversation-back">←</a>
             <h1 id="conversation-title">Peer</h1>
+            <div style="margin-left: auto;">
+                <button class="theme-toggle" id="theme-toggle-btn-conversation" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
+            </div>
         </div>
         
         <div id="message-list" class="message-list"></div>
@@ -98,7 +102,8 @@
                 <h1 id="room-chat-title">Room</h1>
                 <div class="subtitle" id="room-chat-members"></div>
             </div>
-            <div style="margin-left: auto;">
+            <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
+                <button class="theme-toggle" id="theme-toggle-btn-room-chat" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
                 <button id="room-refresh-btn" class="btn btn-icon" title="Refresh messages">🔄</button>
             </div>
         </div>
@@ -145,6 +150,9 @@
         <div class="header">
             <a href="#" class="back-link" id="archived-back">←</a>
             <h1>Archived Messages</h1>
+            <div style="margin-left: auto;">
+                <button class="theme-toggle" id="theme-toggle-btn-archived" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
+            </div>
         </div>
         
         <div class="container">
@@ -198,8 +206,8 @@
         var hljsLink = document.getElementById('hljs-theme-link');
         if (hljsLink) hljsLink.href = effective === 'dark' ? HLJS_DARK : HLJS_LIGHT;
         // Update toggle button icon
-        var btn = document.getElementById('theme-toggle-btn');
-        if (btn) btn.textContent = effective === 'dark' ? '☀️' : '🌙';
+        var icon = effective === 'dark' ? '☀️' : '🌙';
+        document.querySelectorAll('.theme-toggle').forEach(function(btn) { btn.textContent = icon; });
     }
 
     function cycleTheme() {
