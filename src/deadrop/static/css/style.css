@@ -1,18 +1,56 @@
 /* Deadrop Web App Styles */
 
 :root {
-    --primary-color: #2563eb;
-    --primary-hover: #1d4ed8;
-    --danger-color: #dc2626;
-    --warning-color: #f59e0b;
-    --success-color: #10b981;
+    /* Core palette — light mode */
     --bg-color: #f9fafb;
     --card-bg: #ffffff;
     --text-color: #1f2937;
     --text-muted: #6b7280;
     --border-color: #e5e7eb;
+    --hover-bg: #f3f4f6;
+    --surface: #f5f5f5;
+    --border: #e0e0e0;
+    --input-bg: #ffffff;
+    --code-bg: rgba(0, 0, 0, 0.06);
+    --table-header-bg: rgba(0, 0, 0, 0.04);
+    --unread-bg: rgba(37, 99, 235, 0.05);
+
+    /* Accent / interactive */
+    --primary-color: #2563eb;
+    --primary-hover: #1d4ed8;
+    --danger-color: #dc2626;
+    --warning-color: #f59e0b;
+    --success-color: #10b981;
+
+    /* Misc */
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
     --radius: 8px;
+    --focus-ring: rgba(37, 99, 235, 0.15);
+}
+
+/* ---- Dark mode palette ---- */
+[data-theme="dark"] {
+    --bg-color: #0f1621;
+    --card-bg: #161e2d;
+    --text-color: #d4dae4;
+    --text-muted: #8892a4;
+    --border-color: #2a3448;
+    --hover-bg: #1e2a3a;
+    --surface: #1a2332;
+    --border: #2a3448;
+    --input-bg: #1a2332;
+    --code-bg: rgba(255, 255, 255, 0.07);
+    --table-header-bg: rgba(255, 255, 255, 0.05);
+    --unread-bg: rgba(77, 142, 240, 0.08);
+
+    --primary-color: #4d8ef0;
+    --primary-hover: #3b7ee0;
+    --danger-color: #f87171;
+    --warning-color: #fbbf24;
+    --success-color: #34d399;
+
+    --shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+    --focus-ring: rgba(77, 142, 240, 0.2);
 }
 
 * {
@@ -127,7 +165,7 @@ body {
 }
 
 .btn-secondary:hover {
-    background: #d1d5db;
+    background: var(--hover-bg);
 }
 
 .btn-danger {
@@ -136,7 +174,7 @@ body {
 }
 
 .btn-danger:hover {
-    background: #b91c1c;
+    background: #b91c1c;  /* intentional — keeps contrast on dark bg */
 }
 
 .btn-small {
@@ -172,12 +210,14 @@ body {
     border: 1px solid var(--border-color);
     border-radius: var(--radius);
     font-size: 1rem;
+    background: var(--input-bg);
+    color: var(--text-color);
 }
 
 .form-input:focus {
     outline: none;
     border-color: var(--primary-color);
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+    box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
 textarea.form-input {
@@ -277,7 +317,7 @@ textarea.form-input {
 }
 
 .thread-item.unread {
-    background: rgba(37, 99, 235, 0.05);
+    background: var(--unread-bg);
 }
 
 .thread-avatar {
@@ -382,6 +422,8 @@ textarea.form-input {
     font-size: 1rem;
     resize: none;
     max-height: 120px;
+    background: var(--input-bg);
+    color: var(--text-color);
 }
 
 .compose-input:focus {
@@ -581,7 +623,7 @@ textarea.form-input {
 
 /* Inline code */
 .message-body.markdown-body code {
-    background: rgba(0, 0, 0, 0.06);
+    background: var(--code-bg);
     padding: 2px 6px;
     border-radius: 4px;
     font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
@@ -656,7 +698,7 @@ textarea.form-input {
 }
 
 .message-body.markdown-body th {
-    background: rgba(0, 0, 0, 0.04);
+    background: var(--table-header-bg);
     font-weight: 600;
 }
 
@@ -728,7 +770,7 @@ textarea.form-input {
 }
 
 .reaction-badge.mine {
-    background: rgba(37, 99, 235, 0.1);
+    background: var(--unread-bg);
     border-color: var(--primary-color);
 }
 
@@ -766,7 +808,7 @@ textarea.form-input {
     display: flex;
     gap: 2px;
     padding: 6px 8px;
-    background: white;
+    background: var(--card-bg);
     border-radius: 24px;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
     border: 1px solid var(--border-color);
@@ -844,7 +886,7 @@ textarea.form-input {
 }
 
 .room-message.pending .message-body {
-    background: var(--bg-color);
+    background: var(--surface);
     border: 1px dashed var(--border-color);
 }
 
@@ -963,4 +1005,36 @@ button:disabled {
     border-radius: 6px;
     font-size: 13px;
     margin: 4px 0;
+}
+
+/* ==================== DARK MODE EXTRAS ==================== */
+
+/* highlight.js theme swapping is handled via JS (see base.html) */
+
+/* Theme toggle button */
+.theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 8px;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 1rem;
+    color: var(--text-muted);
+    transition: background-color 0.15s, color 0.15s, border-color 0.15s;
+    margin-left: 8px;
+    line-height: 1;
+}
+
+.theme-toggle:hover {
+    background: var(--hover-bg);
+    color: var(--text-color);
+    border-color: var(--primary-color);
+}
+
+.theme-toggle:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus-ring);
 }

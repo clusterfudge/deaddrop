@@ -14,9 +14,21 @@
     <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
 
+    <!-- FOUC prevention: apply theme before first paint -->
+    <script>
+        (function() {
+            var stored = localStorage.getItem('deaddrop:theme') || 'auto';
+            var theme = stored;
+            if (stored === 'auto') {
+                theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            }
+            document.documentElement.setAttribute('data-theme', theme);
+        })();
+    </script>
     <link rel="stylesheet" href="/static/css/style.css">
-    <!-- Markdown rendering: highlight.js theme -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github.min.css" />
+    <!-- Markdown rendering: highlight.js theme (light default, dark via media swap) -->
+    <link rel="stylesheet" id="hljs-theme-link"
+          href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github.min.css" />
     {% block head %}{% endblock %}
 </head>
 <body>

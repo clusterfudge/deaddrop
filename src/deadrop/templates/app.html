@@ -8,6 +8,9 @@
     <div id="view-namespaces" class="view">
         <div class="header">
             <h1>📬 Deadrop</h1>
+            <div style="margin-left: auto;">
+                <button class="theme-toggle" id="theme-toggle-btn" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
+            </div>
         </div>
         
         <div class="container">
@@ -15,9 +18,9 @@
             
             <div id="namespace-list"></div>
             
-            <div id="deep-link-banner" class="card hidden" style="margin-bottom: 16px; background: #fff3cd; border-left: 4px solid #ffc107;">
+            <div id="deep-link-banner" class="card hidden" style="margin-bottom: 16px; background: rgba(245, 158, 11, 0.1); border-left: 4px solid var(--warning-color);">
                 <p style="margin: 0;"><strong>🔗 You followed a link to <span id="deep-link-target"></span></strong></p>
-                <p style="margin: 4px 0 0 0; color: #666;">Claim an invite to this namespace to continue, or select it below if you already have access.</p>
+                <p style="margin: 4px 0 0 0; color: var(--text-muted);">Claim an invite to this namespace to continue, or select it below if you already have access.</p>
             </div>
 
             <div id="no-namespaces" class="empty-state hidden">
@@ -178,6 +181,51 @@
 
 {% block scripts %}
 <script>
+    // ==================== THEME MANAGEMENT ====================
+
+    const THEME_KEY = 'deaddrop:theme';
+
+    var HLJS_LIGHT = 'https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github.min.css';
+    var HLJS_DARK  = 'https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github-dark.min.css';
+
+    function applyTheme(theme) {
+        var effective = theme;
+        if (theme === 'auto') {
+            effective = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-theme', effective);
+        // Swap highlight.js stylesheet
+        var hljsLink = document.getElementById('hljs-theme-link');
+        if (hljsLink) hljsLink.href = effective === 'dark' ? HLJS_DARK : HLJS_LIGHT;
+        // Update toggle button icon
+        var btn = document.getElementById('theme-toggle-btn');
+        if (btn) btn.textContent = effective === 'dark' ? '☀️' : '🌙';
+    }
+
+    function cycleTheme() {
+        var current = localStorage.getItem(THEME_KEY) || 'auto';
+        // Cycle: auto → dark → light → auto
+        var next = current === 'auto' ? 'dark' : current === 'dark' ? 'light' : 'auto';
+        localStorage.setItem(THEME_KEY, next);
+        applyTheme(next);
+    }
+
+    // Init theme on load (FOUC script in <head> already set data-theme,
+    // but we still need to set the button icon once DOM is ready)
+    document.addEventListener('DOMContentLoaded', function() {
+        var stored = localStorage.getItem(THEME_KEY) || 'auto';
+        applyTheme(stored);
+    });
+
+    // Sync with OS-level changes when preference is 'auto'
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function() {
+        if ((localStorage.getItem(THEME_KEY) || 'auto') === 'auto') {
+            applyTheme('auto');
+        }
+    });
+
+    // ==================== END THEME MANAGEMENT ====================
+
     // App state
     let currentSlug = {{ slug | tojson if slug else 'null' }};
     let currentPeerId = {{ peer_id | tojson if peer_id is defined and peer_id else 'null' }};
