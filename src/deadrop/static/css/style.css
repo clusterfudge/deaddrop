@@ -183,13 +183,29 @@ body {
 }
 
 .btn-icon {
-    padding: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 8px;
     background: transparent;
     border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 1rem;
+    color: var(--text-muted);
+    transition: background-color 0.15s, color 0.15s, border-color 0.15s;
+    line-height: 1;
 }
 
 .btn-icon:hover {
-    background: var(--border-color);
+    background: var(--hover-bg);
+    color: var(--text-color);
+    border-color: var(--primary-color);
+}
+
+.btn-icon:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
 /* Forms */
@@ -781,20 +797,22 @@ textarea.form-input {
 
 .reaction-badge.add-reaction {
     font-size: 12px;
-    color: var(--text-muted);
+    color: var(--text-color);   /* was text-muted — needs to read clearly */
+    border-color: var(--border-color); /* explicit — inherits from .reaction-badge but being clear */
     padding: 2px 6px;
-    opacity: 0.4;
-    transition: opacity 0.15s ease;
+    opacity: 0.65;              /* was 0.4 — too faint in dark mode */
+    transition: opacity 0.15s ease, border-color 0.15s ease;
 }
 
 .room-message:hover .reaction-badge.add-reaction {
     opacity: 1;
+    border-color: var(--primary-color); /* invite interaction on hover */
 }
 
 /* Touch devices: always show the add-reaction button since there's no hover */
 @media (hover: none) {
     .reaction-badge.add-reaction {
-        opacity: 0.6;
+        opacity: 0.85;  /* was 0.6 — primary interaction surface on mobile */
     }
 }
 
