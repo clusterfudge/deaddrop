@@ -33,15 +33,15 @@
     --bg-color: #0f1621;
     --card-bg: #161e2d;
     --text-color: #d4dae4;
-    --text-muted: #8892a4;
-    --border-color: #2a3448;
-    --hover-bg: #1e2a3a;
+    --text-muted: #9aa3b4;      /* was #8892a4 — bumped for readability */
+    --border-color: #506c90;    /* was #2a3448 — 3.09:1 on card, 3.36:1 on bg (WCAG UI) */
+    --hover-bg: #1c2d42;        /* was #1e2a3a — slightly warmer blue for hover */
     --surface: #1a2332;
-    --border: #2a3448;
+    --border: #506c90;          /* was #2a3448 — matches border-color */
     --input-bg: #1a2332;
     --code-bg: rgba(255, 255, 255, 0.07);
     --table-header-bg: rgba(255, 255, 255, 0.05);
-    --unread-bg: rgba(77, 142, 240, 0.08);
+    --unread-bg: rgba(77, 142, 240, 0.10); /* was 0.08 — slightly more visible */
 
     --primary-color: #4d8ef0;
     --primary-hover: #3b7ee0;
