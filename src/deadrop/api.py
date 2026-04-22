@@ -64,60 +64,52 @@ async def lifespan(app: FastAPI):
 
     # Post a Grafana deploy annotation so we can correlate latency changes
     # with deploys on the dashboard.  Fire-and-forget — never block startup.
+    # GRAFANA_API_KEY and GRAFANA_BASE_URL must be set as environment variables
+    # (e.g. on the dokku deployment).  Never read from disk — skip silently if unset.
     try:
         import os
         import subprocess
 
-        grafana_env_path = os.path.expanduser("~/.config/grafana/fritz.env")
-        if os.path.exists(grafana_env_path):
-            grafana_cfg: dict[str, str] = {}
-            with open(grafana_env_path) as _f:
-                for _line in _f:
-                    _line = _line.strip()
-                    if "=" in _line and not _line.startswith("#"):
-                        _k, _, _v = _line.partition("=")
-                        grafana_cfg[_k.strip()] = _v.strip()
+        grafana_base = os.environ.get("GRAFANA_BASE_URL", "")
+        grafana_key = os.environ.get("GRAFANA_API_KEY", "")
 
-            grafana_base = grafana_cfg.get("GRAFANA_BASE", "")
-            grafana_key = grafana_cfg.get("GRAFANA_KEY", "")
-
-            if grafana_base and grafana_key:
-                # Get current git SHA (best-effort — may not be available in all envs)
-                try:
-                    git_sha = (
-                        subprocess.check_output(
-                            ["git", "rev-parse", "--short", "HEAD"],
-                            stderr=subprocess.DEVNULL,
-                            timeout=2,
-                        )
-                        .decode()
-                        .strip()
+        if grafana_base and grafana_key:
+            # Get current git SHA (best-effort — may not be available in all envs)
+            try:
+                git_sha = (
+                    subprocess.check_output(
+                        ["git", "rev-parse", "--short", "HEAD"],
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
                     )
-                except Exception:
-                    git_sha = "unknown"
-
-                import json as _json
-                import urllib.request
-
-                annotation_payload = _json.dumps(
-                    {
-                        "text": f"Deploy: {git_sha}",
-                        "tags": ["deploy", "deaddrop"],
-                    }
-                ).encode()
-
-                req = urllib.request.Request(
-                    f"{grafana_base}/api/annotations",
-                    data=annotation_payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {grafana_key}",
-                    },
-                    method="POST",
+                    .decode()
+                    .strip()
                 )
-                with urllib.request.urlopen(req, timeout=3) as _resp:
-                    _resp.read()
-                logger.info(f"Grafana deploy annotation posted (sha={git_sha})")
+            except Exception:
+                git_sha = "unknown"
+
+            import json as _json
+            import urllib.request
+
+            annotation_payload = _json.dumps(
+                {
+                    "text": f"Deploy: {git_sha}",
+                    "tags": ["deploy", "deaddrop"],
+                }
+            ).encode()
+
+            req = urllib.request.Request(
+                f"{grafana_base}/api/annotations",
+                data=annotation_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {grafana_key}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3) as _resp:
+                _resp.read()
+            logger.info(f"Grafana deploy annotation posted (sha={git_sha})")
     except Exception:
         logger.warning("Failed to post Grafana deploy annotation", exc_info=True)
 
