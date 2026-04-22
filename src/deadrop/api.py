@@ -135,18 +135,35 @@ app = FastAPI(
 
 @app.middleware("http")
 async def add_timing_middleware(request: Request, call_next):
-    """Middleware to track request timing and log every request via structlog."""
+    """Middleware to track request timing and log every request via structlog.
+
+    Slow-request diagnostics (> SLOW_REQUEST_THRESHOLD_MS):
+    Emits a single WARNING log with all buffered DB query timings so you can
+    see at a glance which queries contributed to the latency.
+    """
     import time
+    from uuid import uuid4
 
     import structlog
 
-    from .metrics import metrics
+    from .metrics import _request_query_buffer, metrics
+
+    # --- Request START ---
+    request_id = uuid4().hex[:12]
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+
+    # Install a fresh query buffer for this request
+    query_buffer: list[dict] = []
+    buffer_token = _request_query_buffer.set(query_buffer)
 
     start_time = time.perf_counter()
 
     response = await call_next(request)
 
     duration_ms = (time.perf_counter() - start_time) * 1000
+
+    # --- Request END: slow-request flush ---
+    slow_threshold_ms = float(os.environ.get("SLOW_REQUEST_THRESHOLD_MS", "500"))
 
     # Extract endpoint pattern for metrics aggregation.
     # We include the HTTP method for key endpoints so GET vs POST are
@@ -194,6 +211,26 @@ async def add_timing_middleware(request: Request, call_next):
             client=request.client.host if request.client else None,
             endpoint=endpoint,
         )
+
+        # Emit slow-request diagnostic if over threshold
+        if duration_ms > slow_threshold_ms:
+            db_total = sum(q["ms"] for q in query_buffer)
+            structlog.get_logger("deadrop.access").warning(
+                "slow_request",
+                request_id=request_id,
+                duration_ms=round(duration_ms, 1),
+                endpoint=endpoint,
+                method=method,
+                path=path,
+                status=response.status_code,
+                db_queries=query_buffer,
+                db_total_ms=round(db_total, 1),
+                overhead_ms=round(duration_ms - db_total, 1),
+            )
+
+    # Always clean up: reset buffer ContextVar + unbind request_id from structlog
+    _request_query_buffer.reset(buffer_token)
+    structlog.contextvars.unbind_contextvars("request_id")
 
     return response
 

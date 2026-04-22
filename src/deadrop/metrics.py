@@ -9,6 +9,7 @@ When STATSD_HOST is not set, statsd calls are no-ops.
 In-memory metrics (for /admin/metrics endpoint) are always collected.
 """
 
+import contextvars
 import functools
 import logging as _logging
 import os
@@ -17,6 +18,12 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Generator
+
+# --- Per-request query buffer (ContextVar so it's async-safe) ---
+
+_request_query_buffer: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
+    "_request_query_buffer", default=None
+)
 
 # --- StatsD transport ---
 
@@ -225,7 +232,13 @@ def timed_query(name: str):
                 statsd_incr(f"db.{metric_name}.count")
                 # Also feed into the in-memory metrics (same bucket as record_db_operation)
                 metrics.record_db_operation(f"query.{name}", elapsed_ms)
-                _db_logger.debug("DB query %s: %.1fms", name, elapsed_ms)
+                # Append to per-request query buffer if one is active;
+                # otherwise fall back to a plain DEBUG log.
+                buf = _request_query_buffer.get()
+                if buf is not None:
+                    buf.append({"name": name, "ms": elapsed_ms})
+                else:
+                    _db_logger.debug("DB query %s: %.1fms", name, elapsed_ms)
 
         return wrapper
 
