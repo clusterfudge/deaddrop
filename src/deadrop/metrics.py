@@ -9,6 +9,8 @@ When STATSD_HOST is not set, statsd calls are no-ops.
 In-memory metrics (for /admin/metrics endpoint) are always collected.
 """
 
+import functools
+import logging as _logging
 import os
 import socket
 import time
@@ -186,3 +188,45 @@ def timed_db_operation(operation: str) -> Generator[None, None, None]:
     finally:
         elapsed_ms = (time.perf_counter() - start) * 1000
         metrics.record_db_operation(operation, elapsed_ms)
+
+
+_db_logger = _logging.getLogger("deadrop.db")
+
+
+def timed_query(name: str):
+    """Decorator that wraps a DB function with per-query timing.
+
+    Emits:
+        - statsd timing:  deadrop.db.query.<name>  (ms)
+        - statsd counter: deadrop.db.query.<name>.count
+        - DEBUG log:      DB query <name>: <ms>ms
+
+    Usage::
+
+        @timed_query("send_room_message")
+        def send_room_message(...):
+            ...
+
+    The decorator is transparent — it preserves the function's signature,
+    return value, and exceptions.  statsd is fire-and-forget UDP so there
+    is no meaningful overhead.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                metric_name = f"query.{name}"
+                statsd_timing(f"db.{metric_name}", elapsed_ms)
+                statsd_incr(f"db.{metric_name}.count")
+                # Also feed into the in-memory metrics (same bucket as record_db_operation)
+                metrics.record_db_operation(f"query.{name}", elapsed_ms)
+                _db_logger.debug("DB query %s: %.1fms", name, elapsed_ms)
+
+        return wrapper
+
+    return decorator

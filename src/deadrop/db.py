@@ -38,6 +38,7 @@ from typing import Any, Iterator
 from uuid_extensions import uuid7 as make_uuid7
 
 from .auth import derive_id, generate_secret, hash_secret
+from .metrics import timed_query
 
 # Deduplication window in seconds — messages with the same sender,
 # destination, and content hash within this window are considered
@@ -1344,6 +1345,7 @@ def _compute_content_hash(body: str, content_type: str, reference_mid: str | Non
 # --- Message Operations ---
 
 
+@timed_query("send_message")
 def send_message(
     ns: str,
     from_id: str,
@@ -1416,6 +1418,7 @@ def send_message(
     }
 
 
+@timed_query("has_new_messages")
 def has_new_messages(
     ns: str,
     identity_id: str,
@@ -1460,6 +1463,7 @@ def has_new_messages(
     return count > 0
 
 
+@timed_query("get_messages")
 def get_messages(
     ns: str,
     identity_id: str,
@@ -2100,6 +2104,7 @@ def delete_room(
     return cursor.rowcount > 0
 
 
+@timed_query("is_room_member")
 def is_room_member(
     room_id: str,
     identity_id: str,
@@ -2238,6 +2243,7 @@ def list_room_members(
     return rows
 
 
+@timed_query("send_room_message")
 def send_room_message(
     room_id: str,
     from_id: str,
@@ -2326,6 +2332,7 @@ def send_room_message(
     }
 
 
+@timed_query("has_new_room_messages")
 def has_new_room_messages(
     room_id: str,
     after_mid: str | None = None,
@@ -2357,6 +2364,7 @@ def has_new_room_messages(
     return count > 0
 
 
+@timed_query("get_room_messages")
 def get_room_messages(
     room_id: str,
     after_mid: str | None = None,
@@ -2477,6 +2485,7 @@ def get_room_messages(
     return messages
 
 
+@timed_query("get_room_message")
 def get_room_message(
     room_id: str,
     mid: str,
@@ -2513,6 +2522,7 @@ def get_room_message(
     return None
 
 
+@timed_query("update_room_read_cursor")
 def update_room_read_cursor(
     room_id: str,
     identity_id: str,
@@ -2557,6 +2567,7 @@ def update_room_read_cursor(
     return cursor.fetchone() is not None
 
 
+@timed_query("get_room_unread_count")
 def get_room_unread_count(
     room_id: str,
     identity_id: str,
@@ -2865,6 +2876,7 @@ def is_room_member_cached(
 # ---------------------------------------------------------------------------
 
 
+@timed_query("add_attachment")
 def add_attachment(
     message_mid: str,
     content_type: str,
@@ -2909,6 +2921,7 @@ def add_attachment(
     }
 
 
+@timed_query("get_attachment")
 def get_attachment(
     attachment_id: str,
     include_data: bool = True,
