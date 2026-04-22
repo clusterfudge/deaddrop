@@ -35,6 +35,57 @@ STATIC_DIR = PACKAGE_DIR / "static"
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
 
 
+def _post_deploy_annotation() -> None:
+    """Post a Grafana deploy annotation (fire-and-forget).
+
+    Reads GRAFANA_BASE_URL and GRAFANA_API_KEY from environment.
+    Skips silently if either is unset. Never blocks startup.
+    """
+    import os
+
+    grafana_base = os.environ.get("GRAFANA_BASE_URL", "")
+    grafana_key = os.environ.get("GRAFANA_API_KEY", "")
+    if not grafana_base or not grafana_key:
+        return
+
+    try:
+        import json as _json
+        import subprocess
+        import urllib.request
+
+        try:
+            git_sha = (
+                subprocess.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+                .decode()
+                .strip()
+            )
+        except Exception:
+            git_sha = "unknown"
+
+        payload = _json.dumps(
+            {"text": f"Deploy: {git_sha}", "tags": ["deploy", "deaddrop"]}
+        ).encode()
+
+        req = urllib.request.Request(
+            f"{grafana_base}/api/annotations",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {grafana_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            resp.read()
+        logger.info("Grafana deploy annotation posted (sha=%s)", git_sha)
+    except Exception:
+        logger.warning("Failed to post Grafana deploy annotation", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup database, and warm caches."""
@@ -62,56 +113,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Cache warming failed on startup", exc_info=True)
 
-    # Post a Grafana deploy annotation so we can correlate latency changes
-    # with deploys on the dashboard.  Fire-and-forget — never block startup.
-    # GRAFANA_API_KEY and GRAFANA_BASE_URL must be set as environment variables
-    # (e.g. on the dokku deployment).  Never read from disk — skip silently if unset.
-    try:
-        import os
-        import subprocess
-
-        grafana_base = os.environ.get("GRAFANA_BASE_URL", "")
-        grafana_key = os.environ.get("GRAFANA_API_KEY", "")
-
-        if grafana_base and grafana_key:
-            # Get current git SHA (best-effort — may not be available in all envs)
-            try:
-                git_sha = (
-                    subprocess.check_output(
-                        ["git", "rev-parse", "--short", "HEAD"],
-                        stderr=subprocess.DEVNULL,
-                        timeout=2,
-                    )
-                    .decode()
-                    .strip()
-                )
-            except Exception:
-                git_sha = "unknown"
-
-            import json as _json
-            import urllib.request
-
-            annotation_payload = _json.dumps(
-                {
-                    "text": f"Deploy: {git_sha}",
-                    "tags": ["deploy", "deaddrop"],
-                }
-            ).encode()
-
-            req = urllib.request.Request(
-                f"{grafana_base}/api/annotations",
-                data=annotation_payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {grafana_key}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=3) as _resp:
-                _resp.read()
-            logger.info(f"Grafana deploy annotation posted (sha={git_sha})")
-    except Exception:
-        logger.warning("Failed to post Grafana deploy annotation", exc_info=True)
+    _post_deploy_annotation()
 
     yield
 
