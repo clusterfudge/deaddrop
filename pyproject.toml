@@ -58,3 +58,9 @@ markers = [
 ]
 
 
+
+[tool.ty.rules]
+# InstrumentedConnection.execute() adds a name= kwarg that sqlite3.Connection
+# doesn't declare. The type: ignore directives on individual call sites are
+# sufficient; suppress the diagnostic globally to avoid per-line noise.
+unknown-argument = "ignore"
