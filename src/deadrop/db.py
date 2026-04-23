@@ -1992,6 +1992,7 @@ def create_room(
     }
 
 
+@timed_query("get_room")
 def get_room(
     room_id: str,
     conn: sqlite3.Connection | None = None,
@@ -2290,6 +2291,8 @@ def send_room_message(
 
     # Check for recent duplicate within the dedup window
     window_start = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS)).isoformat()
+    import time as _t
+    _t0_dedup = _t.perf_counter()
     cursor = conn.execute(
         """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
            FROM room_messages
@@ -2299,6 +2302,12 @@ def send_room_message(
         (room_id, from_id, content_hash, window_start),
     )
     existing = _row_to_dict(cursor.description, cursor.fetchone())
+    _dedup_ms = (_t.perf_counter() - _t0_dedup) * 1000
+    from .metrics import _request_query_buffer, statsd_timing
+    statsd_timing("db.send_room_message.dedup_check", _dedup_ms)
+    _buf = _request_query_buffer.get()
+    if _buf is not None:
+        _buf.append({"name": "send_room_message.dedup_check", "ms": _dedup_ms})
     if existing:
         return {
             "mid": existing["mid"],
@@ -2313,6 +2322,7 @@ def send_room_message(
 
     mid = str(make_uuid7())
 
+    _t0_insert = _t.perf_counter()
     conn.execute(
         """INSERT INTO room_messages
                (mid, room_id, from_id, body, content_type, content_hash, reference_mid, created_at)
@@ -2320,6 +2330,11 @@ def send_room_message(
         (mid, room_id, from_id, body, content_type, content_hash, reference_mid, now_iso),
     )
     conn.commit()
+    _insert_ms = (_t.perf_counter() - _t0_insert) * 1000
+    statsd_timing("db.send_room_message.insert_commit", _insert_ms)
+    _buf = _request_query_buffer.get()
+    if _buf is not None:
+        _buf.append({"name": "send_room_message.insert_commit", "ms": _insert_ms})
 
     return {
         "mid": mid,
