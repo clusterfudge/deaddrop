@@ -1,6 +1,7 @@
 """FastAPI application for deadrop."""
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -490,12 +491,22 @@ async def _run_sync(fn, *args):
     cannot block the server indefinitely.  On timeout the executor is
     replaced (the hung thread is abandoned as a daemon) and the libsql
     connection is reset on the new executor.
+
+    ContextVar propagation: Python 3.11's run_in_executor does NOT
+    propagate contextvars to executor threads. We capture the current
+    context and run the function inside it so that the per-request
+    query buffer (from metrics.py) is visible to timed_query decorators
+    running in the thread.
     """
     loop = asyncio.get_event_loop()
     executor = _get_db_executor()
+
+    # Capture the current context so contextvars propagate to the thread
+    ctx = contextvars.copy_context()
+
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(executor, fn, *args),
+            loop.run_in_executor(executor, ctx.run, fn, *args),
             timeout=DB_OPERATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
