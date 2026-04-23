@@ -8,6 +8,9 @@ Covers:
 - Threshold configurable via SLOW_REQUEST_THRESHOLD_MS env var
 - Fast requests do NOT emit slow_request warning
 - Buffer isolation between concurrent requests (ContextVar async-safety)
+- Buffer entry has {name, total_ms, conn_ms, query_ms} breakdown
+- conn_ms reflects time spent in get_connection(); query_ms = total_ms - conn_ms
+- slow_request WARNING includes db_conn_ms and db_query_ms aggregates
 """
 
 import logging
@@ -18,7 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deadrop.api import app
-from deadrop.metrics import _request_query_buffer, timed_query
+from deadrop.metrics import _conn_acquire_ms, _request_query_buffer, timed_query
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +42,7 @@ class TestQueryBuffer:
             _request_query_buffer.reset(token)
 
     def test_timed_query_appends_to_active_buffer(self):
-        """When a buffer is installed, timed_query should append to it."""
+        """When a buffer is installed, timed_query should append with timing breakdown."""
         buf: list[dict] = []
         token = _request_query_buffer.set(buf)
         try:
@@ -53,8 +56,17 @@ class TestQueryBuffer:
             assert len(buf) == 1
             entry = buf[0]
             assert entry["name"] == "test_op"
-            assert isinstance(entry["ms"], float)
-            assert entry["ms"] >= 0
+            # New breakdown fields
+            assert isinstance(entry["total_ms"], float)
+            assert isinstance(entry["conn_ms"], float)
+            assert isinstance(entry["query_ms"], float)
+            assert entry["total_ms"] >= 0
+            assert entry["conn_ms"] >= 0
+            assert entry["query_ms"] >= 0
+            # total = conn + query (within float rounding)
+            assert abs(entry["total_ms"] - entry["conn_ms"] - entry["query_ms"]) < 0.01
+            # Legacy "ms" key should be gone
+            assert "ms" not in entry
         finally:
             _request_query_buffer.reset(token)
 
@@ -113,7 +125,11 @@ class TestQueryBuffer:
 
             # Timing should still have been recorded even on exception
             assert len(buf) == 1
-            assert buf[0]["name"] == "failing_op"
+            entry = buf[0]
+            assert entry["name"] == "failing_op"
+            assert "total_ms" in entry
+            assert "conn_ms" in entry
+            assert "query_ms" in entry
         finally:
             _request_query_buffer.reset(token)
 
@@ -141,6 +157,85 @@ class TestQueryBuffer:
         assert len(buf_b) == 1
         assert buf_a[0]["name"] == "shared_name"
         assert buf_b[0]["name"] == "shared_name"
+
+
+class TestConnAcquireTiming:
+    """Unit tests for the conn-acquire breakdown in timed_query."""
+
+    def test_conn_ms_accumulates_from_conn_acquire_var(self):
+        """timed_query reads _conn_acquire_ms and splits it into conn_ms.
+
+        We inject a value that is *smaller* than the total wall-clock time so the
+        query_ms remainder is well-defined and positive.  We do this by sleeping
+        slightly longer than the injected acquire time.
+        """
+        import time as _time
+
+        buf: list[dict] = []
+        token = _request_query_buffer.set(buf)
+        try:
+
+            @timed_query("fake_db_op")
+            def db_op_with_fake_acquire():
+                # Simulate 2ms connection acquire, then "do work" for ~4ms total
+                _conn_acquire_ms.set(2.0)
+                _time.sleep(0.004)  # ensure total_ms >= 2ms so query_ms >= 0
+
+            db_op_with_fake_acquire()
+
+            assert len(buf) == 1
+            entry = buf[0]
+            # conn_ms should exactly match what we injected
+            assert entry["conn_ms"] == pytest.approx(2.0, abs=0.1)
+            # query_ms = max(total_ms - conn_ms, 0) — should be positive
+            assert entry["query_ms"] >= 0.0
+            # total_ms >= conn_ms (sleep guarantees this)
+            assert entry["total_ms"] >= entry["conn_ms"]
+            # round-trip invariant: conn + query == total (within float rounding)
+            assert abs(entry["conn_ms"] + entry["query_ms"] - entry["total_ms"]) < 0.01
+        finally:
+            _request_query_buffer.reset(token)
+
+    def test_conn_ms_reset_between_calls(self):
+        """_conn_acquire_ms is reset to 0.0 at the start of each timed_query call."""
+        buf: list[dict] = []
+        token = _request_query_buffer.set(buf)
+        try:
+
+            @timed_query("op_a")
+            def op_a():
+                _conn_acquire_ms.set(10.0)  # simulate 10ms acquire
+
+            @timed_query("op_b")
+            def op_b():
+                pass  # no acquire time injected → should see 0.0
+
+            op_a()
+            op_b()
+
+            assert buf[0]["conn_ms"] == pytest.approx(10.0, abs=0.1)
+            # op_b gets a fresh 0.0 reset — not leftover from op_a
+            assert buf[1]["conn_ms"] == pytest.approx(0.0, abs=0.1)
+        finally:
+            _request_query_buffer.reset(token)
+
+    def test_conn_ms_zero_when_no_acquire(self):
+        """When get_connection() is not called (conn provided directly), conn_ms stays 0."""
+        buf: list[dict] = []
+        token = _request_query_buffer.set(buf)
+        try:
+
+            @timed_query("direct_conn_op")
+            def noop():
+                # Don't touch _conn_acquire_ms — simulates passing conn= directly
+                pass
+
+            noop()
+
+            entry = buf[0]
+            assert entry["conn_ms"] == pytest.approx(0.0, abs=0.01)
+        finally:
+            _request_query_buffer.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +323,19 @@ class TestSlowRequestMiddleware:
         assert "duration_ms" in w
         assert "db_queries" in w
         assert "db_total_ms" in w
+        assert "db_conn_ms" in w
+        assert "db_query_ms" in w
         assert "overhead_ms" in w
         assert isinstance(w["db_queries"], list)
+        # Each query entry should have the breakdown fields
+        for q in w["db_queries"]:
+            assert "total_ms" in q, f"query entry missing total_ms: {q}"
+            assert "conn_ms" in q, f"query entry missing conn_ms: {q}"
+            assert "query_ms" in q, f"query entry missing query_ms: {q}"
         # overhead + db_total should approximately equal duration
         assert abs(w["overhead_ms"] + w["db_total_ms"] - w["duration_ms"]) < 1.0
+        # conn + query totals should add up to db_total
+        assert abs(w["db_conn_ms"] + w["db_query_ms"] - w["db_total_ms"]) < 0.1
 
     def test_slow_request_warning_includes_endpoint(self, client, admin_headers):
         """slow_request log must include endpoint and method fields."""

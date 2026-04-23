@@ -38,7 +38,7 @@ from typing import Any, Iterator
 from uuid_extensions import uuid7 as make_uuid7
 
 from .auth import derive_id, generate_secret, hash_secret
-from .metrics import timed_query
+from .metrics import _conn_acquire_ms, timed_query
 
 # Deduplication window in seconds — messages with the same sender,
 # destination, and content hash within this window are considered
@@ -441,10 +441,23 @@ def close_thread_connection():
 
 
 def _get_conn(conn: sqlite3.Connection | None) -> sqlite3.Connection:
-    """Helper to get connection - uses provided conn or falls back to global."""
+    """Helper to get connection - uses provided conn or falls back to global.
+
+    When ``conn`` is None, times the ``get_connection()`` call and accumulates
+    the duration into the ``_conn_acquire_ms`` ContextVar so that
+    :func:`~deadrop.metrics.timed_query` can report conn vs query breakdown.
+    If a connection is provided directly (e.g. test fixtures), there is no
+    acquire cost and we skip the timing.
+    """
     if conn is not None:
         return conn
-    return get_connection()
+    import time as _time
+
+    _t0 = _time.perf_counter()
+    _c = get_connection()
+    _elapsed = (_time.perf_counter() - _t0) * 1000
+    _conn_acquire_ms.set(_conn_acquire_ms.get() + _elapsed)
+    return _c
 
 
 def _execute_with_retry(

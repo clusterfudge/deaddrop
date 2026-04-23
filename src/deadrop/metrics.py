@@ -25,6 +25,14 @@ _request_query_buffer: contextvars.ContextVar[list[dict] | None] = contextvars.C
     "_request_query_buffer", default=None
 )
 
+# --- Per-call connection-acquire accumulator (ContextVar so it's async-safe) ---
+# Reset at the start of each timed_query call, incremented by get_connection().
+# Allows timed_query to split total_ms into conn_ms + query_ms.
+
+_conn_acquire_ms: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "_conn_acquire_ms", default=0.0
+)
+
 # --- StatsD transport ---
 
 _STATSD_HOST = os.environ.get("STATSD_HOST")
@@ -206,7 +214,16 @@ def timed_query(name: str):
     Emits:
         - statsd timing:  deadrop.db.query.<name>  (ms)
         - statsd counter: deadrop.db.query.<name>.count
-        - DEBUG log:      DB query <name>: <ms>ms
+        - statsd timing:  deadrop.db.conn_acquire.<name>  (ms) — connection-acquire portion
+        - DEBUG log:      DB query <name>: total=<ms>ms conn=<ms>ms query=<ms>ms
+
+    The buffer entry format is::
+
+        {"name": str, "total_ms": float, "conn_ms": float, "query_ms": float}
+
+    where ``conn_ms`` is the time spent in ``get_connection()`` / ``_get_conn()``
+    (accumulated via the ``_conn_acquire_ms`` ContextVar) and ``query_ms`` is
+    the remainder (actual SQL execution + row processing).
 
     Usage::
 
@@ -222,23 +239,43 @@ def timed_query(name: str):
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            # Reset the conn-acquire accumulator for this call so we get a
+            # clean reading that belongs only to this invocation.
+            _conn_acquire_ms.set(0.0)
             start = time.perf_counter()
             try:
                 return fn(*args, **kwargs)
             finally:
-                elapsed_ms = (time.perf_counter() - start) * 1000
+                total_ms = (time.perf_counter() - start) * 1000
+                conn_ms = _conn_acquire_ms.get()
+                query_ms = max(total_ms - conn_ms, 0.0)
+
                 metric_name = f"query.{name}"
-                statsd_timing(f"db.{metric_name}", elapsed_ms)
+                statsd_timing(f"db.{metric_name}", total_ms)
                 statsd_incr(f"db.{metric_name}.count")
+                statsd_timing(f"db.conn_acquire.{name}", conn_ms)
                 # Also feed into the in-memory metrics (same bucket as record_db_operation)
-                metrics.record_db_operation(f"query.{name}", elapsed_ms)
+                metrics.record_db_operation(f"query.{name}", total_ms)
                 # Append to per-request query buffer if one is active;
                 # otherwise fall back to a plain DEBUG log.
                 buf = _request_query_buffer.get()
                 if buf is not None:
-                    buf.append({"name": name, "ms": elapsed_ms})
+                    buf.append(
+                        {
+                            "name": name,
+                            "total_ms": total_ms,
+                            "conn_ms": conn_ms,
+                            "query_ms": query_ms,
+                        }
+                    )
                 else:
-                    _db_logger.debug("DB query %s: %.1fms", name, elapsed_ms)
+                    _db_logger.debug(
+                        "DB query %s: total=%.1fms conn=%.1fms query=%.1fms",
+                        name,
+                        total_ms,
+                        conn_ms,
+                        query_ms,
+                    )
 
         return wrapper
 

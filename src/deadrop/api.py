@@ -214,7 +214,9 @@ async def add_timing_middleware(request: Request, call_next):
 
         # Emit slow-request diagnostic if over threshold
         if duration_ms > slow_threshold_ms:
-            db_total = sum(q["ms"] for q in query_buffer)
+            db_total = sum(q["total_ms"] for q in query_buffer)
+            db_conn_total = sum(q["conn_ms"] for q in query_buffer)
+            db_query_total = sum(q["query_ms"] for q in query_buffer)
             structlog.get_logger("deadrop.access").warning(
                 "slow_request",
                 request_id=request_id,
@@ -225,6 +227,8 @@ async def add_timing_middleware(request: Request, call_next):
                 status=response.status_code,
                 db_queries=query_buffer,
                 db_total_ms=round(db_total, 1),
+                db_conn_ms=round(db_conn_total, 1),
+                db_query_ms=round(db_query_total, 1),
                 overhead_ms=round(duration_ms - db_total, 1),
             )
 
