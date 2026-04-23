@@ -33,12 +33,12 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 from uuid_extensions import uuid7 as make_uuid7
 
 from .auth import derive_id, generate_secret, hash_secret
-from .metrics import timed_query
+from .metrics import InstrumentedConnection, timed_query
 
 # Deduplication window in seconds — messages with the same sender,
 # destination, and content hash within this window are considered
@@ -284,7 +284,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
         # Enable foreign key enforcement
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
-        return conn
+        return cast(sqlite3.Connection, InstrumentedConnection(conn))
 
     # Check for Turso/libsql — each thread gets its own connection via
     # thread-local storage, enabling concurrent Turso requests from the
@@ -296,7 +296,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
             # Health check existing connection
             try:
                 _health_check_conn(_local.libsql_conn, timeout=LIBSQL_HEALTH_CHECK_TIMEOUT)
-                return _local.libsql_conn
+                return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
             except (TimeoutError, Exception) as e:
                 is_timeout = isinstance(e, TimeoutError)
                 is_hrana = not is_timeout and _is_hrana_stream_error(e)
@@ -345,7 +345,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
             logging.error(f"Failed to connect to libsql: {e}")
             raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
 
-        return _local.libsql_conn
+        return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
 
     # Thread-local connection for SQLite
     # Each thread gets its own connection to avoid concurrency issues
@@ -376,7 +376,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
         _local.conn.row_factory = sqlite3.Row
 
-    return _local.conn
+    return cast(sqlite3.Connection, InstrumentedConnection(_local.conn))
 
 
 @contextmanager
@@ -440,9 +440,19 @@ def close_thread_connection():
         _local.conn = None
 
 
-def _get_conn(conn: sqlite3.Connection | None) -> sqlite3.Connection:
-    """Helper to get connection - uses provided conn or falls back to global."""
+def _get_conn(
+    conn: sqlite3.Connection | None,
+) -> sqlite3.Connection:
+    """Helper to get connection - uses provided conn or falls back to global.
+
+    Always returns an InstrumentedConnection so that name= kwargs on
+    conn.execute() work regardless of whether the caller passed a raw
+    sqlite3.Connection or None.
+    """
     if conn is not None:
+        # Wrap raw connections so name= kwargs are accepted
+        if not isinstance(conn, InstrumentedConnection):
+            return cast(sqlite3.Connection, InstrumentedConnection(conn))
         return conn
     return get_connection()
 
@@ -1365,7 +1375,11 @@ def send_message(
     conn = _get_conn(conn)
 
     # Verify recipient exists
-    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, to_id))
+    cursor = conn.execute(
+        "SELECT id FROM identities WHERE ns = ? AND id = ?",
+        (ns, to_id),
+        name="send_message.verify_recipient",
+    )
     row = cursor.fetchone()
 
     if not row:
@@ -1384,6 +1398,7 @@ def send_message(
              AND created_at > ?
            ORDER BY created_at DESC LIMIT 1""",
         (ns, from_id, to_id, content_hash, window_start),
+        name="send_message.dedup_check",
     )
     existing = _row_to_dict(cursor.description, cursor.fetchone())
     if existing:
@@ -1406,6 +1421,7 @@ def send_message(
         """INSERT INTO messages (mid, ns, to_id, from_id, body, content_type, content_hash, created_at, expires_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (mid, ns, to_id, from_id, body, content_type, content_hash, now_iso, expires_at),
+        name="send_message.insert",
     )
     conn.commit()
 
@@ -1458,7 +1474,7 @@ def has_new_messages(
         query += " AND mid > ?"
         params.append(after_mid)
 
-    cursor = conn.execute(query, tuple(params))
+    cursor = conn.execute(query, tuple(params), name="has_new_messages.count")
     count = cursor.fetchone()[0]
     return count > 0
 
@@ -1499,7 +1515,7 @@ def get_messages(
 
     query += " ORDER BY mid"
 
-    cursor = conn.execute(query, tuple(params))
+    cursor = conn.execute(query, tuple(params), name="get_messages.select")
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
     messages = [
@@ -1529,6 +1545,7 @@ def get_messages(
             conn.execute(
                 f"UPDATE messages SET read_at = ?, expires_at = ? WHERE mid IN ({placeholders})",
                 tuple([now, expires_at] + unread_mids),
+                name="get_messages.mark_read",
             )
             conn.commit()
 
@@ -2124,6 +2141,7 @@ def is_room_member(
     cursor = conn.execute(
         "SELECT 1 FROM room_members WHERE room_id = ? AND identity_id = ?",
         (room_id, identity_id),
+        name="is_room_member.select",
     )
     return cursor.fetchone() is not None
 
@@ -2297,6 +2315,7 @@ def send_room_message(
              AND created_at > ?
            ORDER BY created_at DESC LIMIT 1""",
         (room_id, from_id, content_hash, window_start),
+        name="send_room_message.dedup_check",
     )
     existing = _row_to_dict(cursor.description, cursor.fetchone())
     if existing:
@@ -2318,6 +2337,7 @@ def send_room_message(
                (mid, room_id, from_id, body, content_type, content_hash, reference_mid, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (mid, room_id, from_id, body, content_type, content_hash, reference_mid, now_iso),
+        name="send_room_message.insert",
     )
     conn.commit()
 
@@ -2359,7 +2379,7 @@ def has_new_room_messages(
         query += " AND mid > ?"
         params.append(after_mid)
 
-    cursor = conn.execute(query, tuple(params))
+    cursor = conn.execute(query, tuple(params), name="has_new_room_messages.count")
     count = cursor.fetchone()[0]
     return count > 0
 
@@ -2443,7 +2463,7 @@ def get_room_messages(
         ORDER BY rm.mid {"DESC" if use_desc else "ASC"}, a.created_at
     """
 
-    cursor = conn.execute(query, tuple(params))
+    cursor = conn.execute(query, tuple(params), name="get_room_messages.select")
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
     # Collapse multi-row JOIN results into one message dict per mid
@@ -2506,6 +2526,7 @@ def get_room_message(
         """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
            FROM room_messages WHERE room_id = ? AND mid = ?""",
         (room_id, mid),
+        name="get_room_message.select",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -2551,6 +2572,7 @@ def update_room_read_cursor(
            WHERE room_id = ? AND identity_id = ?
            AND (last_read_mid IS NULL OR last_read_mid < ?)""",
         (last_read_mid, room_id, identity_id, last_read_mid),
+        name="update_room_read_cursor.update",
     )
     conn.commit()
 
@@ -2589,6 +2611,7 @@ def get_room_unread_count(
     cursor = conn.execute(
         "SELECT last_read_mid FROM room_members WHERE room_id = ? AND identity_id = ?",
         (room_id, identity_id),
+        name="get_room_unread_count.get_cursor",
     )
     row = cursor.fetchone()
 
@@ -2602,11 +2625,13 @@ def get_room_unread_count(
         cursor = conn.execute(
             "SELECT COUNT(*) FROM room_messages WHERE room_id = ? AND mid > ?",
             (room_id, last_read_mid),
+            name="get_room_unread_count.count",
         )
     else:
         cursor = conn.execute(
             "SELECT COUNT(*) FROM room_messages WHERE room_id = ?",
             (room_id,),
+            name="get_room_unread_count.count",
         )
 
     return cursor.fetchone()[0]
@@ -2908,6 +2933,7 @@ def add_attachment(
         """INSERT INTO attachments (id, message_mid, filename, content_type, data, size, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (attachment_id, message_mid, filename, content_type, data, size, now_iso),
+        name="add_attachment.insert",
     )
     conn.commit()
 
@@ -2943,7 +2969,11 @@ def get_attachment(
         if include_data
         else "id, message_mid, filename, content_type, size, created_at"
     )
-    cursor = conn.execute(f"SELECT {cols} FROM attachments WHERE id = ?", (attachment_id,))
+    cursor = conn.execute(
+        f"SELECT {cols} FROM attachments WHERE id = ?",
+        (attachment_id,),
+        name="get_attachment.select",
+    )
     row = cursor.fetchone()
     if not row:
         return None

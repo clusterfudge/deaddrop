@@ -11,6 +11,7 @@ In-memory metrics (for /admin/metrics endpoint) are always collected.
 
 import contextvars
 import functools
+import sqlite3 as _sqlite3
 import logging as _logging
 import os
 import socket
@@ -243,3 +244,87 @@ def timed_query(name: str):
         return wrapper
 
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# Per-SQL-statement instrumentation
+# ---------------------------------------------------------------------------
+
+
+def _record_query(name: str, ms: float) -> None:
+    """Emit a per-SQL-statement timing to statsd + the per-request query buffer.
+
+    This is the single funnel for ``InstrumentedConnection`` timing data.
+
+    Args:
+        name: Short name for the query, e.g. ``"select.room_messages"``.
+        ms:   Elapsed time in milliseconds.
+    """
+    statsd_timing(f"db.sql.{name}", ms)
+    buf = _request_query_buffer.get()
+    if buf is not None:
+        buf.append({"name": name, "ms": ms})
+
+
+# ---------------------------------------------------------------------------
+# InstrumentedConnection -- auto-times every execute() / commit()
+# ---------------------------------------------------------------------------
+
+
+class InstrumentedConnection:
+    """Transparent proxy around a raw DB connection that auto-times SQL.
+
+    Wraps any connection object that supports ``.execute(sql, params)`` and
+    ``.commit()`` (sqlite3, libsql, etc.) and records timing for every call
+    via :func:`_record_query`.
+
+    All other attributes/methods are forwarded to the underlying connection
+    unchanged via ``__getattr__``, so ``row_factory``, ``executescript``,
+    ``close``, cursor properties, etc. all work transparently.
+
+    Usage::
+
+        raw_conn = sqlite3.connect(...)
+        conn = InstrumentedConnection(raw_conn)
+        # All DAO code uses conn.execute() as normal -- timing is automatic.
+    """
+
+    _conn: _sqlite3.Connection
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: _sqlite3.Connection) -> None:
+        # Use object.__setattr__ to avoid triggering our own __setattr__
+        object.__setattr__(self, "_conn", conn)
+
+    # -- Core instrumented methods --
+
+    def execute(self, sql: str, params=(), *, name: str = "unnamed") -> _sqlite3.Cursor:
+        t0 = time.perf_counter()
+        try:
+            result = self._conn.execute(sql, params)
+        finally:
+            ms = (time.perf_counter() - t0) * 1000
+            _record_query(name, ms)
+        return result
+
+    def commit(self) -> None:
+        t0 = time.perf_counter()
+        try:
+            self._conn.commit()
+        finally:
+            ms = (time.perf_counter() - t0) * 1000
+            _record_query("commit", ms)
+
+    # -- Transparent proxy for everything else --
+
+    def __getattr__(self, name: str) -> object:  # noqa: ANN401
+        return getattr(object.__getattribute__(self, "_conn"), name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_conn":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_conn"), name, value)
+
+    def __repr__(self) -> str:
+        return f"InstrumentedConnection({object.__getattribute__(self, '_conn')!r})"
