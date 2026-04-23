@@ -2312,15 +2312,9 @@ def send_room_message(
     #       SELECT 1 FROM room_messages
     #       WHERE room_id=? AND from_id=? AND content_hash=? AND created_at > ?
     #   )
-    #
-    # If the row already exists (duplicate within the dedup window):
-    #   cursor.rowcount == 0  -> dedup fired; fetch existing message and return it.
-    # If the row was inserted:
-    #   cursor.rowcount == 1  -> new message; return immediately without another SELECT.
-    #
-    # This replaces the previous 3-step SELECT->INSERT->COMMIT pattern (2 round-trips
-    # to Turso) with a single INSERT + COMMIT (1 round-trip), cutting write latency
-    # from ~310 ms to ~155 ms on same-region Turso.
+    # Conditional INSERT: skip if a duplicate exists within the dedup window.
+    # cursor.rowcount == 0 → dedup fired; fetch existing and return.
+    # cursor.rowcount == 1 → new message inserted.
     mid = str(make_uuid7())
     window_start = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS)).isoformat()
 
