@@ -65,12 +65,10 @@ class TestRecordQuery:
         buf: list[dict] = []
         token = _request_query_buffer.set(buf)
         try:
-            _record_query("send_room_message.dedup_check", 1.0)
-            _record_query("send_room_message.insert", 2.0)
+            _record_query("send_room_message.upsert", 1.0)
             _record_query("commit", 0.5)
             assert [e["name"] for e in buf] == [
-                "send_room_message.dedup_check",
-                "send_room_message.insert",
+                "send_room_message.upsert",
                 "commit",
             ]
         finally:
@@ -356,12 +354,18 @@ class TestIntegrationNamedQueriesInBuffer:
 
         names = [q["name"] for q in captured[0]["db_queries"]]
 
-        # Explicit named SQL entries from InstrumentedConnection
-        assert "send_room_message.dedup_check" in names, (
-            f"Expected send_room_message.dedup_check in {names}"
-        )
-        assert "send_room_message.insert" in names, f"Expected send_room_message.insert in {names}"
+        # Explicit named SQL entries from InstrumentedConnection.
+        # send_room_message.upsert replaces the old dedup_check + insert pair —
+        # the conditional INSERT-SELECT eliminates the separate dedup SELECT round-trip.
+        assert "send_room_message.upsert" in names, f"Expected send_room_message.upsert in {names}"
         assert "commit" in names, f"Expected 'commit' in {names}"
+        # Old names should no longer appear
+        assert "send_room_message.dedup_check" not in names, (
+            f"send_room_message.dedup_check should be gone (batched into upsert): {names}"
+        )
+        assert "send_room_message.insert" not in names, (
+            f"send_room_message.insert should be gone (batched into upsert): {names}"
+        )
 
         # @timed_query function-level total
         assert "send_room_message" in names, (
