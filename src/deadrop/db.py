@@ -2292,6 +2292,7 @@ def send_room_message(
     # Check for recent duplicate within the dedup window
     window_start = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS)).isoformat()
     import time as _t
+
     _t0_dedup = _t.perf_counter()
     cursor = conn.execute(
         """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
@@ -2304,6 +2305,7 @@ def send_room_message(
     existing = _row_to_dict(cursor.description, cursor.fetchone())
     _dedup_ms = (_t.perf_counter() - _t0_dedup) * 1000
     from .metrics import _request_query_buffer, statsd_timing
+
     statsd_timing("db.send_room_message.dedup_check", _dedup_ms)
     _buf = _request_query_buffer.get()
     if _buf is not None:
