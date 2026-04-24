@@ -2293,12 +2293,11 @@ def send_room_message(
     """
     conn = _get_conn(conn)
 
-    # Verify room exists
+    # Verify room exists and sender is a member — both cached in the hot path.
     room = get_room(room_id, conn=conn)
     if not room:
         raise ValueError(f"Room {room_id} not found")
 
-    # Verify sender is a member
     if not is_room_member(room_id, from_id, conn=conn):
         raise ValueError(f"Identity {from_id} is not a member of room {room_id}")
 
@@ -2306,40 +2305,72 @@ def send_room_message(
     now_iso = now.isoformat()
     content_hash = _compute_content_hash(body, content_type, reference_mid)
 
-    # Check for recent duplicate within the dedup window
-    window_start = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS)).isoformat()
-    cursor = conn.execute(
-        """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
-           FROM room_messages
-           WHERE room_id = ? AND from_id = ? AND content_hash = ?
-             AND created_at > ?
-           ORDER BY created_at DESC LIMIT 1""",
-        (room_id, from_id, content_hash, window_start),
-        name="send_room_message.dedup_check",
-    )
-    existing = _row_to_dict(cursor.description, cursor.fetchone())
-    if existing:
-        return {
-            "mid": existing["mid"],
-            "room_id": existing["room_id"],
-            "from": existing["from_id"],
-            "body": existing["body"],
-            "content_type": existing.get("content_type") or "text/plain",
-            "reference_mid": existing.get("reference_mid"),
-            "created_at": existing["created_at"],
-            "deduplicated": True,
-        }
-
+    # Dedup + insert in ONE round-trip via a conditional INSERT:
+    #
+    #   INSERT INTO room_messages ... SELECT <values>
+    #   WHERE NOT EXISTS (
+    #       SELECT 1 FROM room_messages
+    #       WHERE room_id=? AND from_id=? AND content_hash=? AND created_at > ?
+    #   )
+    # Conditional INSERT: skip if a duplicate exists within the dedup window.
+    # cursor.rowcount == 0 → dedup fired; fetch existing and return.
+    # cursor.rowcount == 1 → new message inserted.
     mid = str(make_uuid7())
+    window_start = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS)).isoformat()
 
-    conn.execute(
+    cursor = conn.execute(
         """INSERT INTO room_messages
                (mid, room_id, from_id, body, content_type, content_hash, reference_mid, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (mid, room_id, from_id, body, content_type, content_hash, reference_mid, now_iso),
-        name="send_room_message.insert",
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE NOT EXISTS (
+               SELECT 1 FROM room_messages
+               WHERE room_id = ? AND from_id = ? AND content_hash = ?
+                 AND created_at > ?
+           )""",
+        (
+            mid,
+            room_id,
+            from_id,
+            body,
+            content_type,
+            content_hash,
+            reference_mid,
+            now_iso,
+            room_id,
+            from_id,
+            content_hash,
+            window_start,
+        ),
+        name="send_room_message.upsert",
     )
     conn.commit()
+
+    if cursor.rowcount == 0:
+        # Dedup fired — the conditional INSERT matched an existing message.
+        # Fetch the original so we can return consistent fields.
+        cursor = conn.execute(
+            """SELECT mid, room_id, from_id, body, content_type, reference_mid, created_at
+               FROM room_messages
+               WHERE room_id = ? AND from_id = ? AND content_hash = ?
+                 AND created_at > ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (room_id, from_id, content_hash, window_start),
+            name="send_room_message.dedup_fetch",
+        )
+        existing = _row_to_dict(cursor.description, cursor.fetchone())
+        # existing should always be non-None here since the INSERT-guard matched it,
+        # but fall back to a safe new-message response if the DB is in a weird state.
+        if existing:
+            return {
+                "mid": existing["mid"],
+                "room_id": existing["room_id"],
+                "from": existing["from_id"],
+                "body": existing["body"],
+                "content_type": existing.get("content_type") or "text/plain",
+                "reference_mid": existing.get("reference_mid"),
+                "created_at": existing["created_at"],
+                "deduplicated": True,
+            }
 
     return {
         "mid": mid,
