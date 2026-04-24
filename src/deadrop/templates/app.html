@@ -377,6 +377,9 @@
     // Pending attachments for the current compose
     let pendingAttachments = [];
 
+    // In-memory cache for fetched attachment data: attachmentId -> {content_type, data}
+    const attachmentCache = new Map();
+
     function renderAttachments(msg) {
         if (!msg.attachments || msg.attachments.length === 0) return '';
         const parts = msg.attachments.map(att => {
@@ -417,7 +420,14 @@
         placeholderEl.innerHTML = '⏳ Loading...';
         placeholderEl.style.opacity = '0.6';
         try {
-            const att = await DeadropAPI.getAttachment(credentials, attachmentId);
+            // Serve from cache if already fetched, otherwise fetch and store
+            let att;
+            if (attachmentCache.has(attachmentId)) {
+                att = attachmentCache.get(attachmentId);
+            } else {
+                att = await DeadropAPI.getAttachment(credentials, attachmentId);
+                attachmentCache.set(attachmentId, { content_type: att.content_type, data: att.data });
+            }
             const img = document.createElement('img');
             img.src = `data:${att.content_type};base64,${att.data}`;
             img.alt = att.filename || 'image';
@@ -1056,6 +1066,9 @@
         const attachmentsToSend = hasAttachments
             ? pendingAttachments.map(a => ({ filename: a.filename, content_type: a.content_type, data: a.data }))
             : null;
+
+        // Snapshot attachments before clearing so we can restore them on send failure
+        const savedAttachments = pendingAttachments.map(a => ({ ...a }));
         
         // Immediately clear input and disable button
         input.value = '';
@@ -1095,9 +1108,28 @@
             // Remove optimistic message on error
             roomMessages = roomMessages.filter(m => m.mid !== optimisticMsg.mid);
             renderRoomMessages();
-            alert('Failed to send: ' + e.message);
-            // Restore the message to input
-            input.value = body;
+
+            // Before showing an error, verify the message didn't actually land.
+            // A network timeout can fire even though the server received the POST.
+            let landed = false;
+            try {
+                const recent = await DeadropAPI.getRoomMessages(
+                    credentials, currentRoomId, { limit: 10 }
+                );
+                const msgs = Array.isArray(recent) ? recent : (recent.messages || []);
+                landed = msgs.some(m => m.body === (body || '📎') && m.from_id === credentials.id);
+            } catch (_) { /* best-effort — ignore secondary failure */ }
+
+            if (landed) {
+                // Server got it despite the client-side error; next poll will surface it.
+                console.log('Message landed despite send error — slow upload confirmed');
+            } else {
+                alert('Failed to send: ' + e.message);
+                // Restore the message body and attachments so the user doesn't lose work
+                input.value = body;
+                pendingAttachments = savedAttachments;
+                renderAttachmentPreview();
+            }
         } finally {
             sendBtn.disabled = false;
             sendBtn.textContent = 'Send ➤';
