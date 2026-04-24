@@ -465,43 +465,23 @@ def require_active_namespace(ns: str) -> None:
 # they keep using the sync versions above directly.
 
 
-def _get_db_executor():
-    """Get the appropriate executor for DB operations.
-
-    Delegates to db.get_db_executor() to ensure ALL database operations
-    (API handlers, cache warming, background tasks) share the same
-    single-threaded executor when using libsql/Turso.
-    """
-    return db.get_db_executor()
-
-
 # Maximum time a single DB operation can take before we assume the connection
 # is stale and needs to be reset.  This prevents a hung Turso query from
 # blocking the single-threaded executor indefinitely.
 DB_OPERATION_TIMEOUT = float(os.environ.get("DEADROP_DB_OPERATION_TIMEOUT", "15"))
 
 
-async def _run_sync(fn, *args):
-    """Run a synchronous function off the event loop.
+async def _run_read(fn, *args):
+    """Run a read-only (SELECT) database function off the event loop.
 
-    Uses a single-threaded executor for libsql/Turso (shared connection)
-    or the default threadpool for local SQLite (thread-local connections).
+    Routes to the read executor pool so that slow reads (e.g. large attachment
+    blob fetches) cannot block write threads.
 
-    Wraps the call in an asyncio timeout so that a hung Turso connection
-    cannot block the server indefinitely.  On timeout the executor is
-    replaced (the hung thread is abandoned as a daemon) and the libsql
-    connection is reset on the new executor.
-
-    ContextVar propagation: Python 3.11's run_in_executor does NOT
-    propagate contextvars to executor threads. We capture the current
-    context and run the function inside it so that the per-request
-    query buffer (from metrics.py) is visible to timed_query decorators
-    running in the thread.
+    ContextVar propagation: captures the current context so that the per-request
+    query buffer (metrics.py) is visible to timed_query decorators in the thread.
     """
     loop = asyncio.get_event_loop()
-    executor = _get_db_executor()
-
-    # Capture the current context so contextvars propagate to the thread
+    executor = db.get_read_executor()
     ctx = contextvars.copy_context()
 
     try:
@@ -513,14 +493,11 @@ async def _run_sync(fn, *args):
         import logging
 
         logging.error(
-            f"DB operation timed out after {DB_OPERATION_TIMEOUT}s, "
-            "replacing executor and resetting connection"
+            f"DB read operation timed out after {DB_OPERATION_TIMEOUT}s, "
+            "replacing executors and resetting connection"
         )
-        # The old executor thread is stuck — replace the executor entirely.
-        # The hung thread is a daemon and will be abandoned.
         db._replace_db_executor()
-        # Reset connection on the *new* executor
-        new_executor = db.get_db_executor()
+        new_executor = db.get_read_executor()
         try:
             await asyncio.wait_for(
                 loop.run_in_executor(new_executor, db._reset_libsql_connection),
@@ -531,9 +508,52 @@ async def _run_sync(fn, *args):
         raise HTTPException(503, "Database operation timed out — please retry")
 
 
+async def _run_write(fn, *args):
+    """Run a write (INSERT/UPDATE/DELETE) database function off the event loop.
+
+    Routes to the write executor pool, isolated from read threads so that
+    slow reads cannot cause write latency spikes.
+
+    ContextVar propagation: captures the current context so that the per-request
+    query buffer (metrics.py) is visible to timed_query decorators in the thread.
+    """
+    loop = asyncio.get_event_loop()
+    executor = db.get_write_executor()
+    ctx = contextvars.copy_context()
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(executor, ctx.run, fn, *args),
+            timeout=DB_OPERATION_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        import logging
+
+        logging.error(
+            f"DB write operation timed out after {DB_OPERATION_TIMEOUT}s, "
+            "replacing executors and resetting connection"
+        )
+        db._replace_db_executor()
+        new_executor = db.get_write_executor()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(new_executor, db._reset_libsql_connection),
+                timeout=5.0,
+            )
+        except Exception:
+            pass
+        raise HTTPException(503, "Database operation timed out — please retry")
+
+
+# Backward-compatible alias: callers that already use _run_sync without needing
+# to distinguish read vs write continue to work. New callers should use
+# _run_read or _run_write explicitly.
+_run_sync = _run_write
+
+
 async def _require_active_namespace(ns: str) -> None:
     """Async variant of require_active_namespace."""
-    archived = await _run_sync(db.is_namespace_archived, ns)
+    archived = await _run_read(db.is_namespace_archived, ns)
     if archived:
         raise HTTPException(410, "Namespace is archived")
 
@@ -562,7 +582,7 @@ async def _require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str |
         return identity_id
 
     # Slow path: cache miss, go through executor
-    verified = await _run_sync(db.verify_identity_secret, ns, identity_id, x_inbox_secret)
+    verified = await _run_read(db.verify_identity_secret, ns, identity_id, x_inbox_secret)
     if not verified:
         raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
 
@@ -591,7 +611,7 @@ async def _require_inbox_secret_any(ns: str, x_inbox_secret: str | None) -> str:
         raise HTTPException(403, "Invalid inbox secret or not in namespace")
 
     # Slow path: cache miss, go through executor
-    result = await _run_sync(db.verify_identity_in_namespace, ns, x_inbox_secret)
+    result = await _run_read(db.verify_identity_in_namespace, ns, x_inbox_secret)
     if not result:
         raise HTTPException(403, "Invalid inbox secret or not in namespace")
 
@@ -627,7 +647,7 @@ async def _require_room_member(room_id: str, x_inbox_secret: str | None) -> tupl
     # Slow path: cache miss, go through executor
     import functools
 
-    room, error = await _run_sync(
+    room, error = await _run_read(
         functools.partial(db.verify_room_access, room_id, identity_id, x_inbox_secret)
     )
 
@@ -684,13 +704,13 @@ async def _validate_subscription_topics(
                     raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
             else:
                 # Cache miss — fall back to DB
-                is_member = await _run_sync(db.is_room_member, topic_id, caller_id)
+                is_member = await _run_read(db.is_room_member, topic_id, caller_id)
                 if not is_member:
                     raise HTTPException(
                         403,
                         f"Not a member of room: {topic_id}",
                     )
-                room = await _run_sync(db.get_room, topic_id)
+                room = await _run_read(db.get_room, topic_id)
                 if room is None or room.get("ns") != ns:
                     raise HTTPException(404, f"Room not found in this namespace: {topic_id}")
         else:
@@ -915,17 +935,17 @@ async def list_identities(
     """
     # Either namespace secret OR inbox secret works
     if x_namespace_secret:
-        verified = await _run_sync(db.verify_namespace_secret, ns, x_namespace_secret)
+        verified = await _run_read(db.verify_namespace_secret, ns, x_namespace_secret)
         if not verified:
             raise HTTPException(403, "Invalid namespace secret")
     elif x_inbox_secret:
-        identity_id = await _run_sync(db.verify_identity_in_namespace, ns, x_inbox_secret)
+        identity_id = await _run_read(db.verify_identity_in_namespace, ns, x_inbox_secret)
         if not identity_id:
             raise HTTPException(403, "Invalid inbox secret or not in namespace")
     else:
         raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
 
-    identities = await _run_sync(db.list_identities, ns)
+    identities = await _run_read(db.list_identities, ns)
     return [IdentityInfo(**identity) for identity in identities]
 
 
@@ -1021,7 +1041,7 @@ async def send_message(
     from_id = await _require_inbox_secret_any(ns, x_inbox_secret)
 
     try:
-        result = await _run_sync(
+        result = await _run_write(
             functools.partial(
                 db.send_message,
                 ns=ns,
@@ -1077,7 +1097,7 @@ async def get_inbox(
     await _require_inbox_secret(ns, identity_id, x_inbox_secret)
 
     # Fetch and return messages
-    messages = await _run_sync(
+    messages = await _run_read(
         functools.partial(
             db.get_messages,
             ns=ns,
@@ -1538,7 +1558,7 @@ async def create_room(
     display_name = request.display_name if request else None
 
     try:
-        room = await _run_sync(db.create_room, ns, created_by, display_name)
+        room = await _run_write(db.create_room, ns, created_by, display_name)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -1556,7 +1576,7 @@ async def list_my_rooms(
     """
     identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
 
-    rooms = await _run_sync(db.list_rooms_for_identity, ns, identity_id)
+    rooms = await _run_read(db.list_rooms_for_identity, ns, identity_id)
     return [RoomWithMemberInfo(**r) for r in rooms]
 
 
@@ -1613,7 +1633,7 @@ async def list_room_members(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    members = await _run_sync(db.list_room_members, room_id)
+    members = await _run_read(db.list_room_members, room_id)
     return [RoomMemberInfo(**m) for m in members]
 
 
@@ -1634,13 +1654,13 @@ async def add_room_member(
         raise HTTPException(404, "Room not found in this namespace")
 
     try:
-        await _run_sync(db.add_room_member, room_id, request.identity_id)
+        await _run_write(db.add_room_member, room_id, request.identity_id)
         cache.invalidate_membership(room_id, request.identity_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
     # Get full member info with metadata
-    member_info = await _run_sync(db.get_room_member_info, room_id, request.identity_id)
+    member_info = await _run_read(db.get_room_member_info, room_id, request.identity_id)
     if not member_info:
         raise HTTPException(500, "Failed to get member info")
 
@@ -1712,7 +1732,7 @@ async def get_room_messages(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    messages = await _run_sync(
+    messages = await _run_read(
         functools.partial(
             db.get_room_messages,
             room_id,
@@ -1819,7 +1839,7 @@ async def send_room_message(
         return msg, deduped, att_records
 
     try:
-        message, deduplicated, attachment_records = await _run_sync(_send_with_attachments)
+        message, deduplicated, attachment_records = await _run_write(_send_with_attachments)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -1873,7 +1893,7 @@ async def update_read_cursor(
             # All caches hit — auth is free, just do the write
             if cached_room["ns"] != ns:
                 raise HTTPException(404, "Room not found in this namespace")
-            result = await _run_sync(
+            result = await _run_write(
                 functools.partial(
                     db.update_room_read_cursor, room_id, identity_id, request.last_read_mid
                 )
@@ -1892,7 +1912,7 @@ async def update_read_cursor(
         ok = db.update_room_read_cursor(room_id, identity_id, request.last_read_mid)
         return room, ok, None
 
-    room, result, error = await _run_sync(_auth_and_update)
+    room, result, error = await _run_write(_auth_and_update)
 
     if error:
         if error == "namespace_mismatch":
@@ -1923,7 +1943,7 @@ async def get_unread_count(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    count = await _run_sync(db.get_room_unread_count, room_id, identity_id)
+    count = await _run_read(db.get_room_unread_count, room_id, identity_id)
     return {"unread_count": count, "room_id": room_id}
 
 
@@ -2000,34 +2020,43 @@ async def get_attachment(
     The caller must be a member of the room the attachment's message belongs to.
     Returns the full attachment including base64-encoded data.
     """
-    import functools
-
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    attachment = await _run_sync(
-        functools.partial(db.get_attachment, attachment_id, include_data=True)
-    )
+    caller_id = derive_id(x_inbox_secret)
+
+    def _fetch_and_verify_attachment():
+        """Fetch attachment + verify room membership in a single read executor dispatch."""
+        attachment = db.get_attachment(attachment_id, include_data=True)
+        if not attachment:
+            return None, None, "not_found"
+
+        # Look up the message's room_id to verify membership
+        conn = db.get_connection()
+        cursor = conn.execute(
+            "SELECT room_id FROM room_messages WHERE mid = ?", (attachment["message_mid"],)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None, None, "not_found"
+
+        room_id = row[0]
+        room = db.get_room(room_id)
+        if not room or room["ns"] != ns:
+            return None, None, "not_found"
+
+        if not db.is_room_member(room_id, caller_id):
+            return None, None, "forbidden"
+
+        return attachment, room_id, None
+
+    attachment, _room_id, err = await _run_read(_fetch_and_verify_attachment)
+    if err == "not_found":
+        raise HTTPException(404, "Attachment not found")
+    if err == "forbidden":
+        raise HTTPException(403, "Not a room member")
     if not attachment:
         raise HTTPException(404, "Attachment not found")
-
-    # Verify caller has access via room membership
-    # Look up the message's room_id directly from room_messages table
-    message_mid = attachment["message_mid"]
-    conn = db.get_connection()
-    cursor = conn.execute("SELECT room_id FROM room_messages WHERE mid = ?", (message_mid,))
-    row = cursor.fetchone()
-    if not row:
-        raise HTTPException(404, "Attachment not found")
-
-    room_id = row[0]
-    room = db.get_room(room_id)
-    if not room or room["ns"] != ns:
-        raise HTTPException(404, "Attachment not found")
-
-    caller_id = derive_id(x_inbox_secret)
-    if not db.is_room_member(room_id, caller_id):
-        raise HTTPException(403, "Not a room member")
 
     return AttachmentDataInfo(
         id=attachment["id"],

@@ -83,75 +83,130 @@ _libsql_lock = threading.Lock()
 LIBSQL_CONNECT_TIMEOUT = 10.0
 LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
 
-# Shared single-threaded executor for serializing libsql operations.
-# When using Turso/libsql, ALL database operations must go through this
-# executor because the shared connection is NOT thread-safe.
-_db_executor = None
-_db_executor_lock = threading.Lock()
+# Separate read and write executor pools.
+#
+# Reads (SELECT-only) and writes (INSERT/UPDATE/DELETE + commit) are routed to
+# different thread pools so that a slow read (e.g. a large attachment blob
+# fetch) cannot starve write threads and cause write latency spikes.
+#
+# Each thread in each pool has its own libsql connection via thread-local
+# storage.  For local SQLite the executors are None and FastAPI's default
+# thread pool is used instead.
+_read_executor = None
+_write_executor = None
+_executor_lock = threading.Lock()
+
+# Pool sizes — tunable via environment variables.
+READ_POOL_SIZE = int(os.environ.get("DEADROP_READ_POOL_SIZE", "6"))
+WRITE_POOL_SIZE = int(os.environ.get("DEADROP_WRITE_POOL_SIZE", "4"))
+
+# Backward-compat alias so any existing tooling referencing DB_POOL_SIZE still works.
+DB_POOL_SIZE = int(os.environ.get("DEADROP_DB_POOL_SIZE", str(READ_POOL_SIZE)))
 
 
-DB_POOL_SIZE = int(os.environ.get("DEADROP_DB_POOL_SIZE", "4"))
+def get_read_executor():
+    """Get the executor for read (SELECT-only) database operations.
 
-
-def get_db_executor():
-    """Get the shared executor for database operations.
-
-    For libsql/Turso: uses a thread pool with DB_POOL_SIZE workers (default 4).
+    For libsql/Turso: uses a thread pool with READ_POOL_SIZE workers (default 6).
     Each worker thread gets its own libsql connection via thread-local storage,
-    enabling concurrent Turso requests.
+    enabling concurrent reads without blocking the write pool.
 
-    For local SQLite: returns None to use the default threadpool with
+    For local SQLite: returns None to use FastAPI's default thread pool with
     thread-local connections.
-
-    This MUST be used by all async code that accesses the database.
     """
-    global _db_executor
+    global _read_executor
 
-    if _db_executor is not None:
-        return _db_executor
+    if _read_executor is not None:
+        return _read_executor
 
-    with _db_executor_lock:
-        # Double-check under lock
-        if _db_executor is not None:
-            return _db_executor
+    with _executor_lock:
+        if _read_executor is not None:
+            return _read_executor
 
         if is_using_libsql():
             from concurrent.futures import ThreadPoolExecutor
 
             import logging
 
-            _db_executor = ThreadPoolExecutor(max_workers=DB_POOL_SIZE, thread_name_prefix="db")
+            _read_executor = ThreadPoolExecutor(
+                max_workers=READ_POOL_SIZE, thread_name_prefix="db-read"
+            )
             logging.getLogger(__name__).info(
-                f"Using DB executor pool with {DB_POOL_SIZE} workers for libsql/Turso"
+                f"Using read executor pool with {READ_POOL_SIZE} workers for libsql/Turso"
             )
 
-    return _db_executor
+    return _read_executor
+
+
+def get_write_executor():
+    """Get the executor for write (INSERT/UPDATE/DELETE) database operations.
+
+    For libsql/Turso: uses a thread pool with WRITE_POOL_SIZE workers (default 4).
+    Each worker thread gets its own libsql connection via thread-local storage.
+    Keeping write threads isolated ensures that slow reads never block writes.
+
+    For local SQLite: returns None to use FastAPI's default thread pool with
+    thread-local connections.
+    """
+    global _write_executor
+
+    if _write_executor is not None:
+        return _write_executor
+
+    with _executor_lock:
+        if _write_executor is not None:
+            return _write_executor
+
+        if is_using_libsql():
+            from concurrent.futures import ThreadPoolExecutor
+
+            import logging
+
+            _write_executor = ThreadPoolExecutor(
+                max_workers=WRITE_POOL_SIZE, thread_name_prefix="db-write"
+            )
+            logging.getLogger(__name__).info(
+                f"Using write executor pool with {WRITE_POOL_SIZE} workers for libsql/Turso"
+            )
+
+    return _write_executor
+
+
+def get_db_executor():
+    """Get the shared executor for database operations.
+
+    Backward-compatible shim — returns the write executor.
+    New code should prefer get_read_executor() or get_write_executor().
+    """
+    return get_write_executor()
 
 
 def _replace_db_executor():
-    """Replace the shared DB executor with a fresh one.
+    """Replace the DB executor pools with fresh ones.
 
-    Called when the executor thread is stuck on a hung Turso operation.
-    The old executor (and its stuck thread) is abandoned — the thread is a
-    daemon so it won't prevent process exit.
-
-    The old executor is intentionally NOT shut down (that would block waiting
-    for the stuck thread to finish).  A new single-threaded executor is
-    created to take its place.
+    Called when an executor thread is stuck on a hung Turso operation.
+    Old executors (and their stuck threads) are abandoned — threads are daemons
+    so they won't prevent process exit.  Old executors are intentionally NOT
+    shut down (that would block waiting for the stuck threads to finish).
     """
-    global _db_executor
+    global _read_executor, _write_executor
 
     if not is_using_libsql():
-        return  # Only relevant for libsql with its single-threaded executor
+        return  # Only relevant for libsql
 
-    with _db_executor_lock:
+    with _executor_lock:
         from concurrent.futures import ThreadPoolExecutor
 
         import logging
 
-        _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+        _read_executor = ThreadPoolExecutor(
+            max_workers=READ_POOL_SIZE, thread_name_prefix="db-read"
+        )
+        _write_executor = ThreadPoolExecutor(
+            max_workers=WRITE_POOL_SIZE, thread_name_prefix="db-write"
+        )
         logging.getLogger(__name__).warning(
-            "Replaced stuck DB executor with a fresh one (old thread abandoned)"
+            "Replaced stuck DB executors with fresh ones (old threads abandoned)"
         )
 
 
