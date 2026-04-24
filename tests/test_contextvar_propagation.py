@@ -34,11 +34,13 @@ def test_post_populates_db_queries(client, room_setup):
     alice = room_setup["alice"]
     room = room_setup["room"]
 
-    import deadrop.api as api_mod
-
+    # Patch both read and write executors on the db module so the custom
+    # executor is used for all DB operations in this request.
     custom_executor = ThreadPoolExecutor(max_workers=2)
-    original_get = api_mod._get_db_executor
-    api_mod._get_db_executor = lambda: custom_executor
+    original_read = db.get_read_executor
+    original_write = db.get_write_executor
+    db.get_read_executor = lambda: custom_executor
+    db.get_write_executor = lambda: custom_executor
 
     try:
         resp = client.post(
@@ -47,7 +49,8 @@ def test_post_populates_db_queries(client, room_setup):
             headers={"X-Inbox-Secret": alice["secret"]},
         )
     finally:
-        api_mod._get_db_executor = original_get
+        db.get_read_executor = original_read
+        db.get_write_executor = original_write
         custom_executor.shutdown(wait=False)
 
     assert resp.status_code == 200

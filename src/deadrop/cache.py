@@ -293,7 +293,8 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
         return results
 
     loop = asyncio.get_event_loop()
-    executor = db.get_db_executor()
+    # Cache warming is all SELECT reads — use the read executor pool.
+    executor = db.get_read_executor()
 
     try:
         return await loop.run_in_executor(executor, _warm_all_sync)
