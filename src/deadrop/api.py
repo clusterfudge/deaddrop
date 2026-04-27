@@ -114,7 +114,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Cache warming failed on startup", exc_info=True)
 
-    _post_deploy_annotation()
+    # Run in a background thread so urllib.request.urlopen doesn't block the
+    # ASGI event loop during startup. Fire-and-forget: failures are logged but
+    # never surface to callers.
+    asyncio.create_task(asyncio.to_thread(_post_deploy_annotation))
 
     yield
 
