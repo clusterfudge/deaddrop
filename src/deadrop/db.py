@@ -83,6 +83,20 @@ _libsql_lock = threading.Lock()
 LIBSQL_CONNECT_TIMEOUT = 10.0
 LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
 
+# Minimum seconds between consecutive _replace_db_executor() calls.
+# Under load, many concurrent handlers can time out simultaneously and each
+# independently call _replace_db_executor(), creating N×(read+write) threads
+# in a single burst.  This cooldown ensures only the first call within the
+# window creates new pools; subsequent calls skip the replacement.
+_EXECUTOR_REPLACE_COOLDOWN = 10.0
+_last_executor_replace: float = 0.0
+
+# How often (in seconds) to health-check a thread-local libsql connection.
+# Previously the health check ran on EVERY get_connection() call, adding
+# one Turso round-trip (~100ms) to every DB operation.  Now we only check
+# if the connection is older than this interval, or after an error.
+LIBSQL_HEALTH_CHECK_INTERVAL = 30.0
+
 # Separate read and write executor pools.
 #
 # Reads (SELECT-only) and writes (INSERT/UPDATE/DELETE + commit) are routed to
@@ -188,16 +202,34 @@ def _replace_db_executor():
     Old executors (and their stuck threads) are abandoned — threads are daemons
     so they won't prevent process exit.  Old executors are intentionally NOT
     shut down (that would block waiting for the stuck threads to finish).
+
+    Debounced: if called multiple times within _EXECUTOR_REPLACE_COOLDOWN seconds,
+    only the first call actually replaces the pools.  Under load, many concurrent
+    handlers can time out simultaneously and each call _replace_db_executor(),
+    which would otherwise create N×(read+write) threads in a single burst and
+    overwhelm Turso with simultaneous reconnect attempts.
     """
-    global _read_executor, _write_executor
+    global _read_executor, _write_executor, _last_executor_replace
 
     if not is_using_libsql():
         return  # Only relevant for libsql
 
-    with _executor_lock:
-        from concurrent.futures import ThreadPoolExecutor
+    import logging
+    import time
 
-        import logging
+    now = time.monotonic()
+    with _executor_lock:
+        # Debounce: skip if a replacement already happened recently.
+        if now - _last_executor_replace < _EXECUTOR_REPLACE_COOLDOWN:
+            logging.getLogger(__name__).debug(
+                "Skipping _replace_db_executor — cooldown active "
+                f"({now - _last_executor_replace:.1f}s < {_EXECUTOR_REPLACE_COOLDOWN}s)"
+            )
+            return
+
+        _last_executor_replace = now
+
+        from concurrent.futures import ThreadPoolExecutor
 
         _read_executor = ThreadPoolExecutor(
             max_workers=READ_POOL_SIZE, thread_name_prefix="db-read"
@@ -348,9 +380,21 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     if db_url.startswith("libsql://"):
         # Check thread-local connection
         if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
-            # Health check existing connection
+            # Throttled health check: only ping Turso if the connection hasn't
+            # been checked recently.  Previously we ran SELECT 1 on every
+            # get_connection() call, adding ~100ms overhead to every DB
+            # operation and creating constant Turso traffic that could cascade
+            # into a reconnect storm when all connections expired simultaneously.
+            import time as _time
+
+            last_check = getattr(_local, "libsql_last_health", 0.0)
+            if _time.monotonic() - last_check < LIBSQL_HEALTH_CHECK_INTERVAL:
+                # Connection was recently verified — skip the health check.
+                return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
+
             try:
                 _health_check_conn(_local.libsql_conn, timeout=LIBSQL_HEALTH_CHECK_TIMEOUT)
+                _local.libsql_last_health = _time.monotonic()
                 return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
             except (TimeoutError, Exception) as e:
                 is_timeout = isinstance(e, TimeoutError)
@@ -374,6 +418,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                     except Exception:
                         pass
                     _local.libsql_conn = None
+                    _local.libsql_last_health = 0.0  # force health check on next connection
                     # Fall through to create new connection
                 else:
                     raise
@@ -391,6 +436,11 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                 description=f"libsql.connect() on {thread_name}",
             )
             _is_libsql = True
+            # Stamp the connection time so we don't immediately health-check
+            # on the next get_connection() call for this thread.
+            import time as _time
+
+            _local.libsql_last_health = _time.monotonic()
         except TimeoutError:
             logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
             raise RuntimeError(
