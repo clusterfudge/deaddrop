@@ -96,6 +96,9 @@ async def lifespan(app: FastAPI):
 
     db.init_db()
 
+    # Start background DB instrumentation loop (pushes gauge metrics every 30s)
+    db._start_metrics_loop()
+
     # Enforce namespace TTLs on startup (archive expired namespaces)
     from . import jobs
 
@@ -2304,6 +2307,21 @@ def pwa_service_worker():
 def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/debug/db")
+def debug_db(
+    authorization: Annotated[str | None, Header()] = None,
+    x_admin_token: Annotated[str | None, Header()] = None,
+):
+    """Live DB instrumentation snapshot.
+
+    Returns current executor pool state, counters for Hrana errors, health-check
+    failures, and executor replacements.  Intended for diagnosing runtime hangs.
+    Requires admin authentication.
+    """
+    require_admin(authorization, x_admin_token)
+    return db.get_db_debug_state()
 
 
 @app.get("/metrics")

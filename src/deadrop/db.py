@@ -102,6 +102,27 @@ WRITE_POOL_SIZE = int(os.environ.get("DEADROP_WRITE_POOL_SIZE", "4"))
 
 # Backward-compat alias so any existing tooling referencing DB_POOL_SIZE still works.
 DB_POOL_SIZE = int(os.environ.get("DEADROP_DB_POOL_SIZE", str(READ_POOL_SIZE)))
+# ---------------------------------------------------------------------------
+# Instrumentation state — counters / timestamps for /debug/db and statsd
+# ---------------------------------------------------------------------------
+
+# Timestamp when each pool was last (re)created (monotonic + wall clock)
+_read_pool_created_at: float = 0.0  # time.monotonic()
+_write_pool_created_at: float = 0.0  # time.monotonic()
+_read_pool_created_wall: str = ""  # ISO-8601 UTC wall clock
+_write_pool_created_wall: str = ""
+
+# Running counters — never reset between pool replacements
+_executor_replace_count: int = 0
+_last_executor_replace_at: str = ""  # ISO-8601 UTC
+
+_hrana_stream_errors_total: int = 0
+_health_check_count_total: int = 0
+_health_check_failures_total: int = 0
+_libsql_connect_count_total: int = 0
+
+# Protects the counter globals above (they are written from executor threads)
+_instr_lock = threading.Lock()
 
 
 def get_read_executor():
@@ -125,14 +146,19 @@ def get_read_executor():
 
         if is_using_libsql():
             from concurrent.futures import ThreadPoolExecutor
-
             import logging
+            import time as _time
+            from datetime import datetime as _dt, timezone as _tz
 
+            global _read_pool_created_at, _read_pool_created_wall
             _read_executor = ThreadPoolExecutor(
                 max_workers=READ_POOL_SIZE, thread_name_prefix="db-read"
             )
+            _read_pool_created_at = _time.monotonic()
+            _read_pool_created_wall = _dt.now(_tz.utc).isoformat()
             logging.getLogger(__name__).info(
-                f"Using read executor pool with {READ_POOL_SIZE} workers for libsql/Turso"
+                "Created read executor pool: %d workers for libsql/Turso",
+                READ_POOL_SIZE,
             )
 
     return _read_executor
@@ -159,14 +185,19 @@ def get_write_executor():
 
         if is_using_libsql():
             from concurrent.futures import ThreadPoolExecutor
-
             import logging
+            import time as _time
+            from datetime import datetime as _dt, timezone as _tz
 
+            global _write_pool_created_at, _write_pool_created_wall
             _write_executor = ThreadPoolExecutor(
                 max_workers=WRITE_POOL_SIZE, thread_name_prefix="db-write"
             )
+            _write_pool_created_at = _time.monotonic()
+            _write_pool_created_wall = _dt.now(_tz.utc).isoformat()
             logging.getLogger(__name__).info(
-                f"Using write executor pool with {WRITE_POOL_SIZE} workers for libsql/Turso"
+                "Created write executor pool: %d workers for libsql/Turso",
+                WRITE_POOL_SIZE,
             )
 
     return _write_executor
@@ -181,23 +212,57 @@ def get_db_executor():
     return get_write_executor()
 
 
-def _replace_db_executor():
+def _replace_db_executor(reason: str = "unspecified") -> None:
     """Replace the DB executor pools with fresh ones.
 
     Called when an executor thread is stuck on a hung Turso operation.
     Old executors (and their stuck threads) are abandoned — threads are daemons
     so they won't prevent process exit.  Old executors are intentionally NOT
     shut down (that would block waiting for the stuck threads to finish).
+
+    Args:
+        reason: Human-readable reason for the replacement (logged + statsd tagged).
     """
     global _read_executor, _write_executor
+    global _executor_replace_count, _last_executor_replace_at
+    global _read_pool_created_at, _write_pool_created_at
+    global _read_pool_created_wall, _write_pool_created_wall
 
     if not is_using_libsql():
         return  # Only relevant for libsql
 
-    with _executor_lock:
-        from concurrent.futures import ThreadPoolExecutor
+    import logging
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime as _dt, timezone as _tz
 
-        import logging
+    from .metrics import metrics, statsd_incr
+
+    log = logging.getLogger(__name__)
+    now_monotonic = _time.monotonic()
+    now_wall = _dt.now(_tz.utc).isoformat()
+
+    with _executor_lock:
+        with _instr_lock:
+            _executor_replace_count += 1
+            replace_num = _executor_replace_count
+            _last_executor_replace_at = now_wall
+
+            # Warn if the pool is being replaced very quickly after the last one
+            age_read = now_monotonic - _read_pool_created_at
+            if _read_pool_created_at > 0 and age_read < 60:
+                log.warning(
+                    "db.executor: read pool replaced only %.1fs after creation (replace #%d, reason=%s)",
+                    age_read,
+                    replace_num,
+                    reason,
+                )
+
+        log.warning(
+            "db.executor: replacing stuck DB executors (replace #%d, reason=%s) — old threads abandoned",
+            replace_num,
+            reason,
+        )
 
         _read_executor = ThreadPoolExecutor(
             max_workers=READ_POOL_SIZE, thread_name_prefix="db-read"
@@ -205,9 +270,20 @@ def _replace_db_executor():
         _write_executor = ThreadPoolExecutor(
             max_workers=WRITE_POOL_SIZE, thread_name_prefix="db-write"
         )
-        logging.getLogger(__name__).warning(
-            "Replaced stuck DB executors with fresh ones (old threads abandoned)"
+        _read_pool_created_at = now_monotonic
+        _write_pool_created_at = now_monotonic
+        _read_pool_created_wall = now_wall
+        _write_pool_created_wall = now_wall
+
+        log.info(
+            "db.executor: new pools created (read=%d workers, write=%d workers)",
+            READ_POOL_SIZE,
+            WRITE_POOL_SIZE,
         )
+
+    # Emit statsd counter (outside the lock to avoid blocking)
+    statsd_incr("db.executor.replace_count")
+    metrics.incr("db.executor.replace_count")
 
 
 def _reset_libsql_connection() -> None:
@@ -350,7 +426,25 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
         if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
             # Health check existing connection
             try:
+                import logging
+                import time as _time
+                from .metrics import metrics, statsd_incr
+
+                global _health_check_count_total, _health_check_failures_total
+                with _instr_lock:
+                    _health_check_count_total += 1
+                statsd_incr("db.health_check.count")
+                metrics.incr("db.health_check.count")
                 _health_check_conn(_local.libsql_conn, timeout=LIBSQL_HEALTH_CHECK_TIMEOUT)
+
+                # Track connection age at time of use
+                conn_age = _time.monotonic() - getattr(
+                    _local, "libsql_conn_created_at", _time.monotonic()
+                )
+                from .metrics import statsd_timing
+
+                statsd_timing("db.connection.age_seconds", conn_age * 1000)  # send as ms timing
+
                 return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
             except (TimeoutError, Exception) as e:
                 is_timeout = isinstance(e, TimeoutError)
@@ -358,11 +452,32 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
                 if is_timeout or is_hrana:
                     import logging
+                    from .metrics import metrics, statsd_incr
+
+                    global _hrana_stream_errors_total, _health_check_failures_total
+
+                    with _instr_lock:
+                        _health_check_failures_total += 1
+                        if is_hrana:
+                            _hrana_stream_errors_total += 1
+
+                    statsd_incr("db.health_check.failures")
+                    metrics.incr("db.health_check.failures")
+                    if is_hrana:
+                        statsd_incr("db.hrana_stream_error")
+                        metrics.incr("db.hrana_stream_error")
+                        logging.getLogger(__name__).info(
+                            "db.hrana_stream_error on %s: %s",
+                            threading.current_thread().name,
+                            e,
+                        )
 
                     reason = "timed out" if is_timeout else "stale"
-                    logging.warning(
-                        f"Libsql connection {reason} on {threading.current_thread().name}, "
-                        f"reconnecting: {e}"
+                    logging.getLogger(__name__).warning(
+                        "Libsql connection %s on %s, reconnecting: %s",
+                        reason,
+                        threading.current_thread().name,
+                        e,
                     )
                     stale_conn = _local.libsql_conn
                     try:
@@ -381,9 +496,15 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
         # Create new thread-local connection
         import libsql_experimental as libsql  # type: ignore[import-not-found]
         import logging
+        import time as _time
+
+        from .metrics import metrics, statsd_incr, statsd_timing
+
+        global _libsql_connect_count_total
 
         thread_name = threading.current_thread().name
-        logging.info(f"Creating libsql connection on {thread_name} to {db_url[:50]}...")
+        logging.info("Creating libsql connection on %s to %s...", thread_name, db_url[:50])
+        _connect_start = _time.perf_counter()
         try:
             _local.libsql_conn = _run_with_timeout(
                 lambda: libsql.connect(db_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")),
@@ -391,13 +512,20 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                 description=f"libsql.connect() on {thread_name}",
             )
             _is_libsql = True
+            _connect_ms = (_time.perf_counter() - _connect_start) * 1000
+            with _instr_lock:
+                _libsql_connect_count_total += 1
+            statsd_incr("db.libsql_connect.count")
+            statsd_timing("db.libsql_connect.duration_ms", _connect_ms)
+            metrics.incr("db.libsql_connect.count")
+            _local.libsql_conn_created_at = _time.monotonic()
         except TimeoutError:
-            logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
+            logging.error("libsql.connect() timed out after %ss", LIBSQL_CONNECT_TIMEOUT)
             raise RuntimeError(
                 f"Timed out connecting to Turso database after {LIBSQL_CONNECT_TIMEOUT}s"
             )
         except Exception as e:
-            logging.error(f"Failed to connect to libsql: {e}")
+            logging.error("Failed to connect to libsql: %s", e)
             raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
 
         return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
@@ -493,6 +621,104 @@ def close_thread_connection():
     if hasattr(_local, "conn") and _local.conn is not None:
         _local.conn.close()
         _local.conn = None
+
+
+# ---------------------------------------------------------------------------
+# Debug state snapshot — used by /debug/db endpoint
+# ---------------------------------------------------------------------------
+
+
+def get_db_debug_state() -> dict:
+    """Return a snapshot of DB instrumentation state for the /debug/db endpoint.
+
+    Safe to call from any thread.  All counters are read under _instr_lock.
+    Thread counts iterate through the executor's internal thread set, which
+    is a live snapshot (alive threads only).
+    """
+    import time as _time
+
+    now = _time.monotonic()
+
+    with _instr_lock:
+        replace_count = _executor_replace_count
+        last_replace_at = _last_executor_replace_at
+        hrana_errors = _hrana_stream_errors_total
+        hc_count = _health_check_count_total
+        hc_failures = _health_check_failures_total
+        connect_count = _libsql_connect_count_total
+        read_created_at = _read_pool_created_at
+        write_created_at = _write_pool_created_at
+        read_created_wall = _read_pool_created_wall
+        write_created_wall = _write_pool_created_wall
+
+    # Count alive threads in each pool
+    def _alive_threads(executor) -> int:
+        if executor is None:
+            return 0
+        try:
+            return sum(1 for t in executor._threads if t.is_alive())
+        except Exception:
+            return -1
+
+    read_threads = _alive_threads(_read_executor)
+    write_threads = _alive_threads(_write_executor)
+
+    read_age = round(now - read_created_at, 1) if read_created_at else None
+    write_age = round(now - write_created_at, 1) if write_created_at else None
+
+    return {
+        "read_pool_threads": read_threads,
+        "write_pool_threads": write_threads,
+        "read_pool_age_seconds": read_age,
+        "write_pool_age_seconds": write_age,
+        "read_pool_created_at": read_created_wall or None,
+        "write_pool_created_at": write_created_wall or None,
+        "executor_replace_count_total": replace_count,
+        "last_executor_replace_at": last_replace_at or None,
+        "hrana_stream_errors_total": hrana_errors,
+        "health_check_count_total": hc_count,
+        "health_check_failures_total": hc_failures,
+        "libsql_connect_count_total": connect_count,
+        "is_libsql": is_using_libsql(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Background metrics loop — pushes executor gauges to statsd every 30s
+# ---------------------------------------------------------------------------
+
+
+def _start_metrics_loop() -> None:
+    """Start a background daemon thread that pushes DB gauge metrics every 30s.
+
+    Safe to call multiple times — subsequent calls after the first are no-ops.
+    Only active when using libsql/Turso (gauges are not meaningful for SQLite).
+    """
+    if not is_using_libsql():
+        return
+
+    import threading as _threading
+
+    def _loop() -> None:
+        import logging
+        import time as _time
+        from .metrics import statsd_gauge
+
+        log = logging.getLogger(__name__)
+        while True:
+            _time.sleep(30)
+            try:
+                state = get_db_debug_state()
+                statsd_gauge("db.executor.thread_count.read", state["read_pool_threads"])
+                statsd_gauge("db.executor.thread_count.write", state["write_pool_threads"])
+                statsd_gauge("db.executor.replace_count", state["executor_replace_count_total"])
+                statsd_gauge("db.hrana_stream_errors_total", state["hrana_stream_errors_total"])
+                statsd_gauge("db.health_check_failures_total", state["health_check_failures_total"])
+            except Exception:
+                log.debug("db metrics loop error", exc_info=True)
+
+    _t = _threading.Thread(target=_loop, daemon=True, name="db-metrics-loop")
+    _t.start()
 
 
 def _get_conn(
