@@ -104,30 +104,38 @@ class Metrics:
             self._request_durations[endpoint] = self._request_durations[endpoint][-500:]
         self._status_counts[f"{status}"] += 1
 
-        instrument.sink.timing("request.duration_ms", duration_ms, tags={"endpoint": endpoint})
-        instrument.sink.counter("request.count", tags={"endpoint": endpoint})
-        instrument.sink.counter("response.status", tags={"status": str(status)})
+        # Emit backward-compatible flat metric names (same as pre-PR53 statsd calls).
+        # These are the names the Grafana dashboard queries expect.
+        instrument.sink.timing(f"request.{endpoint}", duration_ms)
+        instrument.sink.counter(f"request.{endpoint}.count")
+        instrument.sink.counter(f"response.{status}")
 
     def record_cache_hit(self, cache_name: str) -> None:
         self._cache_hits[cache_name] += 1
-        instrument.sink.counter("cache.hit", tags={"cache": cache_name})
+        # Backward-compatible flat name: deadrop.cache.{name}.hit
+        instrument.sink.counter(f"cache.{cache_name}.hit")
 
     def record_cache_miss(self, cache_name: str) -> None:
         self._cache_misses[cache_name] += 1
-        instrument.sink.counter("cache.miss", tags={"cache": cache_name})
+        # Backward-compatible flat name: deadrop.cache.{name}.miss
+        instrument.sink.counter(f"cache.{cache_name}.miss")
 
     def record_db_operation(self, operation: str, duration_ms: float) -> None:
         self._db_operation_counts[operation] += 1
         self._db_operation_durations[operation].append(duration_ms)
         if len(self._db_operation_durations[operation]) > 1000:
             self._db_operation_durations[operation] = self._db_operation_durations[operation][-500:]
-        instrument.sink.timing("db.operation_ms", duration_ms, tags={"op": operation})
+        # Backward-compatible flat name: deadrop.db.{operation}
+        # (pre-PR53: statsd_timing(f"db.{operation}", duration_ms))
+        instrument.sink.timing(f"db.{operation}", duration_ms)
 
     def incr(self, key: str, count: int = 1) -> None:
         self._counters[key] += count
+        # Flat key forwarded as-is (same as pre-PR53 statsd_incr behaviour)
         instrument.sink.counter(key, count)
 
     def gauge(self, key: str, value: int | float) -> None:
+        # Flat key forwarded as-is (same as pre-PR53 statsd_gauge behaviour)
         instrument.sink.gauge(key, float(value))
 
     def to_dict(self) -> dict:
@@ -258,8 +266,13 @@ def timed_query(name: str):
 
 
 def _record_query(name: str, ms: float) -> None:
-    """Emit a per-SQL timing to sink + per-request query buffer."""
-    instrument.sink.timing("db.sql_ms", ms, tags={"query": name})
+    """Emit a per-SQL timing to sink + per-request query buffer.
+
+    Emits the backward-compatible flat metric name ``db.sql.{name}``
+    (same format as pre-PR53: ``statsd_timing(f"db.sql.{name}", ms)``).
+    """
+    # Backward-compatible flat name: deadrop.db.sql.{name}
+    instrument.sink.timing(f"db.sql.{name}", ms)
     buf = _request_query_buffer.get()
     if buf is not None:
         buf.append({"name": name, "ms": ms})

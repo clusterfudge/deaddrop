@@ -76,10 +76,13 @@ class TestRecordQuery:
         try:
             instrument.sink = test_sink
             _record_query("send_message.insert", 2.5)
+            # Backward-compatible flat name: db.sql.{name} (no tags).
+            # This matches the pre-PR53 statsd_timing(f"db.sql.{name}", ms) behaviour
+            # that the Grafana dashboard queries depend on.
             assert any(
-                name == "db.sql_ms" and tags == {"query": "send_message.insert"}
+                name == "db.sql.send_message.insert" and tags is None
                 for name, _, tags in test_sink.calls
-            ), f"Expected db.sql_ms with query tag, got: {test_sink.calls}"
+            ), f"Expected db.sql.send_message.insert (flat, no tags), got: {test_sink.calls}"
         finally:
             instrument.sink = original_sink
             _request_query_buffer.reset(token)

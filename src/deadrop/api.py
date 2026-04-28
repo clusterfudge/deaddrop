@@ -206,12 +206,9 @@ async def add_timing_middleware(request: Request, call_next):
         endpoint = "other"
 
     metrics.record_request(endpoint, duration_ms, status=response.status_code)
-
-    # Also emit to pluggable sink via instrument module
-    instrument.sink.timing("request.duration_ms", duration_ms, tags={"endpoint": endpoint})
-    instrument.sink.counter(
-        "request.status", tags={"status": str(response.status_code), "endpoint": endpoint}
-    )
+    # Note: metrics.record_request() already forwards to instrument.sink with
+    # backward-compatible flat names.  No additional direct sink calls here to
+    # avoid emitting duplicate/tagged metrics that break Grafana dashboard queries.
 
     # Add timing header for debugging
     response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
