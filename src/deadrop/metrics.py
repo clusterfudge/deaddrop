@@ -1,79 +1,90 @@
-"""Lightweight statsd + in-memory metrics for deadrop.
+"""Metrics layer for deadrop.
 
-Configurable via environment variables:
-    STATSD_HOST: StatsD host (default: None = no-op for statsd)
-    STATSD_PORT: StatsD port (default: 8125)
-    STATSD_PREFIX: Metric prefix (default: deadrop)
+This module is the **internal** metrics API used by db.py, api.py, cache.py,
+and the instrumentation middleware.  It wraps the pluggable
+:mod:`~deadrop.instrument` sink so that all call sites continue to work
+unchanged while the underlying transport is configurable at runtime.
 
-When STATSD_HOST is not set, statsd calls are no-ops.
-In-memory metrics (for /admin/metrics endpoint) are always collected.
+Legacy statsd helpers (``statsd_incr``, ``statsd_gauge``, ``statsd_timing``)
+are preserved for backward compatibility but now forward to the active
+``instrument.sink``.
+
+For new instrumentation code, import ``instrument.sink`` directly.
+
+Per-request query buffer
+-------------------------
+``_request_query_buffer`` is a :class:`~contextvars.ContextVar` that
+:class:`InstrumentedConnection` and :func:`timed_query` append to.  The
+middleware in ``api.py`` installs a fresh list at request start and reads it
+at request end for slow-request diagnostics.
 """
+
+from __future__ import annotations
 
 import contextvars
 import functools
-import sqlite3 as _sqlite3
 import logging as _logging
-import os
-import socket
+import sqlite3 as _sqlite3
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Generator
 
-# --- Per-request query buffer (ContextVar so it's async-safe) ---
+from . import instrument
+
+# Re-export for convenience (existing ``from .metrics import metrics`` still works)
+__all__ = [
+    "metrics",
+    "timed_db_operation",
+    "timed_query",
+    "InstrumentedConnection",
+    "_request_query_buffer",
+    # legacy helpers
+    "statsd_incr",
+    "statsd_gauge",
+    "statsd_timing",
+]
+
+# ---------------------------------------------------------------------------
+# Per-request query buffer (ContextVar — async-safe)
+# ---------------------------------------------------------------------------
 
 _request_query_buffer: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
     "_request_query_buffer", default=None
 )
 
-# --- StatsD transport ---
-
-_STATSD_HOST = os.environ.get("STATSD_HOST")
-_STATSD_PORT = int(os.environ.get("STATSD_PORT", "8125"))
-_PREFIX = os.environ.get("STATSD_PREFIX", "deadrop")
-_sock: socket.socket | None = None
-
-
-def _get_sock() -> socket.socket | None:
-    global _sock
-    if _STATSD_HOST is None:
-        return None
-    if _sock is None:
-        _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    return _sock
-
-
-def _statsd_send(metric: str, value: str, metric_type: str, sample_rate: float = 1.0) -> None:
-    sock = _get_sock()
-    if sock is None:
-        return
-    try:
-        key = f"{_PREFIX}.{metric}" if _PREFIX else metric
-        payload = f"{key}:{value}|{metric_type}"
-        if sample_rate < 1.0:
-            payload += f"|@{sample_rate}"
-        sock.sendto(payload.encode(), (_STATSD_HOST, _STATSD_PORT))
-    except Exception:
-        pass
+# ---------------------------------------------------------------------------
+# Legacy statsd helpers — now forward to instrument.sink
+# ---------------------------------------------------------------------------
 
 
 def statsd_incr(metric: str, count: int = 1) -> None:
-    _statsd_send(metric, str(count), "c")
+    """Increment a counter via the active metrics sink."""
+    instrument.sink.counter(metric, count)
 
 
 def statsd_gauge(metric: str, value: int | float) -> None:
-    _statsd_send(metric, str(value), "g")
+    """Record a gauge via the active metrics sink."""
+    instrument.sink.gauge(metric, float(value))
 
 
 def statsd_timing(metric: str, ms: float) -> None:
-    _statsd_send(metric, f"{ms:.1f}", "ms")
+    """Record a timing (ms) via the active metrics sink."""
+    instrument.sink.timing(metric, ms)
 
 
-# --- In-memory metrics (always active) ---
+# ---------------------------------------------------------------------------
+# In-memory Metrics collector (always active — powers /metrics endpoint)
+# ---------------------------------------------------------------------------
 
 
 class Metrics:
-    """Thread-safe in-memory metrics collector + statsd emitter."""
+    """Thread-safe in-memory metrics collector.
+
+    Aggregates counters and timing histograms in memory for the ``/metrics``
+    admin endpoint.  Also forwards every observation to ``instrument.sink``
+    so that whichever external backend is configured receives it too.
+    """
 
     def __init__(self) -> None:
         self._request_counts: dict[str, int] = defaultdict(int)
@@ -89,67 +100,65 @@ class Metrics:
     def record_request(self, endpoint: str, duration_ms: float, status: int = 200) -> None:
         self._request_counts[endpoint] += 1
         self._request_durations[endpoint].append(duration_ms)
-        # Keep only last 1000 durations per endpoint
         if len(self._request_durations[endpoint]) > 1000:
             self._request_durations[endpoint] = self._request_durations[endpoint][-500:]
         self._status_counts[f"{status}"] += 1
 
-        # StatsD
-        statsd_timing(f"request.{endpoint}", duration_ms)
-        statsd_incr(f"request.{endpoint}.count")
-        statsd_incr(f"response.{status}")
+        instrument.sink.timing("request.duration_ms", duration_ms, tags={"endpoint": endpoint})
+        instrument.sink.counter("request.count", tags={"endpoint": endpoint})
+        instrument.sink.counter("response.status", tags={"status": str(status)})
 
     def record_cache_hit(self, cache_name: str) -> None:
         self._cache_hits[cache_name] += 1
-        statsd_incr(f"cache.{cache_name}.hit")
+        instrument.sink.counter("cache.hit", tags={"cache": cache_name})
 
     def record_cache_miss(self, cache_name: str) -> None:
         self._cache_misses[cache_name] += 1
-        statsd_incr(f"cache.{cache_name}.miss")
+        instrument.sink.counter("cache.miss", tags={"cache": cache_name})
 
     def record_db_operation(self, operation: str, duration_ms: float) -> None:
         self._db_operation_counts[operation] += 1
         self._db_operation_durations[operation].append(duration_ms)
         if len(self._db_operation_durations[operation]) > 1000:
             self._db_operation_durations[operation] = self._db_operation_durations[operation][-500:]
-        statsd_timing(f"db.{operation}", duration_ms)
+        instrument.sink.timing("db.operation_ms", duration_ms, tags={"op": operation})
 
     def incr(self, key: str, count: int = 1) -> None:
         self._counters[key] += count
-        statsd_incr(key, count)
+        instrument.sink.counter(key, count)
 
     def gauge(self, key: str, value: int | float) -> None:
-        statsd_gauge(key, value)
+        instrument.sink.gauge(key, float(value))
 
     def to_dict(self) -> dict:
-        """Export metrics for the /admin/metrics endpoint."""
+        """Export aggregated metrics as a plain dict for the /metrics endpoint."""
 
-        def _summarize_durations(durations: list[float]) -> dict:
+        def _summarize(durations: list[float]) -> dict:
             if not durations:
                 return {"count": 0}
-            sorted_d = sorted(durations)
-            n = len(sorted_d)
+            s = sorted(durations)
+            n = len(s)
             return {
                 "count": n,
-                "avg_ms": round(sum(sorted_d) / n, 1),
-                "p50_ms": round(sorted_d[n // 2], 1),
-                "p95_ms": round(sorted_d[int(n * 0.95)], 1) if n >= 20 else None,
-                "p99_ms": round(sorted_d[int(n * 0.99)], 1) if n >= 100 else None,
-                "max_ms": round(sorted_d[-1], 1),
+                "avg_ms": round(sum(s) / n, 1),
+                "p50_ms": round(s[n // 2], 1),
+                "p95_ms": round(s[int(n * 0.95)], 1) if n >= 20 else None,
+                "p99_ms": round(s[int(n * 0.99)], 1) if n >= 100 else None,
+                "max_ms": round(s[-1], 1),
             }
 
         result: dict = {
             "uptime_seconds": round(time.time() - self._start_time),
-            "statsd_enabled": _STATSD_HOST is not None,
+            "metrics_sink": type(instrument.sink).__name__,
         }
 
         if self._request_counts:
             result["requests"] = {
-                endpoint: {
-                    "count": self._request_counts[endpoint],
-                    **_summarize_durations(self._request_durations.get(endpoint, [])),
+                ep: {
+                    "count": self._request_counts[ep],
+                    **_summarize(self._request_durations.get(ep, [])),
                 }
-                for endpoint in sorted(self._request_counts)
+                for ep in sorted(self._request_counts)
             }
 
         if self._status_counts:
@@ -172,7 +181,7 @@ class Metrics:
             result["db_operations"] = {
                 op: {
                     "count": self._db_operation_counts[op],
-                    **_summarize_durations(self._db_operation_durations.get(op, [])),
+                    **_summarize(self._db_operation_durations.get(op, [])),
                 }
                 for op in sorted(self._db_operation_counts)
             }
@@ -183,13 +192,18 @@ class Metrics:
         return result
 
 
-# Singleton
+# Singleton used throughout the codebase
 metrics = Metrics()
+
+
+# ---------------------------------------------------------------------------
+# Context manager helpers
+# ---------------------------------------------------------------------------
 
 
 @contextmanager
 def timed_db_operation(operation: str) -> Generator[None, None, None]:
-    """Context manager to time a DB operation and record metrics."""
+    """Time a DB operation and emit metrics on exit."""
     start = time.perf_counter()
     try:
         yield
@@ -198,26 +212,24 @@ def timed_db_operation(operation: str) -> Generator[None, None, None]:
         metrics.record_db_operation(operation, elapsed_ms)
 
 
+# ---------------------------------------------------------------------------
+# timed_query decorator
+# ---------------------------------------------------------------------------
+
 _db_logger = _logging.getLogger("deadrop.db")
 
 
 def timed_query(name: str):
-    """Decorator that wraps a DB function with per-query timing.
+    """Decorator: wraps a DB function with per-query timing.
 
-    Emits:
-        - statsd timing:  deadrop.db.query.<name>  (ms)
-        - statsd counter: deadrop.db.query.<name>.count
-        - DEBUG log:      DB query <name>: <ms>ms
+    Emits timing via the active ``instrument.sink`` and appends to the
+    per-request query buffer when one is active.
 
     Usage::
 
         @timed_query("send_room_message")
         def send_room_message(...):
             ...
-
-    The decorator is transparent — it preserves the function's signature,
-    return value, and exceptions.  statsd is fire-and-forget UDP so there
-    is no meaningful overhead.
     """
 
     def decorator(fn):
@@ -228,13 +240,7 @@ def timed_query(name: str):
                 return fn(*args, **kwargs)
             finally:
                 elapsed_ms = (time.perf_counter() - start) * 1000
-                metric_name = f"query.{name}"
-                statsd_timing(f"db.{metric_name}", elapsed_ms)
-                statsd_incr(f"db.{metric_name}.count")
-                # Also feed into the in-memory metrics (same bucket as record_db_operation)
                 metrics.record_db_operation(f"query.{name}", elapsed_ms)
-                # Append to per-request query buffer if one is active;
-                # otherwise fall back to a plain DEBUG log.
                 buf = _request_query_buffer.get()
                 if buf is not None:
                     buf.append({"name": name, "ms": elapsed_ms})
@@ -247,27 +253,20 @@ def timed_query(name: str):
 
 
 # ---------------------------------------------------------------------------
-# Per-SQL-statement instrumentation
+# Per-SQL-statement instrumentation helpers
 # ---------------------------------------------------------------------------
 
 
 def _record_query(name: str, ms: float) -> None:
-    """Emit a per-SQL-statement timing to statsd + the per-request query buffer.
-
-    This is the single funnel for ``InstrumentedConnection`` timing data.
-
-    Args:
-        name: Short name for the query, e.g. ``"select.room_messages"``.
-        ms:   Elapsed time in milliseconds.
-    """
-    statsd_timing(f"db.sql.{name}", ms)
+    """Emit a per-SQL timing to sink + per-request query buffer."""
+    instrument.sink.timing("db.sql_ms", ms, tags={"query": name})
     buf = _request_query_buffer.get()
     if buf is not None:
         buf.append({"name": name, "ms": ms})
 
 
 # ---------------------------------------------------------------------------
-# InstrumentedConnection -- auto-times every execute() / commit()
+# InstrumentedConnection — transparent proxy with auto-timing
 # ---------------------------------------------------------------------------
 
 
@@ -281,30 +280,20 @@ class InstrumentedConnection:
     All other attributes/methods are forwarded to the underlying connection
     unchanged via ``__getattr__``, so ``row_factory``, ``executescript``,
     ``close``, cursor properties, etc. all work transparently.
-
-    Usage::
-
-        raw_conn = sqlite3.connect(...)
-        conn = InstrumentedConnection(raw_conn)
-        # All DAO code uses conn.execute() as normal -- timing is automatic.
     """
 
     _conn: _sqlite3.Connection
     __slots__ = ("_conn",)
 
     def __init__(self, conn: _sqlite3.Connection) -> None:
-        # Use object.__setattr__ to avoid triggering our own __setattr__
         object.__setattr__(self, "_conn", conn)
-
-    # -- Core instrumented methods --
 
     def execute(self, sql: str, params=(), *, name: str = "unnamed") -> _sqlite3.Cursor:
         t0 = time.perf_counter()
         try:
             result = self._conn.execute(sql, params)
         finally:
-            ms = (time.perf_counter() - t0) * 1000
-            _record_query(name, ms)
+            _record_query(name, (time.perf_counter() - t0) * 1000)
         return result
 
     def commit(self) -> None:
@@ -312,10 +301,7 @@ class InstrumentedConnection:
         try:
             self._conn.commit()
         finally:
-            ms = (time.perf_counter() - t0) * 1000
-            _record_query("commit", ms)
-
-    # -- Transparent proxy for everything else --
+            _record_query("commit", (time.perf_counter() - t0) * 1000)
 
     def __getattr__(self, name: str) -> object:  # noqa: ANN401
         return getattr(object.__getattribute__(self, "_conn"), name)
