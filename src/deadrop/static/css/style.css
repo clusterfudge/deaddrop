@@ -732,6 +732,19 @@ textarea.form-input {
     text-decoration: underline;
 }
 
+/* High-contrast links on from-me bubble (blue background) */
+.room-message.from-me .message-body.markdown-body a,
+.room-message.from-me .message-body.markdown-body a:visited {
+    color: #e0f0ff;
+    text-decoration: underline;
+    text-decoration-color: rgba(255,255,255,0.5);
+}
+
+.room-message.from-me .message-body.markdown-body a:hover {
+    color: white;
+    text-decoration-color: white;
+}
+
 /* Horizontal rules */
 .message-body.markdown-body hr {
     border: none;
