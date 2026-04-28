@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import cache, db
+from . import cache, db, instrument
 from .auth import derive_id
 from .auth_provider import (
     extract_bearer_token,
@@ -114,6 +114,12 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Cache warming failed on startup", exc_info=True)
 
+    # Initialise the pluggable metrics sink (reads DEADROP_METRICS_SINK env var)
+    instrument.init_sink()
+
+    # Start background instrumentation tasks (event loop heartbeat + periodic sampler)
+    instrument.start_background_tasks()
+
     # Run in a background thread so urllib.request.urlopen doesn't block the
     # ASGI event loop during startup. Fire-and-forget: failures are logged but
     # never surface to callers.
@@ -163,6 +169,8 @@ async def add_timing_middleware(request: Request, call_next):
     start_time = time.perf_counter()
 
     response = await call_next(request)
+    # NOTE: endpoint label computed below — instrument.request_start/end
+    # are called after we know the endpoint pattern.
 
     duration_ms = (time.perf_counter() - start_time) * 1000
 
@@ -198,6 +206,12 @@ async def add_timing_middleware(request: Request, call_next):
         endpoint = "other"
 
     metrics.record_request(endpoint, duration_ms, status=response.status_code)
+
+    # Also emit to pluggable sink via instrument module
+    instrument.sink.timing("request.duration_ms", duration_ms, tags={"endpoint": endpoint})
+    instrument.sink.counter(
+        "request.status", tags={"status": str(response.status_code), "endpoint": endpoint}
+    )
 
     # Add timing header for debugging
     response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
@@ -2332,3 +2346,25 @@ def get_metrics(
             "identity_hash": identity_hash_cache.stats(),
         },
     }
+
+
+@app.get("/debug/state")
+def get_debug_state(
+    authorization: Annotated[str | None, Header()] = None,
+    x_admin_token: Annotated[str | None, Header()] = None,
+):
+    """Return a live system-state snapshot.
+
+    Covers event-loop lag, asyncio task counts, thread pools, process RSS,
+    GC generation stats, and active in-flight request details.
+
+    Requires admin authentication (``Authorization: Bearer <admin_token>``
+    or ``X-Admin-Token`` header).
+
+    Enable via environment:
+    - ``DEADROP_METRICS_SINK=logging`` or ``statsd`` or ``prometheus``
+      to also emit these observations to an external backend.
+    - The endpoint is always available regardless of sink setting.
+    """
+    require_admin(authorization, x_admin_token)
+    return instrument.get_debug_state()

@@ -51,14 +51,37 @@ class TestRecordQuery:
         finally:
             _request_query_buffer.reset(token)
 
-    def test_statsd_called_with_db_sql_prefix(self):
-        """_record_query emits to statsd with db.sql.<name> prefix."""
+    def test_sink_called_with_db_sql_timing(self):
+        """_record_query emits to the active instrument.sink with db.sql_ms timing."""
+        from deadrop import instrument
+
+        class CapturingSink:
+            calls: list[tuple] = []
+
+            def counter(self, name, value=1, tags=None):
+                pass
+
+            def gauge(self, name, value, tags=None):
+                pass
+
+            def histogram(self, name, value, tags=None):
+                pass
+
+            def timing(self, name, value_ms, tags=None):
+                self.calls.append((name, value_ms, tags))
+
         token = _request_query_buffer.set(None)
+        test_sink = CapturingSink()
+        original_sink = instrument.sink
         try:
-            with patch("deadrop.metrics.statsd_timing") as mock_statsd:
-                _record_query("send_message.insert", 2.5)
-                mock_statsd.assert_called_once_with("db.sql.send_message.insert", 2.5)
+            instrument.sink = test_sink
+            _record_query("send_message.insert", 2.5)
+            assert any(
+                name == "db.sql_ms" and tags == {"query": "send_message.insert"}
+                for name, _, tags in test_sink.calls
+            ), f"Expected db.sql_ms with query tag, got: {test_sink.calls}"
         finally:
+            instrument.sink = original_sink
             _request_query_buffer.reset(token)
 
     def test_multiple_records_in_order(self):
