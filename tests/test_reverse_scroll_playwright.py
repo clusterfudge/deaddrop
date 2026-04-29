@@ -33,7 +33,10 @@ import threading
 import time
 
 import pytest
+
 from playwright.sync_api import sync_playwright
+
+pytestmark = pytest.mark.integration
 
 # Paths
 REPO_ROOT = pathlib.Path(__file__).parent.parent
