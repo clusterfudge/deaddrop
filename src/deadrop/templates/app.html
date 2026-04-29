@@ -928,17 +928,24 @@
             const cacheKey = `room_messages_${currentRoomId}`;
             localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
             
-            // Re-render preserving scroll position.
-            // With column-reverse, the "top" in visual terms is the bottom of
-            // the DOM scroll.  We record scrollHeight before, render, then
-            // adjust scrollTop by the delta so the viewport stays on the same
-            // messages.
+            // Preserve scroll position across the DOM replacement.
+            // column-reverse: scrollTop=0 is the bottom (newest); negative
+            // values mean scrolled up toward older messages.
+            // Strategy: snapshot scrollHeight+scrollTop before innerHTML
+            // replacement, then restore in rAF (post-layout, post-paint)
+            // so late reflows from image loads don't re-jump us.
             const prevScrollHeight = list.scrollHeight;
+            const prevScrollTop = list.scrollTop;
             renderRoomMessages({skipReadCursor: true});
-            const newScrollHeight = list.scrollHeight;
-            // column-reverse: scrollTop is negative (or 0 at bottom).
-            // Adding the height delta keeps the same content in view.
-            list.scrollTop -= (newScrollHeight - prevScrollHeight);
+            requestAnimationFrame(() => {
+                // New content was prepended (visually at the "top", i.e.
+                // the most-negative scrollTop region in column-reverse).
+                // The delta in scrollHeight is how much the content grew;
+                // we subtract it from scrollTop (making it more negative)
+                // to keep the same messages in view.
+                const newScrollHeight = list.scrollHeight;
+                list.scrollTop = prevScrollTop - (newScrollHeight - prevScrollHeight);
+            });
             
             console.log(`Loaded ${olderPage.length} older messages (total: ${roomMessages.length})`);
         } catch (e) {
@@ -1391,18 +1398,25 @@
         }
     });
     
-    // Scroll-up to load older messages + scroll-to-bottom to mark as read
+    // Scroll-up to load older messages + scroll-to-bottom to mark as read.
+    // Debounced: IntersectionObserver on the sentinel would be ideal, but a
+    // debounced scroll listener is simpler and avoids races on inertial scroll.
+    let _scrollDebounceTimer = null;
     document.getElementById('room-message-list').addEventListener('scroll', () => {
         const list = document.getElementById('room-message-list');
         
         // column-reverse: scrollTop is 0 at bottom, negative when scrolled up.
         // When the user scrolls near the "top" (oldest, most negative scrollTop),
-        // load more history.
+        // load more history. Debounce to avoid multiple in-flight fetches.
         if (roomHasOlderMessages && !roomLoadingOlder) {
             const scrolledUp = -list.scrollTop;
             const threshold = list.scrollHeight - list.clientHeight - 200;
             if (scrolledUp >= threshold) {
-                loadOlderRoomMessages();
+                if (_scrollDebounceTimer) clearTimeout(_scrollDebounceTimer);
+                _scrollDebounceTimer = setTimeout(() => {
+                    _scrollDebounceTimer = null;
+                    loadOlderRoomMessages();
+                }, 80);
             }
         }
         

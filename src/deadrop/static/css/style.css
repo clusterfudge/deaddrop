@@ -250,6 +250,7 @@ textarea.form-input {
     overflow-y: auto;
     flex: 1;
     min-height: 0;  /* Allow shrinking in flex container */
+    overflow-anchor: none;  /* We manage scroll anchoring manually on backscroll */
 }
 
 .message {
