@@ -897,56 +897,100 @@
     
     /**
      * Load older messages when the user scrolls to the top.
-     * Uses the `before` cursor to fetch the page preceding the oldest
-     * message currently loaded.
+     *
+     * Uses incremental DOM insertion (DocumentFragment appended to the
+     * physical end of the list) rather than a full innerHTML replacement.
+     * In a column-reverse container the physical end of the DOM is the
+     * *visual top* — so appending is the correct "prepend" operation.
+     *
+     * Because existing DOM nodes are preserved, `overflow-anchor: auto`
+     * keeps the currently-visible message anchored without any manual
+     * scrollTop arithmetic.
      */
     async function loadOlderRoomMessages() {
         if (roomLoadingOlder || !roomHasOlderMessages || roomMessages.length === 0) return;
         roomLoadingOlder = true;
-        
+
         const list = document.getElementById('room-message-list');
-        
+
         try {
             // The oldest message we have is the first element (chronological order)
             const oldestMid = roomMessages[0].mid;
-            
+
             const result = await DeadropAPI.getRoomMessages(
                 credentials, currentRoomId, { beforeMid: oldestMid, limit: ROOM_PAGE_SIZE });
             const olderPage = result?.messages || [];
-            
+
             if (olderPage.length === 0) {
                 roomHasOlderMessages = false;
+                // Remove sentinel — nothing more to load
+                const sentinel = document.getElementById('room-load-more');
+                if (sentinel) sentinel.remove();
                 return;
             }
-            
+
             roomHasOlderMessages = olderPage.length >= ROOM_PAGE_SIZE;
-            
-            // Prepend older messages (they come in chronological order)
+
+            // Prepend to data model (older messages go before existing ones)
             roomMessages = [...olderPage, ...roomMessages];
-            
+
             // Save to cache
             const cacheKey = `room_messages_${currentRoomId}`;
             localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
-            
-            // Preserve scroll position across the DOM replacement.
-            // column-reverse: scrollTop=0 is the bottom (newest); negative
-            // values mean scrolled up toward older messages.
-            // Strategy: snapshot scrollHeight+scrollTop before innerHTML
-            // replacement, then restore in rAF (post-layout, post-paint)
-            // so late reflows from image loads don't re-jump us.
-            const prevScrollHeight = list.scrollHeight;
-            const prevScrollTop = list.scrollTop;
-            renderRoomMessages({skipReadCursor: true});
-            requestAnimationFrame(() => {
-                // New content was prepended (visually at the "top", i.e.
-                // the most-negative scrollTop region in column-reverse).
-                // The delta in scrollHeight is how much the content grew;
-                // we subtract it from scrollTop (making it more negative)
-                // to keep the same messages in view.
-                const newScrollHeight = list.scrollHeight;
-                list.scrollTop = prevScrollTop - (newScrollHeight - prevScrollHeight);
+
+            // Build reaction map across the full updated message set
+            const reactionMap = buildReactionMap(roomMessages);
+
+            // Filter out reactions from display set
+            const olderDisplay = olderPage.filter(m => m.content_type !== 'reaction');
+
+            // Build a DocumentFragment with the older messages.
+            // column-reverse: DOM order is newest→oldest, so older messages
+            // belong at the physical END of the list (= visual top).
+            // olderPage is already in chronological order (oldest→newest),
+            // so we reverse it to maintain newest→oldest DOM order.
+            const fragment = document.createDocumentFragment();
+            for (let i = olderDisplay.length - 1; i >= 0; i--) {
+                fragment.appendChild(renderMessageElement(olderDisplay[i], reactionMap));
+            }
+
+            // If there are still more pages, keep the sentinel at the
+            // very end (visual top); otherwise discard it.
+            const existingSentinel = document.getElementById('room-load-more');
+            if (roomHasOlderMessages) {
+                if (!existingSentinel) {
+                    const sentinel = document.createElement('div');
+                    sentinel.id = 'room-load-more';
+                    sentinel.className = 'load-more-sentinel';
+                    sentinel.style.cssText = 'text-align:center;padding:12px;color:var(--text-muted);font-size:13px;';
+                    sentinel.textContent = 'Loading older messages…';
+                    fragment.appendChild(sentinel);
+                } else {
+                    // Move existing sentinel to the end of the fragment
+                    // (it will land at the physical end = visual top)
+                    existingSentinel.remove();
+                    fragment.appendChild(existingSentinel);
+                }
+            } else {
+                if (existingSentinel) existingSentinel.remove();
+            }
+
+            // Append fragment to DOM — overflow-anchor: auto preserves
+            // the visible viewport automatically; no scrollTop math needed.
+            list.appendChild(fragment);
+
+            // Highlight any code blocks in the newly inserted elements
+            highlightCodeBlocks(list);
+
+            // Auto-load image placeholders in newly added messages
+            list.querySelectorAll('.image-placeholder').forEach(el => {
+                const attId = el.dataset.attachmentId;
+                if (attId && !el.dataset.loading) {
+                    el.dataset.loading = 'true';
+                    loadImageInline(el, attId);
+                }
             });
-            
+
             console.log(`Loaded ${olderPage.length} older messages (total: ${roomMessages.length})`);
         } catch (e) {
             console.error('Failed to load older messages:', e);
@@ -984,6 +1028,26 @@
         return `<div class="reaction-badges">${badges}<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button></div>`;
     }
     
+    /**
+     * Render a single room message into an HTMLElement.
+     * Shared by the full-render and incremental-prepend paths.
+     */
+    function renderMessageElement(msg, reactionMap) {
+        const isMe = msg.from_id === credentials.id;
+        const isPending = msg.pending;
+        const el = document.createElement('div');
+        el.className = `room-message${isMe ? ' from-me' : ''}${isPending ? ' pending' : ''}`;
+        el.dataset.mid = msg.mid;
+        el.innerHTML = `
+            <div class="sender-name">${getMemberName(msg.from_id)}</div>
+            <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
+            ${renderAttachments(msg)}
+            ${renderReactionBadges(msg.mid, reactionMap)}
+            <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
+        `;
+        return el;
+    }
+
     function renderRoomMessages({skipReadCursor = false} = {}) {
         const list = document.getElementById('room-message-list');
         
@@ -993,31 +1057,30 @@
         // Filter out reaction messages from the main list
         const displayMessages = roomMessages.filter(m => m.content_type !== 'reaction');
         
-        // Reverse for column-reverse display (newest at bottom visually)
-        const reversed = [...displayMessages].reverse();
+        // column-reverse layout: newest message must be first in DOM order
+        // (DOM top = visual bottom, DOM bottom = visual top / oldest).
+        // We build the full list newest→oldest so the browser renders
+        // newest at the bottom without any scrollTop manipulation.
+        const fragment = document.createDocumentFragment();
 
-        // Show a "load more" sentinel at the visual top (DOM bottom in
-        // column-reverse) when there are older messages to fetch.
-        const loadMoreHtml = roomHasOlderMessages
-            ? '<div id="room-load-more" class="load-more-sentinel" style="text-align:center;padding:12px;color:var(--text-muted);font-size:13px;">Loading older messages…</div>'
-            : '';
-        
-        list.innerHTML = reversed.map(msg => {
-            const isMe = msg.from_id === credentials.id;
-            const isPending = msg.pending;
-            
-            return `
-                <div class="room-message ${isMe ? 'from-me' : ''} ${isPending ? 'pending' : ''}" data-mid="${msg.mid}">
-                    <div class="sender-name">${getMemberName(msg.from_id)}</div>
-                    <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
-                    ${renderAttachments(msg)}
-                    ${renderReactionBadges(msg.mid, reactionMap)}
-                    <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
-                </div>
-            `;
-        }).join('') + loadMoreHtml;
-        
-        // No need to scroll - column-reverse keeps us at bottom
+        // Newest first (DOM order matches visual order for column-reverse)
+        for (let i = displayMessages.length - 1; i >= 0; i--) {
+            fragment.appendChild(renderMessageElement(displayMessages[i], reactionMap));
+        }
+
+        // Sentinel lives at the physical end of the DOM (= visual top).
+        // It is the anchor for IntersectionObserver-triggered backfill.
+        if (roomHasOlderMessages) {
+            const sentinel = document.createElement('div');
+            sentinel.id = 'room-load-more';
+            sentinel.className = 'load-more-sentinel';
+            sentinel.style.cssText = 'text-align:center;padding:12px;color:var(--text-muted);font-size:13px;';
+            sentinel.textContent = 'Loading older messages…';
+            fragment.appendChild(sentinel);
+        }
+
+        list.innerHTML = '';
+        list.appendChild(fragment);
         
         // Apply syntax highlighting to code blocks
         highlightCodeBlocks(list);
