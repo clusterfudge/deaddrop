@@ -12,6 +12,8 @@
     --border: #e0e0e0;
     --input-bg: #ffffff;
     --code-bg: rgba(0, 0, 0, 0.06);
+    --code-block-bg: #f6f8fa;        /* Light slate, matches github.min.css hljs theme */
+    --code-block-text: #24292f;      /* Dark slate for readable contrast */
     --table-header-bg: rgba(0, 0, 0, 0.04);
     --unread-bg: rgba(37, 99, 235, 0.05);
 
@@ -40,6 +42,8 @@
     --border: #506c90;          /* was #2a3448 — matches border-color */
     --input-bg: #1a2332;
     --code-bg: rgba(255, 255, 255, 0.07);
+    --code-block-bg: #1e1e2e;        /* Catppuccin mocha — dark bg with readable syntax colors */
+    --code-block-text: #cdd6f4;
     --table-header-bg: rgba(255, 255, 255, 0.05);
     --unread-bg: rgba(77, 142, 240, 0.10); /* was 0.08 — slightly more visible */
 
@@ -647,10 +651,10 @@ textarea.form-input {
     font-size: 0.88em;
 }
 
-/* Code blocks */
+/* Code blocks — theme-aware background + text, syntax colors from highlight.js theme */
 .message-body.markdown-body pre {
-    background: #1e1e2e;
-    color: #cdd6f4;
+    background: var(--code-block-bg);
+    color: var(--code-block-text);
     padding: 14px 16px;
     border-radius: var(--radius);
     overflow-x: auto;
@@ -658,6 +662,7 @@ textarea.form-input {
     font-size: 13px;
     line-height: 1.5;
     -webkit-overflow-scrolling: touch;
+    border: 1px solid var(--border-color);
 }
 
 .message-body.markdown-body pre code {
