@@ -496,22 +496,14 @@ async def _run_read(fn, *args):
 
     ContextVar propagation: captures the current context so that the per-request
     query buffer (metrics.py) is visible to timed_query decorators in the thread.
-
-    Hrana 404 retry: transient `stream not found` errors from Turso's Hrana
-    protocol are retried silently via db._execute_with_retry(). These happen
-    when a connection's stream id expires; reconnecting resolves it.
     """
     loop = asyncio.get_event_loop()
     executor = db.get_read_executor()
     ctx = contextvars.copy_context()
 
-    # Wrap fn in retry logic for Hrana stream errors
-    def _wrapped():
-        return db._execute_with_retry(lambda: fn(*args))
-
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(executor, ctx.run, _wrapped),
+            loop.run_in_executor(executor, ctx.run, fn, *args),
             timeout=DB_OPERATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -541,20 +533,14 @@ async def _run_write(fn, *args):
 
     ContextVar propagation: captures the current context so that the per-request
     query buffer (metrics.py) is visible to timed_query decorators in the thread.
-
-    Hrana 404 retry: see _run_read. Same silent-retry behavior for writes.
     """
     loop = asyncio.get_event_loop()
     executor = db.get_write_executor()
     ctx = contextvars.copy_context()
 
-    # Wrap fn in retry logic for Hrana stream errors
-    def _wrapped():
-        return db._execute_with_retry(lambda: fn(*args))
-
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(executor, ctx.run, _wrapped),
+            loop.run_in_executor(executor, ctx.run, fn, *args),
             timeout=DB_OPERATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
