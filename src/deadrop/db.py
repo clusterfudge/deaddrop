@@ -3171,3 +3171,54 @@ def get_batch_message_attachments(
             att["created_at"] = row[5]
         results.setdefault(att["message_mid"], []).append(att)
     return results
+
+
+def get_topic_latest(
+    topic_key: str,
+    ns: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[str, str | None] | None:
+    """Get the latest (mid, sender_id) for a subscribe topic.
+
+    Used by the event bus cold-start fallback to seed _latest from the DB
+    when the process has restarted and hasn't seen a publish for a topic yet.
+
+    Args:
+        topic_key: Topic in "room:{room_id}" or "inbox:{identity_id}" format.
+        ns: Namespace ID (required for inbox topics, ignored for room topics).
+        conn: Optional database connection.
+
+    Returns:
+        (latest_mid, sender_id) or None if no messages exist.
+    """
+    conn = _get_conn(conn)
+
+    if topic_key.startswith("room:"):
+        room_id = topic_key[len("room:"):]
+        cursor = conn.execute(
+            "SELECT mid, from_id FROM room_messages "
+            "WHERE room_id = ? ORDER BY mid DESC LIMIT 1",
+            (room_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return (row[0], row[1])
+        return None
+
+    elif topic_key.startswith("inbox:"):
+        identity_id = topic_key[len("inbox:"):]
+        if ns is None:
+            return None
+        cursor = conn.execute(
+            "SELECT mid, from_id FROM messages "
+            "WHERE ns = ? AND to_id = ? "
+            "AND archived_at IS NULL "
+            "ORDER BY mid DESC LIMIT 1",
+            (ns, identity_id),
+        )
+        row = cursor.fetchone()
+        if row:
+            return (row[0], row[1])
+        return None
+
+    return None

@@ -21,7 +21,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -119,11 +119,22 @@ class InMemoryEventBus(EventBus):
     coroutines.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        db_fallback: "Callable[[str, str, str | None], tuple[str, str | None] | None] | None" = None,
+    ) -> None:
         # Latest event per (namespace, topic): maps to (mid, sender_id)
         self._latest: dict[str, dict[str, tuple[str, str | None]]] = defaultdict(dict)
         # One condition per namespace for waiter notification
         self._conditions: dict[str, asyncio.Condition] = {}
+        # Optional DB fallback for cold-start seeding.  Called as
+        # db_fallback(namespace, topic_key, last_seen_mid) and returns
+        # (latest_mid, sender_id) if the DB has a message newer than
+        # last_seen_mid, else None.  Only invoked when _latest has no
+        # entry for a topic (i.e. the process hasn't seen a publish for
+        # it yet).  The result is cached in _latest so the DB is only
+        # hit once per topic per process lifetime.
+        self._db_fallback = db_fallback
 
     def _get_condition(self, namespace: str) -> asyncio.Condition:
         """Get or create a Condition for a namespace."""
@@ -162,8 +173,23 @@ class InMemoryEventBus(EventBus):
 
         for topic, last_seen in topics.items():
             entry = ns_latest.get(topic)
+            if entry is None and self._db_fallback is not None:
+                # Cold start: no publish has happened for this topic in
+                # this process.  Ask the DB for the latest message so we
+                # can detect messages that existed before we started.
+                try:
+                    db_result = self._db_fallback(namespace, topic, last_seen)
+                except Exception:
+                    logger.warning(
+                        "db_fallback failed for topic %s", topic, exc_info=True
+                    )
+                    db_result = None
+                if db_result is not None:
+                    # Cache it so we never hit the DB for this topic again.
+                    self._latest[namespace][topic] = db_result
+                    entry = db_result
             if entry is None:
-                # No messages published for this topic yet
+                # Still nothing — topic genuinely has no messages
                 continue
             mid, sender_id = entry
             if last_seen is None:
@@ -254,6 +280,23 @@ class InMemoryEventBus(EventBus):
 _event_bus: EventBus | None = None
 
 
+def _default_db_fallback(
+    namespace: str, topic_key: str, last_seen: str | None
+) -> tuple[str, str | None] | None:
+    """DB fallback for cold-start seeding of InMemoryEventBus.
+
+    Queries the DB for the latest message in a topic so that subscribe()
+    can detect messages that existed before this process started.
+    """
+    try:
+        from . import db
+
+        return db.get_topic_latest(topic_key, ns=namespace)
+    except Exception:
+        logger.warning("DB fallback query failed for %s", topic_key, exc_info=True)
+        return None
+
+
 def get_event_bus() -> EventBus:
     """Get the global event bus instance.
 
@@ -262,7 +305,7 @@ def get_event_bus() -> EventBus:
     """
     global _event_bus
     if _event_bus is None:
-        _event_bus = InMemoryEventBus()
+        _event_bus = InMemoryEventBus(db_fallback=_default_db_fallback)
     return _event_bus
 
 
