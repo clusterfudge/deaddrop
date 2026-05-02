@@ -422,6 +422,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                         replica_path,
                         sync_url=db_url,
                         auth_token=auth_token,
+                        isolation_level=None,  # autocommit: eliminates commit roundtrip
                     ),
                     timeout=LIBSQL_CONNECT_TIMEOUT,
                     description=f"libsql.connect(replica) on {thread_name}",
@@ -451,7 +452,11 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
             logging.info(f"Creating libsql connection on {thread_name} to {db_url[:50]}...")
             try:
                 _local.libsql_conn = _run_with_timeout(
-                    lambda: libsql.connect(db_url, auth_token=auth_token),
+                    lambda: libsql.connect(
+                        db_url,
+                        auth_token=auth_token,
+                        isolation_level=None,  # autocommit: eliminates commit roundtrip
+                    ),
                     timeout=LIBSQL_CONNECT_TIMEOUT,
                     description=f"libsql.connect() on {thread_name}",
                 )
