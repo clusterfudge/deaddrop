@@ -144,8 +144,8 @@ def _is_valid_uuid7(value: str) -> bool:
 
 
 def _require_uuid7(value: str | None, field_name: str) -> None:
-    """Raise HTTPException 400 if value is not None and not a valid UUID v7."""
-    if value is not None and not _is_valid_uuid7(value):
+    """Raise HTTPException 400 if value is a non-empty string that isn't UUID v7."""
+    if value is not None and value != "" and not _is_valid_uuid7(value):
         raise HTTPException(400, f"Invalid {field_name}: must be a UUID v7 (got {value!r})")
 
 

@@ -29,6 +29,10 @@ class TestUUID7Validation:
         """None values should pass (they mean 'not provided')."""
         _require_uuid7(None, "test")  # should not raise
 
+    def test_require_uuid7_empty_string_is_ok(self):
+        """Empty string should pass (watcher sends '' for uninitialized cursor)."""
+        _require_uuid7("", "test")  # should not raise
+
     def test_require_uuid7_valid(self):
         _require_uuid7("069f56ee-6ead-7394-8000-20d966e7dc6e", "test")
 
