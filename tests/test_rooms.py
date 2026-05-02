@@ -317,22 +317,33 @@ class TestRoomMessages:
 
         assert msg["content_type"] == "application/json"
 
-    def test_send_room_message_not_member(self):
-        """Sending message as non-member should fail."""
+    def test_send_room_message_non_member_inserts(self):
+        """DB layer no longer checks membership — auth is in the API layer.
+
+        send_room_message trusts its caller to have verified membership.
+        This saves 2 Turso roundtrips (~600-1000ms) on every write.
+        """
         ns = db.create_namespace()
         alice = db.create_identity(ns["ns"])
         bob = db.create_identity(ns["ns"])
         room = db.create_room(ns["ns"], alice["id"])
 
-        with pytest.raises(ValueError, match="not a member"):
-            db.send_room_message(room["room_id"], bob["id"], "Hello!")
+        # DB layer allows the insert — API layer would have blocked this
+        msg = db.send_room_message(room["room_id"], bob["id"], "Hello!")
+        assert msg["mid"] is not None
 
     def test_send_room_message_invalid_room(self):
-        """Sending message to non-existent room should fail."""
+        """Sending message to non-existent room fails with FK constraint.
+
+        Room existence check was moved to the API layer, but the DB
+        foreign key constraint on room_id still prevents orphan inserts.
+        """
+        import sqlite3
+
         ns = db.create_namespace()
         alice = db.create_identity(ns["ns"])
 
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(sqlite3.IntegrityError):
             db.send_room_message("nonexistent-room-id", alice["id"], "Hello!")
 
     def test_get_room_messages(self):

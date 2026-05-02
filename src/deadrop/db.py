@@ -2356,13 +2356,9 @@ def send_room_message(
     """
     conn = _get_conn(conn)
 
-    # Verify room exists and sender is a member — both cached in the hot path.
-    room = get_room(room_id, conn=conn)
-    if not room:
-        raise ValueError(f"Room {room_id} not found")
-
-    if not is_room_member(room_id, from_id, conn=conn):
-        raise ValueError(f"Identity {from_id} is not a member of room {room_id}")
+    # Auth (room existence + membership) is handled by the API layer
+    # via _require_room_member() before this function is called.
+    # Removing redundant checks here saves 2 Turso roundtrips (~300-500ms each).
 
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
