@@ -132,6 +132,23 @@ async def lifespan(app: FastAPI):
     db.close_db()
 
 
+
+import re as _re
+
+_UUID7_RE = _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", _re.I)
+
+
+def _is_valid_uuid7(value: str) -> bool:
+    """Check if a string is a valid UUID v7."""
+    return bool(_UUID7_RE.match(value))
+
+
+def _require_uuid7(value: str | None, field_name: str) -> None:
+    """Raise HTTPException 400 if value is not None and not a valid UUID v7."""
+    if value is not None and not _is_valid_uuid7(value):
+        raise HTTPException(400, f"Invalid {field_name}: must be a UUID v7 (got {value!r})")
+
+
 app = FastAPI(
     title="deadrop",
     description="Minimal inbox-only messaging for agents",
@@ -1127,6 +1144,8 @@ async def get_inbox(
     # Only mailbox owner can read their inbox
     await _require_inbox_secret(ns, identity_id, x_inbox_secret)
 
+    _require_uuid7(after, "after")
+
     # Fetch and return messages
     messages = await _run_read(
         functools.partial(
@@ -1763,6 +1782,9 @@ async def get_room_messages(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
+    _require_uuid7(after, "after")
+    _require_uuid7(before, "before")
+
     messages = await _run_read(
         functools.partial(
             db.get_room_messages,
@@ -1807,6 +1829,8 @@ async def send_room_message(
 
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
+
+    _require_uuid7(request.reference_mid, "reference_mid")
 
     # Validate attachments: count, content-type allowlist, sizes
     validated_attachments: list[tuple] = []  # (att, raw_size)
@@ -1901,6 +1925,8 @@ async def update_read_cursor(
 
     The cursor tracks the last message the user has read.
     """
+    _require_uuid7(request.last_read_mid, "last_read_mid")
+
     # Fast-path: if caches are warm, auth is free and we only need one
     # executor dispatch (for the write).  On cache miss we combine auth+write
     # into a single _run_sync to avoid two sequential round-trips.
@@ -2135,6 +2161,9 @@ async def subscribe(
         raise HTTPException(400, "At least one topic is required")
 
     await _validate_subscription_topics(ns, request.topics, caller_id)
+
+    for topic_key, cursor in request.topics.items():
+        _require_uuid7(cursor, f"cursor for {topic_key}")
 
     event_bus = get_event_bus()
 
