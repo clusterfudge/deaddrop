@@ -1348,9 +1348,15 @@
             // Deduplicate: use a Set of existing mids
             const existingMids = new Set(roomMessages.map(m => m.mid));
             
-            const afterMid = roomMessages.length > 0 
-                ? roomMessages[roomMessages.length - 1].mid 
-                : null;
+            // Use the last *confirmed* message as cursor — skip optimistic
+            // pending messages whose mids are not valid UUIDs.
+            let afterMid = null;
+            for (let i = roomMessages.length - 1; i >= 0; i--) {
+                if (!roomMessages[i].pending && !roomMessages[i].mid.startsWith('pending-')) {
+                    afterMid = roomMessages[i].mid;
+                    break;
+                }
+            }
             
             const result = await DeadropAPI.getRoomMessages(credentials, roomId, { afterMid });
             
