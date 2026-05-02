@@ -105,22 +105,6 @@ DB_POOL_SIZE = int(os.environ.get("DEADROP_DB_POOL_SIZE", str(READ_POOL_SIZE)))
 
 
 
-def sync_replica() -> None:
-    """Sync the embedded replica with the remote Turso database.
-
-    Call after writes to ensure read connections see the latest data.
-    No-op if not using embedded replica mode.
-    """
-    if not os.environ.get("DEADROP_REPLICA_PATH"):
-        return
-    conn = getattr(_local, "libsql_conn", None)
-    if conn is not None and hasattr(conn, "sync"):
-        try:
-            conn.sync()
-        except Exception as e:
-            import logging
-            logging.warning(f"Replica sync failed: {e}")
-
 
 def get_read_executor():
     """Get the executor for read (SELECT-only) database operations.
@@ -402,73 +386,27 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
         thread_name = threading.current_thread().name
         auth_token = os.environ.get("TURSO_AUTH_TOKEN", "")
-        replica_path = os.environ.get("DEADROP_REPLICA_PATH", "")
 
-        if replica_path:
-            # Embedded replica mode: local SQLite file synced from Turso.
-            # Reads are sub-millisecond (local disk), writes go to remote
-            # and sync back. Initial sync downloads the full DB (~seconds),
-            # subsequent syncs are incremental (~milliseconds).
-            #
-            # Each thread gets its own connection to the same replica file.
-            # The libsql library handles internal locking.
-            logging.info(
-                f"Creating embedded replica connection on {thread_name}: "
-                f"local={replica_path}, sync_url={db_url[:50]}..."
+        logging.info(f"Creating libsql connection on {thread_name} to {db_url[:50]}...")
+        try:
+            _local.libsql_conn = _run_with_timeout(
+                lambda: libsql.connect(
+                    db_url,
+                    auth_token=auth_token,
+                    isolation_level=None,  # autocommit: eliminates commit roundtrip
+                ),
+                timeout=LIBSQL_CONNECT_TIMEOUT,
+                description=f"libsql.connect() on {thread_name}",
             )
-            try:
-                conn = _run_with_timeout(
-                    lambda: libsql.connect(
-                        replica_path,
-                        sync_url=db_url,
-                        auth_token=auth_token,
-                        isolation_level=None,  # autocommit: eliminates commit roundtrip
-                    ),
-                    timeout=LIBSQL_CONNECT_TIMEOUT,
-                    description=f"libsql.connect(replica) on {thread_name}",
-                )
-                # Initial sync to pull down latest data from remote.
-                # Capture conn directly — can't use _local in the timeout
-                # thread (thread-local storage doesn't carry over).
-                _run_with_timeout(
-                    lambda: conn.sync(),
-                    timeout=LIBSQL_CONNECT_TIMEOUT,
-                    description=f"initial sync on {thread_name}",
-                )
-                _local.libsql_conn = conn
-                _is_libsql = True
-            except TimeoutError:
-                logging.error(
-                    f"Embedded replica connect/sync timed out after {LIBSQL_CONNECT_TIMEOUT}s"
-                )
-                raise RuntimeError(
-                    f"Timed out connecting embedded replica after {LIBSQL_CONNECT_TIMEOUT}s"
-                )
-            except Exception as e:
-                logging.error(f"Failed to create embedded replica: {e}")
-                raise RuntimeError(f"Failed to create embedded replica: {e}") from e
-        else:
-            # Remote-only mode (Hrana protocol): every query goes over the network.
-            logging.info(f"Creating libsql connection on {thread_name} to {db_url[:50]}...")
-            try:
-                _local.libsql_conn = _run_with_timeout(
-                    lambda: libsql.connect(
-                        db_url,
-                        auth_token=auth_token,
-                        isolation_level=None,  # autocommit: eliminates commit roundtrip
-                    ),
-                    timeout=LIBSQL_CONNECT_TIMEOUT,
-                    description=f"libsql.connect() on {thread_name}",
-                )
-                _is_libsql = True
-            except TimeoutError:
-                logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
-                raise RuntimeError(
-                    f"Timed out connecting to Turso database after {LIBSQL_CONNECT_TIMEOUT}s"
-                )
-            except Exception as e:
-                logging.error(f"Failed to connect to libsql: {e}")
-                raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
+            _is_libsql = True
+        except TimeoutError:
+            logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
+            raise RuntimeError(
+                f"Timed out connecting to Turso database after {LIBSQL_CONNECT_TIMEOUT}s"
+            )
+        except Exception as e:
+            logging.error(f"Failed to connect to libsql: {e}")
+            raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
 
         return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
 
