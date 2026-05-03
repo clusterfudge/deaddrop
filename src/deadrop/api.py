@@ -2091,7 +2091,8 @@ async def get_attachment(
         # Look up the message's room_id to verify membership
         conn = db.get_connection()
         cursor = conn.execute(
-            "SELECT room_id FROM room_messages WHERE mid = ?", (attachment["message_mid"],)
+            "SELECT room_id FROM room_messages WHERE mid = ?", (attachment["message_mid"],),
+            name="get_attachment.lookup_room",
         )
         row = cursor.fetchone()
         if not row:

@@ -288,7 +288,25 @@ class InstrumentedConnection:
     def __init__(self, conn: _sqlite3.Connection) -> None:
         object.__setattr__(self, "_conn", conn)
 
-    def execute(self, sql: str, params=(), *, name: str = "unnamed") -> _sqlite3.Cursor:
+    _MISSING = object()
+
+    def execute(self, sql: str, params=(), *, name: str | object = _MISSING) -> _sqlite3.Cursor:
+        if name is self._MISSING:
+            # Auto-name PRAGMA and utility SQL; reject unnamed real queries
+            sql_upper = sql.strip().upper()
+            if sql_upper.startswith("PRAGMA"):
+                name = "pragma"
+            elif sql_upper in ("SELECT 1",):
+                name = "health_check"
+            elif sql_upper.startswith(("CREATE ", "ALTER ", "DROP ")):
+                name = "ddl"
+            elif "SQLITE_MASTER" in sql_upper:
+                name = "sqlite_master"
+            else:
+                raise TypeError(
+                    f"InstrumentedConnection.execute() requires name= for query: "
+                    f"{sql[:80]!r}"
+                )
         t0 = time.perf_counter()
         try:
             result = self._conn.execute(sql, params)

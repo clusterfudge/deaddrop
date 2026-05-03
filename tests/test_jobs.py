@@ -24,6 +24,7 @@ def expire_message_immediately(ns: str, to_id: str, mid: str):
     conn.execute(
         "UPDATE messages SET expires_at = ? WHERE ns = ? AND to_id = ? AND mid = ?",
         (past_time, ns, to_id, mid),
+        name="test_expire_message",
     )
     conn.commit()
 
@@ -73,7 +74,7 @@ class TestTTLProcessing:
 
         # Verify message is gone
         conn = db.get_connection()
-        row = conn.execute("SELECT * FROM messages WHERE mid = ?", (mid,)).fetchone()
+        row = conn.execute("SELECT * FROM messages WHERE mid = ?", (mid,), name="test_select_message").fetchone()
         assert row is None
 
     def test_expired_messages_archived_not_deleted(self):
@@ -110,7 +111,7 @@ class TestTTLProcessing:
 
             # Message should still exist (not deleted)
             conn = db.get_connection()
-            row = conn.execute("SELECT * FROM messages WHERE mid = ?", (mid,)).fetchone()
+            row = conn.execute("SELECT * FROM messages WHERE mid = ?", (mid,), name="test_select_message").fetchone()
             assert row is not None
 
     def test_dry_run(self):
@@ -139,7 +140,7 @@ class TestTTLProcessing:
 
         # Message should still exist
         conn = db.get_connection()
-        row = conn.execute("SELECT * FROM messages WHERE mid = ?", (result["mid"],)).fetchone()
+        row = conn.execute("SELECT * FROM messages WHERE mid = ?", (result["mid"],), name="test_select_message").fetchone()
         assert row is not None
 
 

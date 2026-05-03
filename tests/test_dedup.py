@@ -127,7 +127,7 @@ class TestDirectMessageDedup:
         window = db.DEDUP_WINDOW_SECONDS
         past = (datetime.now(timezone.utc) - timedelta(seconds=window + 10)).isoformat()
         conn = db._get_conn(None)
-        conn.execute("UPDATE messages SET created_at = ? WHERE mid = ?", (past, msg1["mid"]))
+        conn.execute("UPDATE messages SET created_at = ? WHERE mid = ?", (past, msg1["mid"]), name="test.expire_dedup_window")
         conn.commit()
 
         msg2 = db.send_message(ns, alice_id, bob_id, "Hello!")
@@ -267,7 +267,7 @@ class TestRoomMessageDedup:
         window = db.DEDUP_WINDOW_SECONDS
         past = (datetime.now(timezone.utc) - timedelta(seconds=window + 10)).isoformat()
         conn = db._get_conn(None)
-        conn.execute("UPDATE room_messages SET created_at = ? WHERE mid = ?", (past, msg1["mid"]))
+        conn.execute("UPDATE room_messages SET created_at = ? WHERE mid = ?", (past, msg1["mid"]), name="test.expire_dedup_window")
         conn.commit()
 
         msg2 = db.send_room_message(room_id, alice_id, "Hello!")

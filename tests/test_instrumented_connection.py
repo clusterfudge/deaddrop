@@ -170,20 +170,21 @@ class TestInstrumentedConnection:
 
     # -- unnamed fallback --
 
-    def test_execute_without_name_emits_unnamed(self, instrumented):
-        """execute() without name= kwarg records as 'unnamed'."""
+    def test_execute_without_name_raises_for_real_queries(self, instrumented):
+        """execute() without name= raises TypeError for non-utility queries."""
+        with pytest.raises(TypeError, match="requires name="):
+            instrumented.execute("SELECT * FROM test_table")
+
+    def test_execute_utility_sql_auto_names(self, instrumented):
+        """Utility SQL (SELECT 1, PRAGMA, DDL) auto-names without requiring name=."""
         buf: list[dict] = []
         token = _request_query_buffer.set(buf)
         try:
-            instrumented.execute("SELECT * FROM test_table")
-            assert len(buf) == 1
-            assert buf[0]["name"] == "unnamed"
+            cursor = instrumented.execute("SELECT 1")
+            assert cursor.fetchone()[0] == 1
+            assert buf[0]["name"] == "health_check"
         finally:
             _request_query_buffer.reset(token)
-
-    def test_execute_unnamed_still_returns_cursor(self, instrumented):
-        cursor = instrumented.execute("SELECT 1")
-        assert cursor.fetchone()[0] == 1
 
     # -- timing properties --
 
@@ -333,22 +334,23 @@ class TestIntegrationNamedQueriesInBuffer:
         names = [q["name"] for q in captured[0]["db_queries"]]
         assert "commit" in names, f"Expected 'commit' in {names}"
 
-    def test_no_inference_all_names_explicit_or_unnamed(self, client, admin_headers):
-        """No inferred names like 'select.namespaces' — only explicit names or 'unnamed'."""
+    def test_no_unnamed_queries_in_request(self, client, admin_headers):
+        """All queries in a request must have explicit names — no 'unnamed' entries."""
         captured = self._capture_slow_request(
             lambda: client.post("/admin/namespaces", json={}, headers=admin_headers)
         )
         assert len(captured) >= 1
         names = [q["name"] for q in captured[0]["db_queries"]]
         for name in names:
-            # No dot-separated SQL-inferred names (those were the old design)
+            # No SQL-verb-inferred names (those were the old design)
             assert not (
                 name.startswith("select.")
                 or name.startswith("insert.")
                 or name.startswith("update.")
                 or name.startswith("delete.")
-                or name.startswith("pragma.")
-            ), f"Inferred SQL name found — should be explicit or 'unnamed': {name!r}"
+            ), f"Inferred SQL name found — should be explicit: {name!r}"
+            # No unnamed queries should exist in production code paths
+            assert name != "unnamed", f"Unnamed query found in request — all queries must have name=: {names}"
 
     def test_send_room_message_has_named_entries(self, client, admin_headers):
         """send_room_message produces explicitly-named per-SQL entries + @timed_query total."""

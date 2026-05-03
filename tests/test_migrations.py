@@ -10,7 +10,7 @@ class TestSchemaVersionTracking:
         """Empty database should return version 0."""
         conn = db.get_connection()
         # Reset to clean state
-        conn.execute("DROP TABLE IF EXISTS schema_version")
+        conn.execute("DROP TABLE IF EXISTS schema_version", name="test_drop_schema_version")
         conn.commit()
 
         version = db.get_schema_version(conn)
@@ -20,7 +20,7 @@ class TestSchemaVersionTracking:
         """Recording a migration should update the version."""
         conn = db.get_connection()
         # Reset to clean state
-        conn.execute("DROP TABLE IF EXISTS schema_version")
+        conn.execute("DROP TABLE IF EXISTS schema_version", name="test_drop_schema_version")
         conn.commit()
 
         db._ensure_schema_version_table(conn)
@@ -33,7 +33,7 @@ class TestSchemaVersionTracking:
         """get_schema_version returns the highest version number."""
         conn = db.get_connection()
         # Reset to clean state
-        conn.execute("DROP TABLE IF EXISTS schema_version")
+        conn.execute("DROP TABLE IF EXISTS schema_version", name="test_drop_schema_version")
         conn.commit()
 
         db._ensure_schema_version_table(conn)
@@ -145,11 +145,12 @@ class TestMigration001ContentType:
         conn.execute(
             "INSERT INTO messages (mid, ns, to_id, from_id, body) VALUES (?, ?, ?, ?, ?)",
             ("test-mid", "test-ns", "to-id", "from-id", "test body"),
+            name="test_migration_insert",
         )
         conn.commit()
 
         # Verify default value
-        cursor = conn.execute("SELECT content_type FROM messages WHERE mid = ?", ("test-mid",))
+        cursor = conn.execute("SELECT content_type FROM messages WHERE mid = ?", ("test-mid",), name="test_migration_select")
         row = cursor.fetchone()
         assert row[0] == "text/plain"
 

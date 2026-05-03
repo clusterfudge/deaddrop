@@ -601,7 +601,7 @@ def _ensure_schema_version_table(conn: sqlite3.Connection) -> None:
             applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             description TEXT
         )
-    """)
+    """, name="schema.ensure_version_table")
     conn.commit()
 
 
@@ -613,7 +613,7 @@ def get_schema_version(conn: sqlite3.Connection | None = None) -> int:
     conn = _get_conn(conn)
     _ensure_schema_version_table(conn)
 
-    cursor = conn.execute("SELECT MAX(version) FROM schema_version")
+    cursor = conn.execute("SELECT MAX(version) FROM schema_version", name="schema.get_version")
     row = cursor.fetchone()
     return row[0] if row and row[0] is not None else 0
 
@@ -623,13 +623,14 @@ def record_migration(conn: sqlite3.Connection, version: int, description: str) -
     conn.execute(
         "INSERT INTO schema_version (version, description) VALUES (?, ?)",
         (version, description),
+        name="schema.record_migration",
     )
     conn.commit()
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check if a column exists in a table."""
-    cursor = conn.execute(f"PRAGMA table_info({table})")
+    cursor = conn.execute(f"PRAGMA table_info({table})", name="schema.column_exists")
     columns = [row[1] for row in cursor.fetchall()]
     return column in columns
 
@@ -640,7 +641,7 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 def _migrate_001_add_content_type(conn: sqlite3.Connection) -> None:
     """Migration 001: Add content_type column to messages table."""
     if not _column_exists(conn, "messages", "content_type"):
-        conn.execute("ALTER TABLE messages ADD COLUMN content_type TEXT DEFAULT 'text/plain'")
+        conn.execute("ALTER TABLE messages ADD COLUMN content_type TEXT DEFAULT 'text/plain'", name="migrate.001")
         conn.commit()
 
 
@@ -655,7 +656,7 @@ def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
             created_by TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """, name="migrate.002.create_rooms")
 
     # Create room_members table with per-user read tracking
     conn.execute("""
@@ -668,7 +669,7 @@ def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (room_id, identity_id),
             FOREIGN KEY (ns, identity_id) REFERENCES identities(ns, id) ON DELETE CASCADE
         )
-    """)
+    """, name="migrate.002.create_room_members")
 
     # Create room_messages table
     conn.execute("""
@@ -680,15 +681,17 @@ def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
             content_type TEXT DEFAULT 'text/plain',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """, name="migrate.002.create_room_messages")
 
     # Create indexes
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_rooms_ns ON rooms(ns)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rooms_ns ON rooms(ns)", name="migrate.002.idx")
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_room_members_identity ON room_members(ns, identity_id)"
+        "CREATE INDEX IF NOT EXISTS idx_room_members_identity ON room_members(ns, identity_id)",
+        name="migrate.002.idx",
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at)"
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at)",
+        name="migrate.002.idx",
     )
 
     conn.commit()
@@ -696,9 +699,10 @@ def _migrate_002_add_rooms(conn: sqlite3.Connection) -> None:
 
 def _migrate_003_add_reference_mid(conn: sqlite3.Connection) -> None:
     """Migration 003: Add reference_mid column to room_messages for reactions."""
-    conn.execute("ALTER TABLE room_messages ADD COLUMN reference_mid TEXT")
+    conn.execute("ALTER TABLE room_messages ADD COLUMN reference_mid TEXT", name="migrate.003")
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_room_messages_reference ON room_messages(reference_mid)"
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_reference ON room_messages(reference_mid)",
+        name="migrate.003.idx",
     )
     conn.commit()
 
@@ -714,9 +718,10 @@ def _migrate_004_add_mid_indexes(conn: sqlite3.Connection) -> None:
     but the existing index is on (ns, to_id, created_at). Same scan problem.
     """
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_room_messages_room_mid ON room_messages(room_id, mid)"
+        "CREATE INDEX IF NOT EXISTS idx_room_messages_room_mid ON room_messages(room_id, mid)",
+        name="migrate.004.idx",
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_inbox_mid ON messages(ns, to_id, mid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_inbox_mid ON messages(ns, to_id, mid)", name="migrate.004.idx")
     conn.commit()
 
 
@@ -730,18 +735,20 @@ def _migrate_005_add_content_hash(conn: sqlite3.Connection) -> None:
     """
     # Direct messages
     if not _column_exists(conn, "messages", "content_hash"):
-        conn.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT")
+        conn.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT", name="migrate.005")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_dedup "
-        "ON messages(ns, from_id, to_id, content_hash)"
+        "ON messages(ns, from_id, to_id, content_hash)",
+        name="migrate.005.idx",
     )
 
     # Room messages
     if not _column_exists(conn, "room_messages", "content_hash"):
-        conn.execute("ALTER TABLE room_messages ADD COLUMN content_hash TEXT")
+        conn.execute("ALTER TABLE room_messages ADD COLUMN content_hash TEXT", name="migrate.005")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_room_messages_dedup "
-        "ON room_messages(room_id, from_id, content_hash)"
+        "ON room_messages(room_id, from_id, content_hash)",
+        name="migrate.005.idx",
     )
 
     conn.commit()
@@ -765,8 +772,8 @@ def _migrate_006_add_attachments(conn: sqlite3.Connection) -> None:
             size INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_mid ON attachments(message_mid)")
+    """, name="migrate.006.create_attachments")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_mid ON attachments(message_mid)", name="migrate.006.idx")
     conn.commit()
 
 
@@ -981,7 +988,7 @@ def make_unique_slug(
         query += " AND ns != ?"
         params.append(exclude_ns)
 
-    cursor = conn.execute(query, tuple(params))
+    cursor = conn.execute(query, tuple(params), name="make_unique_slug")
     count = cursor.fetchone()[0]
 
     if count == 0:
@@ -991,7 +998,7 @@ def make_unique_slug(
     while True:
         new_slug = f"{slug}-{counter}"
         params[0] = new_slug
-        cursor = conn.execute(query, tuple(params))
+        cursor = conn.execute(query, tuple(params), name="make_unique_slug")
         if cursor.fetchone()[0] == 0:
             return new_slug
         counter += 1
@@ -1022,6 +1029,7 @@ def create_namespace(
     conn.execute(
         "INSERT INTO namespaces (ns, secret_hash, slug, metadata, ttl_hours) VALUES (?, ?, ?, ?, ?)",
         (ns, secret_hash, slug, metadata_json, ttl_hours),
+        name="create_namespace",
     )
     conn.commit()
 
@@ -1034,6 +1042,7 @@ def get_namespace(ns: str, conn: sqlite3.Connection | None = None) -> dict | Non
     cursor = conn.execute(
         "SELECT ns, slug, metadata, ttl_hours, created_at, archived_at FROM namespaces WHERE ns = ?",
         (ns,),
+        name="get_namespace",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1055,6 +1064,7 @@ def get_namespace_by_slug(slug: str, conn: sqlite3.Connection | None = None) -> 
     cursor = conn.execute(
         "SELECT ns, slug, metadata, ttl_hours, created_at, archived_at FROM namespaces WHERE slug = ?",
         (slug,),
+        name="get_namespace_by_slug",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1078,7 +1088,7 @@ def get_or_create_namespace_slug(
     """Get existing slug or create one for namespace."""
     conn = _get_conn(conn)
 
-    cursor = conn.execute("SELECT slug, metadata FROM namespaces WHERE ns = ?", (ns,))
+    cursor = conn.execute("SELECT slug, metadata FROM namespaces WHERE ns = ?", (ns,), name="get_or_create_namespace_slug.select")
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if not row:
@@ -1091,7 +1101,7 @@ def get_or_create_namespace_slug(
     base_slug = suggested_slug or slugify(metadata.get("display_name", "")) or ns[:8]
     slug = make_unique_slug(base_slug, exclude_ns=ns, conn=conn)
 
-    conn.execute("UPDATE namespaces SET slug = ? WHERE ns = ?", (slug, ns))
+    conn.execute("UPDATE namespaces SET slug = ? WHERE ns = ?", (slug, ns), name="get_or_create_namespace_slug.update")
     conn.commit()
     return slug
 
@@ -1104,11 +1114,11 @@ def set_namespace_slug(ns: str, slug: str, conn: sqlite3.Connection | None = Non
     if not clean_slug:
         return False
 
-    cursor = conn.execute("SELECT ns FROM namespaces WHERE slug = ? AND ns != ?", (clean_slug, ns))
+    cursor = conn.execute("SELECT ns FROM namespaces WHERE slug = ? AND ns != ?", (clean_slug, ns), name="set_namespace_slug.check")
     if cursor.fetchone():
         return False
 
-    cursor = conn.execute("UPDATE namespaces SET slug = ? WHERE ns = ?", (clean_slug, ns))
+    cursor = conn.execute("UPDATE namespaces SET slug = ? WHERE ns = ?", (clean_slug, ns), name="set_namespace_slug.update")
     conn.commit()
     return cursor.rowcount > 0
 
@@ -1116,7 +1126,7 @@ def set_namespace_slug(ns: str, slug: str, conn: sqlite3.Connection | None = Non
 def is_namespace_archived(ns: str, conn: sqlite3.Connection | None = None) -> bool:
     """Check if namespace is archived (read-only)."""
     conn = _get_conn(conn)
-    cursor = conn.execute("SELECT archived_at FROM namespaces WHERE ns = ?", (ns,))
+    cursor = conn.execute("SELECT archived_at FROM namespaces WHERE ns = ?", (ns,), name="is_namespace_archived")
     row = _row_to_dict(cursor.description, cursor.fetchone())
     return row is not None and row["archived_at"] is not None
 
@@ -1126,7 +1136,8 @@ def archive_namespace(ns: str, conn: sqlite3.Connection | None = None) -> bool:
     conn = _get_conn(conn)
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        "UPDATE namespaces SET archived_at = ? WHERE ns = ? AND archived_at IS NULL", (now, ns)
+        "UPDATE namespaces SET archived_at = ? WHERE ns = ? AND archived_at IS NULL", (now, ns),
+        name="archive_namespace",
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -1145,7 +1156,7 @@ def get_namespace_ttl_hours(ns: str, conn: sqlite3.Connection | None = None) -> 
         return cached
 
     conn = _get_conn(conn)
-    cursor = conn.execute("SELECT ttl_hours FROM namespaces WHERE ns = ?", (ns,))
+    cursor = conn.execute("SELECT ttl_hours FROM namespaces WHERE ns = ?", (ns,), name="get_namespace_ttl_hours")
     row = _row_to_dict(cursor.description, cursor.fetchone())
     ttl = row["ttl_hours"] if row else DEFAULT_TTL_HOURS
     _namespace_ttl_cache[ns] = ttl
@@ -1156,7 +1167,8 @@ def list_namespaces(conn: sqlite3.Connection | None = None) -> list[dict]:
     """List all namespaces."""
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "SELECT ns, slug, metadata, ttl_hours, created_at, archived_at FROM namespaces ORDER BY created_at"
+        "SELECT ns, slug, metadata, ttl_hours, created_at, archived_at FROM namespaces ORDER BY created_at",
+        name="list_namespaces",
     )
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -1179,7 +1191,7 @@ def verify_namespace_secret(ns: str, secret: str, conn: sqlite3.Connection | Non
         return False
 
     conn = _get_conn(conn)
-    cursor = conn.execute("SELECT secret_hash FROM namespaces WHERE ns = ?", (ns,))
+    cursor = conn.execute("SELECT secret_hash FROM namespaces WHERE ns = ?", (ns,), name="verify_namespace_secret")
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if not row:
@@ -1193,7 +1205,7 @@ def verify_namespace_secret(ns: str, secret: str, conn: sqlite3.Connection | Non
 def delete_namespace(ns: str, conn: sqlite3.Connection | None = None) -> bool:
     """Delete a namespace and all its data."""
     conn = _get_conn(conn)
-    cursor = conn.execute("DELETE FROM namespaces WHERE ns = ?", (ns,))
+    cursor = conn.execute("DELETE FROM namespaces WHERE ns = ?", (ns,), name="delete_namespace")
     conn.commit()
     return cursor.rowcount > 0
 
@@ -1206,7 +1218,8 @@ def update_namespace_metadata(
     """Update namespace metadata."""
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "UPDATE namespaces SET metadata = ? WHERE ns = ?", (json.dumps(metadata), ns)
+        "UPDATE namespaces SET metadata = ? WHERE ns = ?", (json.dumps(metadata), ns),
+        name="update_namespace_metadata",
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -1231,6 +1244,7 @@ def create_identity(
     conn.execute(
         "INSERT INTO identities (id, ns, secret_hash, metadata) VALUES (?, ?, ?, ?)",
         (identity_id, ns, secret_hash, metadata_json),
+        name="create_identity",
     )
     conn.commit()
 
@@ -1245,7 +1259,8 @@ def get_identity(
     """Get identity by ID."""
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "SELECT id, metadata, created_at FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
+        "SELECT id, metadata, created_at FROM identities WHERE ns = ? AND id = ?", (ns, identity_id),
+        name="get_identity",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1266,7 +1281,8 @@ def get_identity_secret_hash(
     """Get the secret hash for an identity (used for invite creation)."""
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
+        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id),
+        name="get_identity_secret_hash",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
     return row["secret_hash"] if row else None
@@ -1276,7 +1292,8 @@ def list_identities(ns: str, conn: sqlite3.Connection | None = None) -> list[dic
     """List all identities in a namespace."""
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "SELECT id, metadata, created_at FROM identities WHERE ns = ? ORDER BY created_at", (ns,)
+        "SELECT id, metadata, created_at FROM identities WHERE ns = ? ORDER BY created_at", (ns,),
+        name="list_identities",
     )
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -1316,7 +1333,8 @@ def verify_identity_secret(
     # Cache miss — fall through to DB
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
+        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id),
+        name="verify_identity_secret",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1353,7 +1371,8 @@ def verify_identity_in_namespace(
     # Cache miss — fall through to DB
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id)
+        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?", (ns, identity_id),
+        name="verify_identity_in_namespace",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1375,7 +1394,7 @@ def delete_identity(
 ) -> bool:
     """Delete an identity and all its messages."""
     conn = _get_conn(conn)
-    cursor = conn.execute("DELETE FROM identities WHERE ns = ? AND id = ?", (ns, identity_id))
+    cursor = conn.execute("DELETE FROM identities WHERE ns = ? AND id = ?", (ns, identity_id), name="delete_identity")
     conn.commit()
     return cursor.rowcount > 0
 
@@ -1391,6 +1410,7 @@ def update_identity_metadata(
     cursor = conn.execute(
         "UPDATE identities SET metadata = ? WHERE ns = ? AND id = ?",
         (json.dumps(metadata), ns, identity_id),
+        name="update_identity_metadata",
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -1635,6 +1655,7 @@ def get_message(
            WHERE ns = ? AND to_id = ? AND mid = ?
            AND (expires_at IS NULL OR expires_at > ?)""",
         (ns, identity_id, mid, now),
+        name="get_message",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1662,7 +1683,8 @@ def delete_message(
     """Immediately delete a message."""
     conn = _get_conn(conn)
     cursor = conn.execute(
-        "DELETE FROM messages WHERE ns = ? AND to_id = ? AND mid = ?", (ns, identity_id, mid)
+        "DELETE FROM messages WHERE ns = ? AND to_id = ? AND mid = ?", (ns, identity_id, mid),
+        name="delete_message",
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -1681,6 +1703,7 @@ def archive_message(
         """UPDATE messages SET archived_at = ?, expires_at = NULL 
            WHERE ns = ? AND to_id = ? AND mid = ? AND archived_at IS NULL""",
         (now, ns, identity_id, mid),
+        name="archive_message",
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -1697,6 +1720,7 @@ def unarchive_message(
     cursor = conn.execute(
         "UPDATE messages SET archived_at = NULL WHERE ns = ? AND to_id = ? AND mid = ?",
         (ns, identity_id, mid),
+        name="unarchive_message",
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -1715,6 +1739,7 @@ def get_archived_messages(
            WHERE ns = ? AND to_id = ? AND archived_at IS NOT NULL
            ORDER BY archived_at DESC""",
         (ns, identity_id),
+        name="get_archived_messages",
     )
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -1756,6 +1781,7 @@ def create_invite(
            (invite_id, ns, identity_id, encrypted_secret, display_name, created_by, created_at, expires_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (invite_id, ns, identity_id, encrypted_secret, display_name, created_by, now, expires_at),
+        name="create_invite",
     )
     conn.commit()
 
@@ -1777,6 +1803,7 @@ def get_invite(invite_id: str, conn: sqlite3.Connection | None = None) -> dict |
                   created_by, created_at, expires_at, claimed_at, claimed_by
            FROM invites WHERE invite_id = ?""",
         (invite_id,),
+        name="get_invite",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
     return row
@@ -1789,6 +1816,7 @@ def get_invite_info(invite_id: str, conn: sqlite3.Connection | None = None) -> d
         """SELECT invite_id, ns, identity_id, display_name, created_at, expires_at, claimed_at
            FROM invites WHERE invite_id = ?""",
         (invite_id,),
+        name="get_invite_info",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1823,6 +1851,7 @@ def claim_invite(
            AND claimed_at IS NULL
            AND (expires_at IS NULL OR expires_at > ?)""",
         (invite_id, now),
+        name="claim_invite.select",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -1832,6 +1861,7 @@ def claim_invite(
     conn.execute(
         "UPDATE invites SET claimed_at = ?, claimed_by = ? WHERE invite_id = ?",
         (now, claimed_by, invite_id),
+        name="claim_invite.update",
     )
     conn.commit()
 
@@ -1870,14 +1900,14 @@ def list_invites(
 
     query += " ORDER BY created_at DESC"
 
-    cursor = conn.execute(query, (ns,))
+    cursor = conn.execute(query, (ns,), name="list_invites")
     return _rows_to_dicts(cursor.description, cursor.fetchall())
 
 
 def revoke_invite(invite_id: str, conn: sqlite3.Connection | None = None) -> bool:
     """Revoke (delete) an invite."""
     conn = _get_conn(conn)
-    cursor = conn.execute("DELETE FROM invites WHERE invite_id = ?", (invite_id,))
+    cursor = conn.execute("DELETE FROM invites WHERE invite_id = ?", (invite_id,), name="revoke_invite")
     conn.commit()
     return cursor.rowcount > 0
 
@@ -1889,6 +1919,7 @@ def cleanup_expired_invites(conn: sqlite3.Connection | None = None) -> int:
     cursor = conn.execute(
         "DELETE FROM invites WHERE expires_at IS NOT NULL AND expires_at <= ? AND claimed_at IS NULL",
         (now,),
+        name="cleanup_expired_invites",
     )
     conn.commit()
     return cursor.rowcount
@@ -1914,6 +1945,7 @@ def get_expired_namespaces(conn: sqlite3.Connection | None = None) -> list[dict]
              AND ttl_hours > 0
              AND datetime(created_at, '+' || ttl_hours || ' hours') < datetime('now')
            ORDER BY created_at""",
+        name="get_expired_namespaces",
     )
     return _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -1931,6 +1963,7 @@ def archive_expired_namespaces(conn: sqlite3.Connection | None = None) -> int:
              AND ttl_hours > 0
              AND datetime(created_at, '+' || ttl_hours || ' hours') < datetime('now')""",
         (now,),
+        name="archive_expired_namespaces",
     )
     conn.commit()
     return cursor.rowcount
@@ -1950,6 +1983,7 @@ def get_expired_messages(
            ORDER BY expires_at
            LIMIT ?""",
         (now, limit),
+        name="get_expired_messages",
     )
     return _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -1961,6 +1995,7 @@ def delete_expired_messages(conn: sqlite3.Connection | None = None) -> int:
     cursor = conn.execute(
         "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ? AND archived_at IS NULL",
         (now,),
+        name="delete_expired_messages",
     )
     conn.commit()
     return cursor.rowcount
@@ -1993,6 +2028,7 @@ def create_archive_batch(
            (batch_id, ns, archive_path, message_count, min_created_at, max_created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (batch_id, ns, archive_path, message_count, min_created_at, max_created_at),
+        name="create_archive_batch",
     )
     conn.commit()
     return batch_id
@@ -2007,10 +2043,11 @@ def get_archive_batches(
 
     if ns:
         cursor = conn.execute(
-            "SELECT * FROM archive_batches WHERE ns = ? ORDER BY created_at", (ns,)
+            "SELECT * FROM archive_batches WHERE ns = ? ORDER BY created_at", (ns,),
+            name="get_archive_batches",
         )
     else:
-        cursor = conn.execute("SELECT * FROM archive_batches ORDER BY created_at")
+        cursor = conn.execute("SELECT * FROM archive_batches ORDER BY created_at", name="get_archive_batches")
 
     return _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -2040,7 +2077,7 @@ def create_room(
     conn = _get_conn(conn)
 
     # Verify creator exists in namespace
-    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, created_by))
+    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, created_by), name="create_room.verify_creator")
     if not cursor.fetchone():
         raise ValueError(f"Creator {created_by} not found in namespace {ns}")
 
@@ -2052,6 +2089,7 @@ def create_room(
         """INSERT INTO rooms (room_id, ns, display_name, created_by, created_at)
            VALUES (?, ?, ?, ?, ?)""",
         (room_id, ns, display_name, created_by, now),
+        name="create_room.insert",
     )
 
     # Add creator as first member
@@ -2059,6 +2097,7 @@ def create_room(
         """INSERT INTO room_members (room_id, identity_id, ns, joined_at)
            VALUES (?, ?, ?, ?)""",
         (room_id, created_by, ns, now),
+        name="create_room.add_creator",
     )
 
     conn.commit()
@@ -2090,6 +2129,7 @@ def get_room(
         """SELECT room_id, ns, display_name, created_by, created_at
            FROM rooms WHERE room_id = ?""",
         (room_id,),
+        name="get_room",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
     return row
@@ -2113,6 +2153,7 @@ def list_rooms(
         """SELECT room_id, ns, display_name, created_by, created_at
            FROM rooms WHERE ns = ? ORDER BY created_at""",
         (ns,),
+        name="list_rooms",
     )
     return _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -2161,6 +2202,7 @@ def list_rooms_for_identity(
            WHERE r.ns = ? AND m.identity_id = ?
            ORDER BY r.created_at""",
         (ns, identity_id),
+        name="list_rooms_for_identity",
     )
     return _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -2179,7 +2221,7 @@ def delete_room(
         True if deleted, False if not found
     """
     conn = _get_conn(conn)
-    cursor = conn.execute("DELETE FROM rooms WHERE room_id = ?", (room_id,))
+    cursor = conn.execute("DELETE FROM rooms WHERE room_id = ?", (room_id,), name="delete_room")
     conn.commit()
     return cursor.rowcount > 0
 
@@ -2237,7 +2279,7 @@ def add_room_member(
     ns = room["ns"]
 
     # Verify identity exists in same namespace
-    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, identity_id))
+    cursor = conn.execute("SELECT id FROM identities WHERE ns = ? AND id = ?", (ns, identity_id), name="add_room_member.verify_identity")
     if not cursor.fetchone():
         raise ValueError(f"Identity {identity_id} not found in namespace {ns}")
 
@@ -2247,6 +2289,7 @@ def add_room_member(
         cursor = conn.execute(
             "SELECT room_id, identity_id, ns, joined_at, last_read_mid FROM room_members WHERE room_id = ? AND identity_id = ?",
             (room_id, identity_id),
+            name="add_room_member.get_existing",
         )
         return _row_to_dict(cursor.description, cursor.fetchone())  # type: ignore
 
@@ -2256,6 +2299,7 @@ def add_room_member(
         """INSERT INTO room_members (room_id, identity_id, ns, joined_at)
            VALUES (?, ?, ?, ?)""",
         (room_id, identity_id, ns, now),
+        name="add_room_member.insert",
     )
     conn.commit()
 
@@ -2287,6 +2331,7 @@ def remove_room_member(
     cursor = conn.execute(
         "DELETE FROM room_members WHERE room_id = ? AND identity_id = ?",
         (room_id, identity_id),
+        name="remove_room_member",
     )
     conn.commit()
     return cursor.rowcount > 0
@@ -2314,6 +2359,7 @@ def list_room_members(
            WHERE m.room_id = ?
            ORDER BY m.joined_at""",
         (room_id,),
+        name="list_room_members",
     )
     rows = _rows_to_dicts(cursor.description, cursor.fetchall())
 
@@ -2675,6 +2721,7 @@ def update_room_read_cursor(
     cursor = conn.execute(
         "SELECT 1 FROM room_members WHERE room_id = ? AND identity_id = ?",
         (room_id, identity_id),
+        name="update_room_read_cursor.check_member",
     )
     return cursor.fetchone() is not None
 
@@ -2750,6 +2797,7 @@ def get_room_member_info(
            JOIN identities i ON m.ns = i.ns AND m.identity_id = i.id
            WHERE m.room_id = ? AND m.identity_id = ?""",
         (room_id, identity_id),
+        name="get_room_member_info",
     )
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -2836,6 +2884,7 @@ def verify_room_access(
             WHERE r.room_id = ?
             """,
             (identity_id, identity_id, room_id),
+            name="verify_room_access",
         )
         row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -2905,6 +2954,7 @@ def get_room_cached(
             """SELECT room_id, ns, display_name, created_by, created_at
                FROM rooms WHERE room_id = ?""",
             (room_id,),
+            name="get_room_cached",
         )
         row = _row_to_dict(cursor.description, cursor.fetchone())
 
@@ -2942,6 +2992,7 @@ def get_identity_hash_cached(
         cursor = conn.execute(
             "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
             (ns, identity_id),
+            name="get_identity_hash_cached",
         )
         row = cursor.fetchone()
 
@@ -2979,6 +3030,7 @@ def is_room_member_cached(
         cursor = conn.execute(
             "SELECT 1 FROM room_members WHERE room_id = ? AND identity_id = ?",
             (room_id, identity_id),
+            name="is_room_member_cached",
         )
         is_member = cursor.fetchone() is not None
 
@@ -3108,6 +3160,7 @@ def get_message_attachments(
     cursor = conn.execute(
         f"SELECT {cols} FROM attachments WHERE message_mid = ? ORDER BY created_at",
         (message_mid,),
+        name="get_message_attachments",
     )
     results = []
     for row in cursor.fetchall():
@@ -3156,6 +3209,7 @@ def get_batch_message_attachments(
     cursor = conn.execute(
         f"SELECT {cols} FROM attachments WHERE message_mid IN ({placeholders}) ORDER BY created_at",
         tuple(message_mids),
+        name="get_batch_message_attachments",
     )
 
     results: dict[str, list[dict]] = {}
@@ -3203,6 +3257,7 @@ def get_topic_latest(
             "SELECT mid, from_id FROM room_messages "
             "WHERE room_id = ? ORDER BY mid DESC LIMIT 1",
             (room_id,),
+            name="get_topic_latest.room",
         )
         row = cursor.fetchone()
         if row:
@@ -3219,6 +3274,7 @@ def get_topic_latest(
             "AND archived_at IS NULL "
             "ORDER BY mid DESC LIMIT 1",
             (ns, identity_id),
+            name="get_topic_latest.inbox",
         )
         row = cursor.fetchone()
         if row:

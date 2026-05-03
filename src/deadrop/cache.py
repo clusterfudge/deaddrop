@@ -256,7 +256,7 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
         results = {"rooms": 0, "memberships": 0, "identities": 0}
 
         # Warm room cache
-        cursor = c.execute("SELECT room_id, ns, display_name, created_by, created_at FROM rooms")
+        cursor = c.execute("SELECT room_id, ns, display_name, created_by, created_at FROM rooms", name="cache_warm.rooms")
         rows = cursor.fetchall()
         room_items = {}
         for row in rows:
@@ -266,7 +266,7 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
         results["rooms"] = room_cache.set_bulk(room_items)
 
         # Warm membership cache
-        cursor = c.execute("SELECT room_id, identity_id FROM room_members")
+        cursor = c.execute("SELECT room_id, identity_id FROM room_members", name="cache_warm.memberships")
         rows = cursor.fetchall()
         member_items = {}
         for row in rows:
@@ -274,7 +274,7 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
         results["memberships"] = membership_cache.set_bulk(member_items)
 
         # Warm identity hash cache
-        cursor = c.execute("SELECT ns, id, secret_hash FROM identities")
+        cursor = c.execute("SELECT ns, id, secret_hash FROM identities", name="cache_warm.identities")
         rows = cursor.fetchall()
         identity_items = {}
         for row in rows:
