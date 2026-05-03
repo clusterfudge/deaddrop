@@ -2701,12 +2701,24 @@ def update_room_read_cursor(
     """
     conn = _get_conn(conn)
 
-    # Only update if cursor moves forward (UUID7 is lexicographically sortable)
+    # Only update if cursor moves forward (UUID7 is lexicographically sortable).
+    #
+    # Legacy data may contain non-v7 cursors (UUIDv4s from before API-level
+    # validation was added). A v4 like '1e14...' is lexicographically greater
+    # than any v7 like '0194...' / '01f0...', so a naive `last_read_mid < ?`
+    # check silently refuses to advance past a poisoned v4 cursor. Treat any
+    # non-v7 stored cursor as "unset" so new v7 writes clobber poisoning.
+    # UUID v7 has version nibble '7' at string position 14 (0-indexed),
+    # i.e. the 15th character — SQL substr is 1-indexed so position 15.
     cursor = conn.execute(
-        """UPDATE room_members 
+        """UPDATE room_members
            SET last_read_mid = ?
            WHERE room_id = ? AND identity_id = ?
-           AND (last_read_mid IS NULL OR last_read_mid < ?)""",
+           AND (
+               last_read_mid IS NULL
+               OR substr(last_read_mid, 15, 1) != '7'
+               OR last_read_mid < ?
+           )""",
         (last_read_mid, room_id, identity_id, last_read_mid),
         name="update_room_read_cursor.update",
     )
@@ -2756,6 +2768,12 @@ def get_room_unread_count(
         return 0  # Not a member
 
     last_read_mid = row[0]
+
+    # Treat legacy non-v7 cursors (e.g. UUIDv4) as unset — they can't be
+    # compared meaningfully against v7 message IDs. See update_room_read_cursor
+    # for the matching write-path defense.
+    if last_read_mid and len(last_read_mid) >= 15 and last_read_mid[14] != "7":
+        last_read_mid = None
 
     # Count messages after the cursor
     if last_read_mid:

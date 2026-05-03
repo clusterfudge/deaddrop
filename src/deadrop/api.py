@@ -132,10 +132,11 @@ async def lifespan(app: FastAPI):
     db.close_db()
 
 
-
 import re as _re
 
-_UUID7_RE = _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", _re.I)
+_UUID7_RE = _re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", _re.I
+)
 
 
 def _is_valid_uuid7(value: str) -> bool:
@@ -147,6 +148,26 @@ def _require_uuid7(value: str | None, field_name: str) -> None:
     """Raise HTTPException 400 if value is a non-empty string that isn't UUID v7."""
     if value is not None and value != "" and not _is_valid_uuid7(value):
         raise HTTPException(400, f"Invalid {field_name}: must be a UUID v7 (got {value!r})")
+
+
+def _coerce_read_cursor(value: str | None, field_name: str = "cursor") -> str | None:
+    """For READ paths: return value if it's a valid UUID v7, else None.
+
+    Legacy data (pre-e9ec324 when API-layer v7 validation landed) may have
+    seeded UUIDv4 cursors into client-held state — localStorage, SSE topic
+    subscriptions, the web UI's last-rendered mid. A strict 400 on those
+    would wedge the reader forever; instead, quietly fall back to "no
+    cursor" (i.e. latest messages) and log once so we can see the churn.
+
+    Write paths (POST /read, reply reference_mid) stay strict via
+    _require_uuid7 — we do not want new v4s written to the DB.
+    """
+    if value is None or value == "":
+        return None
+    if _is_valid_uuid7(value):
+        return value
+    logger.warning("ignoring non-v7 read cursor for %s: %r", field_name, value)
+    return None
 
 
 app = FastAPI(
@@ -1144,7 +1165,8 @@ async def get_inbox(
     # Only mailbox owner can read their inbox
     await _require_inbox_secret(ns, identity_id, x_inbox_secret)
 
-    _require_uuid7(after, "after")
+    # Read path: non-v7 cursors (legacy poisoning) degrade to "no cursor".
+    after = _coerce_read_cursor(after, "after")
 
     # Fetch and return messages
     messages = await _run_read(
@@ -1782,8 +1804,9 @@ async def get_room_messages(
     if room["ns"] != ns:
         raise HTTPException(404, "Room not found in this namespace")
 
-    _require_uuid7(after, "after")
-    _require_uuid7(before, "before")
+    # Read path: non-v7 cursors (legacy poisoning) degrade to "no cursor".
+    after = _coerce_read_cursor(after, "after")
+    before = _coerce_read_cursor(before, "before")
 
     messages = await _run_read(
         functools.partial(
@@ -2091,7 +2114,8 @@ async def get_attachment(
         # Look up the message's room_id to verify membership
         conn = db.get_connection()
         cursor = conn.execute(
-            "SELECT room_id FROM room_messages WHERE mid = ?", (attachment["message_mid"],),
+            "SELECT room_id FROM room_messages WHERE mid = ?",
+            (attachment["message_mid"],),
             name="get_attachment.lookup_room",
         )
         row = cursor.fetchone()
@@ -2163,8 +2187,12 @@ async def subscribe(
 
     await _validate_subscription_topics(ns, request.topics, caller_id)
 
-    for topic_key, cursor in request.topics.items():
-        _require_uuid7(cursor, f"cursor for {topic_key}")
+    # Subscribe is a READ path — non-v7 cursors degrade to "no cursor"
+    # so legacy v4 values in client state don't wedge the subscription.
+    request.topics = {
+        topic_key: _coerce_read_cursor(cursor, f"cursor for {topic_key}")
+        for topic_key, cursor in request.topics.items()
+    }
 
     event_bus = get_event_bus()
 
