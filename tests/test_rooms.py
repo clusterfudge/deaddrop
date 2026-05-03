@@ -526,6 +526,74 @@ class TestRoomReadTracking:
 
         assert result is False
 
+    def test_update_room_read_cursor_overrides_poisoned_uuid_v4(self):
+        """Legacy UUIDv4 cursors must NOT block UUIDv7 advancement.
+
+        Regression: pre-validation data may contain a v4 like
+        '1e141d46-f442-4391-b714-98aeb44c442f' stored as last_read_mid.
+        Any v4 lexicographically > any v7 (v7 starts with timestamp bytes
+        like '01f0...' or '0194...', v4 starts with random bytes),
+        so `last_read_mid < new_v7` is false and the UPDATE silently
+        no-ops. New v7 cursor writes must clobber v4 poisoning.
+        """
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        msg = db.send_room_message(room["room_id"], alice["id"], "hi")
+
+        # Poison the cursor directly (simulating legacy data from before
+        # API-level v7 validation was added).
+        poisoned_v4 = "1e141d46-f442-4391-b714-98aeb44c442f"
+        conn = db._get_conn(None)
+        conn.execute(
+            "UPDATE room_members SET last_read_mid = ? "
+            "WHERE room_id = ? AND identity_id = ?",
+            (poisoned_v4, room["room_id"], alice["id"]),
+            name="test.poison_cursor",
+        )
+        conn.commit()
+
+        # Sanity: the poisoned value is indeed > the new v7 lexicographically
+        assert poisoned_v4 > msg["mid"]
+
+        # Now advance with a real v7. Must succeed.
+        result = db.update_room_read_cursor(room["room_id"], alice["id"], msg["mid"])
+
+        assert result is True
+        info = db.get_room_member_info(room["room_id"], alice["id"])
+        assert info["last_read_mid"] == msg["mid"]
+
+    def test_get_room_unread_count_with_poisoned_v4_cursor(self):
+        """Unread count must be correct even when stored cursor is a v4.
+
+        With a v4 cursor '1e14...' and v7 messages like '01f0...', the
+        `mid > last_read_mid` comparison returns 0 unread even when
+        messages exist. Poisoned cursors should be treated as 'unset'.
+        """
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        bob = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        db.add_room_member(room["room_id"], bob["id"])
+
+        db.send_room_message(room["room_id"], alice["id"], "msg 1")
+        db.send_room_message(room["room_id"], alice["id"], "msg 2")
+
+        # Poison bob's cursor
+        poisoned_v4 = "1e141d46-f442-4391-b714-98aeb44c442f"
+        conn = db._get_conn(None)
+        conn.execute(
+            "UPDATE room_members SET last_read_mid = ? "
+            "WHERE room_id = ? AND identity_id = ?",
+            (poisoned_v4, room["room_id"], bob["id"]),
+            name="test.poison_cursor",
+        )
+        conn.commit()
+
+        # Two new messages, poisoned cursor => should report 2 unread
+        count = db.get_room_unread_count(room["room_id"], bob["id"])
+        assert count == 2
+
     def test_get_room_unread_count(self):
         """Get count of unread messages."""
         ns = db.create_namespace()
