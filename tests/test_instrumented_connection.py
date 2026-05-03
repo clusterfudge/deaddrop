@@ -350,7 +350,9 @@ class TestIntegrationNamedQueriesInBuffer:
                 or name.startswith("delete.")
             ), f"Inferred SQL name found — should be explicit: {name!r}"
             # No unnamed queries should exist in production code paths
-            assert name != "unnamed", f"Unnamed query found in request — all queries must have name=: {names}"
+            assert name != "unnamed", (
+                f"Unnamed query found in request — all queries must have name=: {names}"
+            )
 
     def test_send_room_message_has_named_entries(self, client, admin_headers):
         """send_room_message produces explicitly-named per-SQL entries + @timed_query total."""
