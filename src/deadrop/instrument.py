@@ -280,7 +280,7 @@ class PrometheusSink:
 
     def generate_latest(self) -> bytes:  # pragma: no cover
         """Return Prometheus text format exposition for /metrics."""
-        return self._prom.generate_latest()  # type: ignore[return-value]
+        return self._prom.generate_latest()
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ class PrometheusSink:
 # ---------------------------------------------------------------------------
 
 
-def _build_sink_from_env() -> MetricsSink:  # type: ignore[return]
+def _build_sink_from_env() -> MetricsSink:
     sink_name = os.environ.get("DEADROP_METRICS_SINK", "null").lower().strip()
     prefix = os.environ.get("DEADROP_METRICS_PREFIX", "deadrop")
 

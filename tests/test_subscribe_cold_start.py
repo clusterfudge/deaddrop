@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deadrop.api import app
-from deadrop.events import InMemoryEventBus, get_event_bus, reset_event_bus, set_event_bus
+from deadrop.events import reset_event_bus
 
 
 @pytest.fixture(autouse=True)
@@ -76,9 +76,7 @@ def setup_with_room(client, admin_headers):
 class TestSubscribeColdStart:
     """Subscribe must detect pre-existing messages after event bus restart."""
 
-    def test_subscribe_detects_message_after_event_bus_reset(
-        self, client, setup_with_room
-    ):
+    def test_subscribe_detects_message_after_event_bus_reset(self, client, setup_with_room):
         """The core bug: message exists in DB, event bus restarted,
         subscribe should still detect it."""
         data = setup_with_room
@@ -111,8 +109,7 @@ class TestSubscribeColdStart:
             json={"body": "Are you there?"},
         )
         assert msg2_resp.status_code == 200
-        msg2 = msg2_resp.json()
-        second_mid = msg2["mid"]
+        assert "mid" in msg2_resp.json()  # second message persisted; we'll pick it up post-restart
 
         # *** SIMULATE SERVER RESTART ***
         # Reset the event bus — this is what happens when the process restarts.
@@ -140,13 +137,9 @@ class TestSubscribeColdStart:
             f"Subscribe should detect the pre-existing message, got: {result}"
         )
         events = result["events"]
-        assert f"room:{room_id}" in events, (
-            f"Room topic should be in events, got: {events}"
-        )
+        assert f"room:{room_id}" in events, f"Room topic should be in events, got: {events}"
 
-    def test_subscribe_no_false_positive_when_cursor_is_current(
-        self, client, setup_with_room
-    ):
+    def test_subscribe_no_false_positive_when_cursor_is_current(self, client, setup_with_room):
         """After reset, subscribe with cursor AT latest should NOT fire."""
         data = setup_with_room
         ns = data["ns"]
@@ -184,9 +177,7 @@ class TestSubscribeColdStart:
             f"Subscribe should NOT fire when cursor is at latest, got: {result}"
         )
 
-    def test_subscribe_inbox_detects_message_after_reset(
-        self, client, setup_with_room
-    ):
+    def test_subscribe_inbox_detects_message_after_reset(self, client, setup_with_room):
         """Inbox subscribe also needs cold-start detection."""
         data = setup_with_room
         ns = data["ns"]
@@ -210,7 +201,9 @@ class TestSubscribeColdStart:
             json={"to": bob_id, "body": "Second DM"},
         )
         assert dm2_resp.status_code == 200
-        dm2_mid = dm2_resp.json()["mid"]
+        assert (
+            "mid" in dm2_resp.json()
+        )  # second DM persisted; cold-start subscribe should surface it
 
         # Reset event bus
         reset_event_bus()

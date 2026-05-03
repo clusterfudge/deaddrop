@@ -546,8 +546,7 @@ class TestRoomReadTracking:
         poisoned_v4 = "1e141d46-f442-4391-b714-98aeb44c442f"
         conn = db._get_conn(None)
         conn.execute(
-            "UPDATE room_members SET last_read_mid = ? "
-            "WHERE room_id = ? AND identity_id = ?",
+            "UPDATE room_members SET last_read_mid = ? WHERE room_id = ? AND identity_id = ?",
             (poisoned_v4, room["room_id"], alice["id"]),
             name="test.poison_cursor",
         )
@@ -583,8 +582,7 @@ class TestRoomReadTracking:
         poisoned_v4 = "1e141d46-f442-4391-b714-98aeb44c442f"
         conn = db._get_conn(None)
         conn.execute(
-            "UPDATE room_members SET last_read_mid = ? "
-            "WHERE room_id = ? AND identity_id = ?",
+            "UPDATE room_members SET last_read_mid = ? WHERE room_id = ? AND identity_id = ?",
             (poisoned_v4, room["room_id"], bob["id"]),
             name="test.poison_cursor",
         )

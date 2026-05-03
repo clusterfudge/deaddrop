@@ -180,9 +180,7 @@ class InMemoryEventBus(EventBus):
                 try:
                     db_result = self._db_fallback(namespace, topic, last_seen)
                 except Exception:
-                    logger.warning(
-                        "db_fallback failed for topic %s", topic, exc_info=True
-                    )
+                    logger.warning("db_fallback failed for topic %s", topic, exc_info=True)
                     db_result = None
                 if db_result is not None:
                     # Cache it so we never hit the DB for this topic again.

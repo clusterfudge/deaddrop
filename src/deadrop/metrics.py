@@ -304,9 +304,10 @@ class InstrumentedConnection:
                 name = "sqlite_master"
             else:
                 raise TypeError(
-                    f"InstrumentedConnection.execute() requires name= for query: "
-                    f"{sql[:80]!r}"
+                    f"InstrumentedConnection.execute() requires name= for query: {sql[:80]!r}"
                 )
+        # Every path out of the sentinel branch assigns a str; narrow for the type checker.
+        assert isinstance(name, str)
         t0 = time.perf_counter()
         try:
             result = self._conn.execute(sql, params)

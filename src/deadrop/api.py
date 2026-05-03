@@ -5,6 +5,7 @@ import contextvars
 import json
 import logging
 import os
+import re as _re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -131,8 +132,6 @@ async def lifespan(app: FastAPI):
     stop_cache_warming()
     db.close_db()
 
-
-import re as _re
 
 _UUID7_RE = _re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", _re.I

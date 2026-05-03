@@ -150,7 +150,11 @@ class TestMigration001ContentType:
         conn.commit()
 
         # Verify default value
-        cursor = conn.execute("SELECT content_type FROM messages WHERE mid = ?", ("test-mid",), name="test_migration_select")
+        cursor = conn.execute(
+            "SELECT content_type FROM messages WHERE mid = ?",
+            ("test-mid",),
+            name="test_migration_select",
+        )
         row = cursor.fetchone()
         assert row[0] == "text/plain"
 
