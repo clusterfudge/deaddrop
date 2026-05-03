@@ -1,6 +1,7 @@
 """Tests for UUID v7 validation on API endpoints."""
+
 import pytest
-from deadrop.api import _is_valid_uuid7, _require_uuid7
+from deadrop.api import _coerce_read_cursor, _is_valid_uuid7, _require_uuid7
 from fastapi.exceptions import HTTPException
 
 
@@ -50,6 +51,7 @@ class TestUUID7EndpointValidation:
     def client(self):
         from fastapi.testclient import TestClient
         from deadrop.api import app
+
         return TestClient(app)
 
     @pytest.fixture
@@ -85,31 +87,32 @@ class TestUUID7EndpointValidation:
             "room_id": room["room_id"],
         }
 
-    def test_subscribe_rejects_non_v7_cursor(self, client, setup):
+    def test_subscribe_tolerates_non_v7_cursor(self, client, setup):
+        """Read-path leniency: legacy v4 cursor (e.g. from stale client state)
+        is silently coerced to None, subscription starts from latest."""
         resp = client.post(
             f"/{setup['ns']}/subscribe",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             json={
                 "topics": {f"room:{setup['room_id']}": "1e141d46-f442-4391-b714-98aeb44c442f"},
                 "mode": "poll",
                 "timeout": 1,
             },
         )
-        assert resp.status_code == 400
-        assert "UUID v7" in resp.json()["detail"]
+        assert resp.status_code == 200
 
     def test_subscribe_accepts_v7_cursor(self, client, setup):
         # Send a message to get a real v7 mid
         send_resp = client.post(
             f"/{setup['ns']}/rooms/{setup['room_id']}/messages",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             json={"body": "hello"},
         )
         mid = send_resp.json()["mid"]
 
         resp = client.post(
             f"/{setup['ns']}/subscribe",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             json={
                 "topics": {f"room:{setup['room_id']}": mid},
                 "mode": "poll",
@@ -121,7 +124,7 @@ class TestUUID7EndpointValidation:
     def test_subscribe_accepts_null_cursor(self, client, setup):
         resp = client.post(
             f"/{setup['ns']}/subscribe",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             json={
                 "topics": {f"room:{setup['room_id']}": None},
                 "mode": "poll",
@@ -133,7 +136,7 @@ class TestUUID7EndpointValidation:
     def test_send_room_message_rejects_non_v7_reference(self, client, setup):
         resp = client.post(
             f"/{setup['ns']}/rooms/{setup['room_id']}/messages",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             json={
                 "body": "test",
                 "reference_mid": "1e141d46-f442-4391-b714-98aeb44c442f",
@@ -145,26 +148,84 @@ class TestUUID7EndpointValidation:
     def test_read_cursor_rejects_non_v7(self, client, setup):
         resp = client.post(
             f"/{setup['ns']}/rooms/{setup['room_id']}/read",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             json={"last_read_mid": "1e141d46-f442-4391-b714-98aeb44c442f"},
         )
         assert resp.status_code == 400
         assert "UUID v7" in resp.json()["detail"]
 
-    def test_get_messages_rejects_non_v7_after(self, client, setup):
+    def test_get_messages_tolerates_non_v7_after(self, client, setup):
+        """Read-path leniency: non-v7 'after' cursor degrades to no cursor,
+        endpoint returns latest messages instead of 400-ing."""
         resp = client.get(
             f"/{setup['ns']}/rooms/{setup['room_id']}/messages",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             params={"after": "1e141d46-f442-4391-b714-98aeb44c442f"},
         )
-        assert resp.status_code == 400
-        assert "UUID v7" in resp.json()["detail"]
+        assert resp.status_code == 200
 
-    def test_get_inbox_rejects_non_v7_after(self, client, setup):
+    def test_get_messages_tolerates_non_v7_before(self, client, setup):
+        resp = client.get(
+            f"/{setup['ns']}/rooms/{setup['room_id']}/messages",
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
+            params={"before": "1e141d46-f442-4391-b714-98aeb44c442f"},
+        )
+        assert resp.status_code == 200
+
+    def test_get_messages_accepts_v7_after(self, client, setup):
+        """Sanity: real v7 cursor still works as a filter."""
+        # Send two messages, use first's mid as 'after', expect second back.
+        r1 = client.post(
+            f"/{setup['ns']}/rooms/{setup['room_id']}/messages",
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
+            json={"body": "first"},
+        )
+        mid1 = r1.json()["mid"]
+        r2 = client.post(
+            f"/{setup['ns']}/rooms/{setup['room_id']}/messages",
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
+            json={"body": "second"},
+        )
+        mid2 = r2.json()["mid"]
+        resp = client.get(
+            f"/{setup['ns']}/rooms/{setup['room_id']}/messages",
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
+            params={"after": mid1},
+        )
+        assert resp.status_code == 200
+        mids = [m["mid"] for m in resp.json()["messages"]]
+        assert mid2 in mids
+        assert mid1 not in mids
+
+    def test_get_inbox_tolerates_non_v7_after(self, client, setup):
+        """Read-path leniency: non-v7 'after' on inbox GET falls back to
+        no cursor rather than 400."""
         resp = client.get(
             f"/{setup['ns']}/inbox/{setup['identity_id']}",
-            headers={"X-Inbox-Secret": setup['identity_secret']},
+            headers={"X-Inbox-Secret": setup["identity_secret"]},
             params={"after": "1e141d46-f442-4391-b714-98aeb44c442f"},
         )
-        assert resp.status_code == 400
-        assert "UUID v7" in resp.json()["detail"]
+        assert resp.status_code == 200
+
+
+class TestCoerceReadCursor:
+    """Unit tests for _coerce_read_cursor helper."""
+
+    def test_none_returns_none(self):
+        assert _coerce_read_cursor(None) is None
+
+    def test_empty_returns_none(self):
+        assert _coerce_read_cursor("") is None
+
+    def test_valid_v7_passes_through(self):
+        v7 = "069f56ee-6ead-7394-8000-20d966e7dc6e"
+        assert _coerce_read_cursor(v7) == v7
+
+    def test_v4_coerces_to_none(self):
+        assert _coerce_read_cursor("1e141d46-f442-4391-b714-98aeb44c442f") is None
+
+    def test_garbage_coerces_to_none(self):
+        assert _coerce_read_cursor("not-a-uuid") is None
+
+    def test_v1_coerces_to_none(self):
+        assert _coerce_read_cursor("550e8400-e29b-11d4-a716-446655440000") is None
