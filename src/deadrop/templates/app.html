@@ -875,6 +875,27 @@
             
             roomMessages = page;
             roomHasOlderMessages = page.length >= ROOM_PAGE_SIZE;
+
+            // If reactions dominate the page, keep fetching backward until
+            // we have enough visible (non-reaction) messages to fill the view.
+            const MIN_VISIBLE = Math.min(ROOM_PAGE_SIZE, 10);
+            const MAX_BACKFILL_ROUNDS = 5;
+            let backfillRound = 0;
+            while (roomHasOlderMessages && backfillRound < MAX_BACKFILL_ROUNDS) {
+                const visibleCount = roomMessages.filter(m => m.content_type !== 'reaction').length;
+                if (visibleCount >= MIN_VISIBLE) break;
+                const oldestMid = roomMessages[0].mid;
+                const more = await DeadropAPI.getRoomMessages(
+                    credentials, currentRoomId, { beforeMid: oldestMid, limit: ROOM_PAGE_SIZE });
+                const morePage = more?.messages || [];
+                if (morePage.length === 0) { roomHasOlderMessages = false; break; }
+                roomHasOlderMessages = morePage.length >= ROOM_PAGE_SIZE;
+                roomMessages = [...morePage, ...roomMessages];
+                backfillRound++;
+            }
+            if (backfillRound > 0) {
+                console.log(`Backfilled ${backfillRound} page(s) to get enough visible messages`);
+            }
             
             // Save to cache
             localStorage.setItem(cacheKey, JSON.stringify(roomMessages));
@@ -932,7 +953,27 @@
             roomHasOlderMessages = olderPage.length >= ROOM_PAGE_SIZE;
 
             // Prepend to data model (older messages go before existing ones)
-            roomMessages = [...olderPage, ...roomMessages];
+            let allOlder = olderPage;
+
+            // If the page was mostly reactions, keep fetching so the user
+            // actually sees content when scrolling up.
+            const MIN_VISIBLE_SCROLL = 5;
+            const MAX_BACKFILL = 5;
+            let bf = 0;
+            while (roomHasOlderMessages && bf < MAX_BACKFILL) {
+                const vis = allOlder.filter(m => m.content_type !== 'reaction').length;
+                if (vis >= MIN_VISIBLE_SCROLL) break;
+                const bfOldest = allOlder[0].mid;
+                const extra = await DeadropAPI.getRoomMessages(
+                    credentials, currentRoomId, { beforeMid: bfOldest, limit: ROOM_PAGE_SIZE });
+                const extraPage = extra?.messages || [];
+                if (extraPage.length === 0) { roomHasOlderMessages = false; break; }
+                roomHasOlderMessages = extraPage.length >= ROOM_PAGE_SIZE;
+                allOlder = [...extraPage, ...allOlder];
+                bf++;
+            }
+
+            roomMessages = [...allOlder, ...roomMessages];
 
             // Save to cache
             const cacheKey = `room_messages_${currentRoomId}`;
