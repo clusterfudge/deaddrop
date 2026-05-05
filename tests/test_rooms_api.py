@@ -471,6 +471,58 @@ class TestRoomMessages:
         assert response.status_code == 403
 
 
+
+    def test_get_room_messages_exclude_reactions(self, client, setup_identities):
+        """exclude_reactions query param filters reactions server-side."""
+        data = setup_identities
+
+        room = client.post(
+            f"/{data['ns']}/rooms",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        ).json()
+
+        # Add bob to room
+        client.post(
+            f"/{data['ns']}/rooms/{room['room_id']}/members",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json={"identity_id": data["bob"]["id"]},
+        )
+
+        # Alice sends 3 messages, bob reacts to each
+        mids = []
+        for i in range(3):
+            msg = client.post(
+                f"/{data['ns']}/rooms/{room['room_id']}/messages",
+                headers={"X-Inbox-Secret": data["alice"]["secret"]},
+                json={"body": f"Message {i}", "content_type": "text/markdown"},
+            ).json()
+            mids.append(msg["mid"])
+
+        for mid in mids:
+            client.post(
+                f"/{data['ns']}/rooms/{room['room_id']}/messages",
+                headers={"X-Inbox-Secret": data["bob"]["secret"]},
+                json={"body": "👀", "content_type": "reaction", "reference_mid": mid},
+            )
+
+        # Without exclude: 6 messages
+        resp = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/messages",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()["messages"]) == 6
+
+        # With exclude: only 3 text messages
+        resp = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}/messages?exclude_reactions=true",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        )
+        assert resp.status_code == 200
+        msgs = resp.json()["messages"]
+        assert len(msgs) == 3
+        assert all(m["content_type"] != "reaction" for m in msgs)
+
 class TestRoomReadTracking:
     """Tests for read cursor tracking."""
 

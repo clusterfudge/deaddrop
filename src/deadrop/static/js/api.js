@@ -134,12 +134,13 @@ const DeadropAPI = {
      * @param {string} options.beforeMid - Get messages before this message ID (backward)
      * @param {number} options.limit - Max messages to return
      */
-    async getRoomMessages(credentials, roomId, { afterMid = null, beforeMid = null, limit = null } = {}) {
+    async getRoomMessages(credentials, roomId, { afterMid = null, beforeMid = null, limit = null, excludeReactions = false } = {}) {
         let path = `/${credentials.ns}/rooms/${roomId}/messages`;
         const params = new URLSearchParams();
         if (afterMid) params.set('after', afterMid);
         if (beforeMid) params.set('before', beforeMid);
         if (limit) params.set('limit', limit.toString());
+        if (excludeReactions) params.set('exclude_reactions', 'true');
         if (params.toString()) path += '?' + params.toString();
         
         return this.request('GET', path, { credentials });

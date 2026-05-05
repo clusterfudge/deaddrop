@@ -2593,6 +2593,7 @@ def get_room_messages(
     after_mid: str | None = None,
     before_mid: str | None = None,
     limit: int = 100,
+    exclude_reactions: bool = False,
     conn: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """Get messages from a room with attachment metadata via LEFT JOIN.
@@ -2629,6 +2630,9 @@ def get_room_messages(
     # page of messages that will actually be returned.
     subquery = "SELECT mid FROM room_messages WHERE room_id = ?"
     params: list[Any] = [room_id]
+
+    if exclude_reactions:
+        subquery += " AND content_type != 'reaction'"
 
     if after_mid:
         subquery += " AND mid > ?"

@@ -9,7 +9,7 @@
 //
 // Cache version: bump CACHE_NAME when shell assets change to force update.
 
-const CACHE_NAME = 'deadrop-shell-v2';
+const CACHE_NAME = 'deadrop-shell-v3';
 const APP_SHELL = [
   '/app',
   '/static/css/style.css',

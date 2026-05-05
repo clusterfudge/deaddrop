@@ -1782,6 +1782,7 @@ async def get_room_messages(
     after: Annotated[str | None, Query()] = None,
     before: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    exclude_reactions: Annotated[bool, Query()] = False,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages from a room.
@@ -1790,6 +1791,7 @@ async def get_room_messages(
     - after: Only return messages after this message ID (forward pagination / polling)
     - before: Only return messages before this message ID (backward pagination / scroll-up)
     - limit: Maximum number of messages to return (default: 100, max: 1000)
+    - exclude_reactions: If true, reactions are excluded from the result and don't count against limit
 
     Messages are always returned in chronological order regardless of
     pagination direction.
@@ -1814,6 +1816,7 @@ async def get_room_messages(
             after_mid=after,
             before_mid=before,
             limit=limit,
+            exclude_reactions=exclude_reactions,
         )
     )
 

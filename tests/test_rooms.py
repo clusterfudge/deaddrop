@@ -660,3 +660,149 @@ class TestRoomMultiUser:
 
         assert db.get_room_unread_count(room["room_id"], alice["id"]) == 0
         assert db.get_room_unread_count(room["room_id"], bob["id"]) == 2
+
+
+class TestExcludeReactions:
+    """Tests for the exclude_reactions parameter on get_room_messages."""
+
+    def test_exclude_reactions_initial_load(self):
+        """Initial load with exclude_reactions skips reactions entirely."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        fritz = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        db.add_room_member(room["room_id"], fritz["id"])
+
+        # Alice sends 5 messages, Fritz reacts to all
+        mids = []
+        for i in range(5):
+            msg = db.send_room_message(room["room_id"], alice["id"], f"Message {i}")
+            mids.append(msg["mid"])
+        for mid in mids:
+            db.send_room_message(
+                room["room_id"], fritz["id"], "👀",
+                content_type="reaction", reference_mid=mid,
+            )
+
+        # Without exclude: 10 messages (5 text + 5 reactions)
+        all_msgs = db.get_room_messages(room["room_id"], limit=20)
+        assert len(all_msgs) == 10
+
+        # With exclude: only 5 text messages
+        text_only = db.get_room_messages(room["room_id"], limit=20, exclude_reactions=True)
+        assert len(text_only) == 5
+        assert all(m["content_type"] != "reaction" for m in text_only)
+
+    def test_exclude_reactions_respects_limit(self):
+        """Limit applies to non-reaction messages when exclude_reactions=True."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        fritz = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        db.add_room_member(room["room_id"], fritz["id"])
+
+        mids = []
+        for i in range(10):
+            msg = db.send_room_message(room["room_id"], alice["id"], f"Message {i}")
+            mids.append(msg["mid"])
+        for mid in mids:
+            db.send_room_message(
+                room["room_id"], fritz["id"], "👀",
+                content_type="reaction", reference_mid=mid,
+            )
+
+        # limit=3 with exclude: should get exactly 3 text messages
+        result = db.get_room_messages(room["room_id"], limit=3, exclude_reactions=True)
+        assert len(result) == 3
+        assert all(m["content_type"] != "reaction" for m in result)
+        # Should be the 3 newest: Message 7, 8, 9
+        assert result[0]["body"] == "Message 7"
+        assert result[2]["body"] == "Message 9"
+
+    def test_exclude_reactions_backward_pagination(self):
+        """Backward pagination with exclude_reactions skips reactions."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        fritz = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        db.add_room_member(room["room_id"], fritz["id"])
+
+        mids = []
+        for i in range(10):
+            msg = db.send_room_message(room["room_id"], alice["id"], f"Message {i}")
+            mids.append(msg["mid"])
+        for mid in mids:
+            db.send_room_message(
+                room["room_id"], fritz["id"], "👀",
+                content_type="reaction", reference_mid=mid,
+            )
+
+        # Get newest 5 text messages
+        newest = db.get_room_messages(room["room_id"], limit=5, exclude_reactions=True)
+        assert len(newest) == 5
+        assert newest[0]["body"] == "Message 5"
+
+        # Paginate backward from Message 5
+        older = db.get_room_messages(
+            room["room_id"], before_mid=newest[0]["mid"], limit=5, exclude_reactions=True
+        )
+        assert len(older) == 5
+        assert all(m["content_type"] != "reaction" for m in older)
+        assert older[0]["body"] == "Message 0"
+        assert older[4]["body"] == "Message 4"
+
+    def test_exclude_reactions_all_reactions_page(self):
+        """When reactions dominate, exclude_reactions returns only text."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        fritz = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        db.add_room_member(room["room_id"], fritz["id"])
+
+        # 1 text, then 25 different text messages each with a reaction
+        msg0 = db.send_room_message(room["room_id"], alice["id"], "Hello")
+        for i in range(25):
+            m = db.send_room_message(room["room_id"], alice["id"], f"Filler {i}")
+            db.send_room_message(
+                room["room_id"], fritz["id"], "👀",
+                content_type="reaction", reference_mid=m["mid"],
+            )
+
+        # Without exclude, limit=20: all 20 are the tail (mix of text+reactions)
+        raw = db.get_room_messages(room["room_id"], limit=20)
+        assert len(raw) == 20
+
+        # With exclude, limit=20: gets 20 text messages, no reactions
+        filtered = db.get_room_messages(room["room_id"], limit=20, exclude_reactions=True)
+        assert len(filtered) == 20
+        assert all(m["content_type"] != "reaction" for m in filtered)
+
+    def test_exclude_reactions_forward_pagination(self):
+        """Forward pagination (after_mid) with exclude_reactions also works."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        fritz = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"])
+        db.add_room_member(room["room_id"], fritz["id"])
+
+        msg1 = db.send_room_message(room["room_id"], alice["id"], "First")
+        # Create 5 reactions to different messages (send text + reaction pairs)
+        for i in range(5):
+            m = db.send_room_message(room["room_id"], alice["id"], f"Filler {i}")
+            db.send_room_message(
+                room["room_id"], fritz["id"], "👀",
+                content_type="reaction", reference_mid=m["mid"],
+            )
+        msg_last = db.send_room_message(room["room_id"], alice["id"], "Last")
+
+        # Forward from msg1: without exclude gets all 11 (5 text + 5 reactions + 1 last)
+        all_after = db.get_room_messages(room["room_id"], after_mid=msg1["mid"], limit=20)
+        assert len(all_after) == 11
+
+        # With exclude: only text messages (5 fillers + Last)
+        text_after = db.get_room_messages(
+            room["room_id"], after_mid=msg1["mid"], limit=20, exclude_reactions=True
+        )
+        assert len(text_after) == 6
+        assert all(m["content_type"] != "reaction" for m in text_after)
+        assert text_after[-1]["body"] == "Last"
