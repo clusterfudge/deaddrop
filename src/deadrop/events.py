@@ -238,24 +238,47 @@ class InMemoryEventBus(EventBus):
         namespace: str,
         topics: dict[str, str | None],
     ) -> AsyncIterator[dict[str, str | None]]:
-        """Stream events as they occur."""
+        """Stream events as they occur.
+
+        Correctness contract: every `publish` must be delivered to every
+        concurrently-open stream consumer, even when the consumer is in
+        between iterations (post-yield, pre-wait). Achieving this
+        requires two invariants:
+
+        1. **Re-check cursors under the condition lock before waiting.**
+           Otherwise a publish that lands between the previous
+           `_check_changes` and the next `condition.wait()` is lost —
+           `notify_all()` fires while we aren't on the waiter queue.
+
+        2. **Do the re-check atomically with the wait.** Holding the
+           lock during the pre-check blocks `publish()` from running,
+           so either we observe the new cursor and skip `wait()`, or
+           we enter `wait()` first and get notified when publish
+           releases the lock.
+
+        The multi-client "desktop tab + mobile both open" case is the
+        primary motivation: without this, a burst of publishes can wake
+        stream A cleanly while stream B is between yield and wait, and
+        stream B silently misses the burst until the next publish.
+        """
         # Track our own cursor so we don't re-yield the same change
         cursors = dict(topics)
-
-        # First, yield any immediately-available changes
-        changes = self._check_changes(namespace, cursors)
-        for topic, info in changes.items():
-            cursors[topic] = info["latest_mid"]
-            yield {"topic": topic, "latest_mid": info["latest_mid"], "sender_id": info["sender_id"]}
-
-        # Then wait for new events
         condition = self._get_condition(namespace)
-        while True:
-            async with condition:
-                await condition.wait()
 
-            # Check what changed
-            changes = self._check_changes(namespace, cursors)
+        while True:
+            # Drain any pending changes before waiting. Done under the
+            # condition lock so a racing publish() either (a) ran before
+            # us and is visible in _latest, or (b) waits on the lock
+            # and will fire notify_all() once we release and wait.
+            async with condition:
+                changes = self._check_changes(namespace, cursors)
+                if not changes:
+                    # Nothing new — block until a publish notifies us.
+                    # When we wake, the loop re-checks cursors under the
+                    # same lock, so we never miss a notification.
+                    await condition.wait()
+                    changes = self._check_changes(namespace, cursors)
+
             for topic, info in changes.items():
                 cursors[topic] = info["latest_mid"]
                 yield {
