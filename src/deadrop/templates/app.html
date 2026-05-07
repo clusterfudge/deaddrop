@@ -1660,39 +1660,85 @@
         }
     }
     
-    // ==================== TAB VISIBILITY ====================
-    
+    // ==================== TAB VISIBILITY / FOCUS ====================
+
     /**
-     * Pause subscriptions and message fetching when the tab is not visible
-     * (backgrounded, another workspace, screen locked, etc.).
+     * Refresh the active view after the tab regains visibility/focus.
      *
-     * This prevents messages from being marked as read while the user isn't
-     * actually looking at them.  When the tab regains focus the subscription
-     * is restarted and the current view is refreshed.
+     * Called from both `visibilitychange` (tab hidden → visible, e.g.
+     * switching browser tabs) AND `window.focus` (window blur → focus,
+     * e.g. desktop alt-tab where the tab stays technically "visible").
+     * The second path matters on desktop: if the user alt-tabs to
+     * another app, the tab's `document.hidden` often stays `false`,
+     * `visibilitychange` never fires, and any SSE/network hiccup during
+     * the blurred window leaves stale state that never reconciles.
+     */
+    function refreshOnForeground() {
+        if (!currentSlug || !credentials) return;
+
+        // Reconnect subscription in case it was stopped or its socket
+        // went stale during the blurred window (OS sleep, network
+        // suspend, etc.).
+        startSubscription();
+
+        // Refresh whichever view is currently shown so any messages that
+        // landed during the blur become visible immediately, without
+        // waiting for the subscription stream to redeliver them.
+        const inboxView = document.getElementById('view-inbox');
+        const roomView = document.getElementById('view-room-chat');
+        const convView = document.getElementById('view-conversation');
+
+        if (roomView && !roomView.classList.contains('hidden') && currentRoomId) {
+            loadRoomMessages();
+        } else if (convView && !convView.classList.contains('hidden') && currentPeerId) {
+            loadUnifiedInbox().then(() => renderConversation());
+        } else if (inboxView && !inboxView.classList.contains('hidden')) {
+            loadUnifiedInbox();
+        }
+    }
+
+    /**
+     * Pause subscriptions and message fetching when the tab is not
+     * visible (backgrounded, another workspace, screen locked, etc.).
+     *
+     * This prevents messages from being marked as read while the user
+     * isn't actually looking at them. When the tab regains visibility
+     * the subscription is restarted and the current view is refreshed.
      */
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
-            // Tab hidden — stop subscription so we don't fetch (and mark-as-read)
+            // Tab hidden — stop subscription so we don't fetch (and
+            // mark-as-read)
             stopSubscription();
         } else {
-            // Tab visible again — restart subscription and refresh the active view
-            if (currentSlug && credentials) {
-                startSubscription();
-
-                // Refresh whichever view is currently shown
-                const inboxView = document.getElementById('view-inbox');
-                const roomView = document.getElementById('view-room-chat');
-                const convView = document.getElementById('view-conversation');
-
-                if (roomView && !roomView.classList.contains('hidden') && currentRoomId) {
-                    loadRoomMessages();
-                } else if (convView && !convView.classList.contains('hidden') && currentPeerId) {
-                    loadUnifiedInbox().then(() => renderConversation());
-                } else if (inboxView && !inboxView.classList.contains('hidden')) {
-                    loadUnifiedInbox();
-                }
-            }
+            // Tab visible again — restart subscription and refresh
+            refreshOnForeground();
         }
+    });
+
+    /**
+     * Desktop-window-refocus path: the tab may never have gone hidden
+     * (alt-tab between apps leaves `document.hidden === false` in most
+     * browsers), but the user's perception is "I left and came back."
+     * Treat window focus the same way we treat tab-visible: refresh
+     * the active view so any messages that arrived during the blur
+     * show up.
+     *
+     * `visibilitychange` will also fire for actual tab switches; when
+     * both fire we do a tiny bit of redundant work, which is strictly
+     * better than the alternative (missed messages).
+     */
+    window.addEventListener('focus', () => {
+        if (!document.hidden) refreshOnForeground();
+    });
+
+    /**
+     * After a network drop (laptop wake, wifi change), the existing
+     * SSE stream may be dead but the client hasn't noticed yet.
+     * Trigger a full refresh on 'online' so we reconcile immediately.
+     */
+    window.addEventListener('online', () => {
+        if (!document.hidden) refreshOnForeground();
     });
 
     // ==================== BROWSER NAVIGATION ====================
