@@ -470,8 +470,6 @@ class TestRoomMessages:
 
         assert response.status_code == 403
 
-
-
     def test_get_room_messages_exclude_reactions(self, client, setup_identities):
         """exclude_reactions query param filters reactions server-side."""
         data = setup_identities
@@ -522,6 +520,7 @@ class TestRoomMessages:
         msgs = resp.json()["messages"]
         assert len(msgs) == 3
         assert all(m["content_type"] != "reaction" for m in msgs)
+
 
 class TestRoomReadTracking:
     """Tests for read cursor tracking."""
