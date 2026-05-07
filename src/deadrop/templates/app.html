@@ -956,13 +956,13 @@
             const reactionMap = buildReactionMap(roomMessages);
 
             // Filter out reactions from display set.
-            // IMPORTANT: render ALL backfilled pages (`allOlder`), not just the
-            // first-fetched `olderPage`. Otherwise, when the first page is
-            // reaction-heavy, backfill grows the data model past the DOM — the
-            // next scroll-up cursor (roomMessages[0].mid) points further back
-            // than anything rendered, leaving a permanent rendering gap and
-            // divergence from the localStorage cache.
-            const olderDisplay = allOlder.filter(m => m.content_type !== 'reaction');
+            // NOTE: prior versions referenced a stale `allOlder` variable — an
+            // artifact from a client-side backfill loop removed in 28949c3
+            // when server-side `exclude_reactions` was added. Since
+            // excludeReactions=true is already passed to getRoomMessages above,
+            // olderPage excludes reactions server-side; the filter here is
+            // belt-and-suspenders for older server versions.
+            const olderDisplay = olderPage.filter(m => m.content_type !== 'reaction');
 
             // Build a DocumentFragment with the older messages.
             // column-reverse: DOM order is newest→oldest, so older messages
@@ -1011,7 +1011,7 @@
                 }
             });
 
-            console.log(`Loaded ${allOlder.length} older messages (${olderDisplay.length} visible, total: ${roomMessages.length})`);
+            console.log(`Loaded ${olderPage.length} older messages (${olderDisplay.length} visible, total: ${roomMessages.length})`);
         } catch (e) {
             console.error('Failed to load older messages:', e);
         } finally {
