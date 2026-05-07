@@ -680,8 +680,11 @@ class TestExcludeReactions:
             mids.append(msg["mid"])
         for mid in mids:
             db.send_room_message(
-                room["room_id"], fritz["id"], "👀",
-                content_type="reaction", reference_mid=mid,
+                room["room_id"],
+                fritz["id"],
+                "👀",
+                content_type="reaction",
+                reference_mid=mid,
             )
 
         # Without exclude: 10 messages (5 text + 5 reactions)
@@ -707,8 +710,11 @@ class TestExcludeReactions:
             mids.append(msg["mid"])
         for mid in mids:
             db.send_room_message(
-                room["room_id"], fritz["id"], "👀",
-                content_type="reaction", reference_mid=mid,
+                room["room_id"],
+                fritz["id"],
+                "👀",
+                content_type="reaction",
+                reference_mid=mid,
             )
 
         # limit=3 with exclude: should get exactly 3 text messages
@@ -733,8 +739,11 @@ class TestExcludeReactions:
             mids.append(msg["mid"])
         for mid in mids:
             db.send_room_message(
-                room["room_id"], fritz["id"], "👀",
-                content_type="reaction", reference_mid=mid,
+                room["room_id"],
+                fritz["id"],
+                "👀",
+                content_type="reaction",
+                reference_mid=mid,
             )
 
         # Get newest 5 text messages
@@ -760,12 +769,15 @@ class TestExcludeReactions:
         db.add_room_member(room["room_id"], fritz["id"])
 
         # 1 text, then 25 different text messages each with a reaction
-        msg0 = db.send_room_message(room["room_id"], alice["id"], "Hello")
+        db.send_room_message(room["room_id"], alice["id"], "Hello")
         for i in range(25):
             m = db.send_room_message(room["room_id"], alice["id"], f"Filler {i}")
             db.send_room_message(
-                room["room_id"], fritz["id"], "👀",
-                content_type="reaction", reference_mid=m["mid"],
+                room["room_id"],
+                fritz["id"],
+                "👀",
+                content_type="reaction",
+                reference_mid=m["mid"],
             )
 
         # Without exclude, limit=20: all 20 are the tail (mix of text+reactions)
@@ -790,10 +802,13 @@ class TestExcludeReactions:
         for i in range(5):
             m = db.send_room_message(room["room_id"], alice["id"], f"Filler {i}")
             db.send_room_message(
-                room["room_id"], fritz["id"], "👀",
-                content_type="reaction", reference_mid=m["mid"],
+                room["room_id"],
+                fritz["id"],
+                "👀",
+                content_type="reaction",
+                reference_mid=m["mid"],
             )
-        msg_last = db.send_room_message(room["room_id"], alice["id"], "Last")
+        db.send_room_message(room["room_id"], alice["id"], "Last")
 
         # Forward from msg1: without exclude gets all 11 (5 text + 5 reactions + 1 last)
         all_after = db.get_room_messages(room["room_id"], after_mid=msg1["mid"], limit=20)
