@@ -90,7 +90,17 @@ LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
 # cascade).
 LIBSQL_HEALTH_PING_INTERVAL = 15.0  # seconds between ping sweeps
 LIBSQL_HEALTH_PING_TIMEOUT = 2.0  # seconds to wait for each ping
-LIBSQL_CONNECTION_MAX_AGE = 240.0  # seconds; pre-emptively recycle older
+# Max-age recycle was set to 240s in PR #68. Observed post-deploy: every
+# ~4min, every pooled connection got force-recycled. Writes that landed
+# in the cold-start window paid 2-3s (TCP + TLS + Hrana stream init)
+# instead of the normal ~50ms. The active ping-every-15s already catches
+# broken connections; proactive rotation was solving a non-problem and
+# introducing a regular latency penalty.
+#
+# Set to None to disable proactive max-age recycling. Keep the setting
+# in place so we can re-enable with a saner value (e.g. 1800s / 30min)
+# if we discover a real silent-stale scenario the ping misses.
+LIBSQL_CONNECTION_MAX_AGE: float | None = None
 
 # Registry of live libsql connections for the background pinger.
 # (conn, thread_local_ref, created_at) tuples. We hold a WEAK reference to
@@ -450,7 +460,7 @@ def _libsql_health_ping_sweep() -> tuple[int, int]:
             continue
 
         age = now - created_at
-        if age > LIBSQL_CONNECTION_MAX_AGE:
+        if LIBSQL_CONNECTION_MAX_AGE is not None and age > LIBSQL_CONNECTION_MAX_AGE:
             try:
                 _run_with_timeout(
                     lambda c=conn: c.close(),
@@ -656,31 +666,22 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     # DB executor pool.
     db_url = os.environ.get("TURSO_URL", "")
     if db_url.startswith("libsql://"):
-        # Check thread-local connection
-        if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
-            # Proactive max-age recycle — pre-empts silent staleness from
-            # NAT/proxy/firewall TCP reaping.
-            import time as _time
-
-            connected_at = getattr(_local, "libsql_connected_at", 0.0)
-            if _time.time() - connected_at > MAX_CONNECTION_AGE_SECONDS:
-                import logging
-
-                logging.info(
-                    f"Libsql connection on {threading.current_thread().name} "
-                    f"exceeded max age ({MAX_CONNECTION_AGE_SECONDS}s), recycling"
-                )
-                stale_conn = _local.libsql_conn
-                try:
-                    _run_with_timeout(
-                        lambda: stale_conn.close(),
-                        timeout=2.0,
-                        description="conn.close()",
-                    )
-                except Exception:
-                    pass
-                _local.libsql_conn = None
-                # Fall through to create new connection
+        # Check thread-local connection.
+        #
+        # Earlier versions had a proactive max-age recycle here that closed
+        # any connection older than DEADROP_MAX_LIBSQL_AGE (default 300s)
+        # on the next hot-path use. Observed post-PR #68 deploy: every
+        # connection got force-recycled roughly every 5 min, and writes
+        # that landed in the cold-start window paid 2-3s (TCP + TLS +
+        # Hrana stream init) instead of the usual ~50ms.
+        #
+        # The active health-pinger (runs every 15s in the background) is
+        # sufficient to detect broken connections and recycle them
+        # off-path. No need to pre-empt on the hot path.
+        #
+        # To re-enable (if a silent-stale scenario the ping misses shows
+        # up): uncomment, set DEADROP_MAX_LIBSQL_AGE to something long
+        # like 1800 so routine writes don't pay cold-start.
 
         if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
             # Health check existing connection
