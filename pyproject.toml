@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-turso = ["libsql-experimental>=0.0.47"]
+turso = ["libsql>=0.1.11"]
 
 [project.scripts]
 deadrop = "deadrop.cli:app"

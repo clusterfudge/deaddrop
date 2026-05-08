@@ -715,7 +715,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
                     raise
 
         # Create new thread-local connection
-        import libsql_experimental as libsql  # type: ignore[import-not-found]
+        import libsql  # type: ignore[import-not-found]
         import logging
 
         thread_name = threading.current_thread().name
