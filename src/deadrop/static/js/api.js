@@ -444,7 +444,22 @@ class SubscriptionManager {
         if (this.onStatusChange) this.onStatusChange('polling');
         this.reconnectDelay = 1000;
 
+        // Bound the poll loop so the outer `start()` loop can retry SSE
+        // periodically. Without this, once SSE fails and we fall to poll,
+        // we stay in poll forever — even if SSE would work on a fresh
+        // attempt. Return after `pollLoopMaxDurationMs` (default 3 min)
+        // so start() cycles back to the SSE attempt.
+        const maxDurationMs = this.pollLoopMaxDurationMs || 3 * 60 * 1000;
+        const startedAt = Date.now();
+
         while (this.running) {
+            // Time-bound: if we've been polling for maxDurationMs,
+            // return so start() can retry SSE.
+            if (Date.now() - startedAt >= maxDurationMs) {
+                if (this.onStatusChange) this.onStatusChange('sse-retry');
+                return;
+            }
+
             try {
                 const currentTopics = this._refreshTopics(topics);
                 const result = await DeadropAPI.subscribePoll(
