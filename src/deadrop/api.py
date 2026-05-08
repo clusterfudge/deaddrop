@@ -97,6 +97,12 @@ async def lifespan(app: FastAPI):
 
     db.init_db()
 
+    # Start the libsql health-ping background thread. No-op when the
+    # backend is local SQLite. For Turso, exercises idle connections
+    # every ~15s so stale TCP (NAT/LB culled) is detected pre-emptively
+    # instead of blowing up the first request after an idle window.
+    db.start_libsql_health_pinger()
+
     # Enforce namespace TTLs on startup (archive expired namespaces)
     from . import jobs
 
@@ -126,10 +132,16 @@ async def lifespan(app: FastAPI):
     # never surface to callers.
     asyncio.create_task(asyncio.to_thread(_post_deploy_annotation))
 
+    # Active libsql health-ping: probes every worker's thread-local
+    # connection every ~15s so that stale TCP to Turso is recycled before
+    # a user request hits it. Only matters for libsql; the loop itself
+    # no-ops for local SQLite.
+
     yield
 
     # Stop background cache refresh
     stop_cache_warming()
+    db.stop_libsql_health_pinger()
     db.close_db()
 
 
