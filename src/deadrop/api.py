@@ -103,6 +103,11 @@ async def lifespan(app: FastAPI):
     # instead of blowing up the first request after an idle window.
     db.start_libsql_health_pinger()
 
+    # Background monitor: resolves Turso hostname and TCP-probes each IP
+    # every 15s. Surfaces the "DNS returns a dead IP" scenario (2026-05-08
+    # incident) in metrics + WARNING logs BEFORE it cascades into 503s.
+    db.start_turso_dns_monitor()
+
     # Enforce namespace TTLs on startup (archive expired namespaces)
     from . import jobs
 
@@ -142,6 +147,7 @@ async def lifespan(app: FastAPI):
     # Stop background cache refresh
     stop_cache_warming()
     db.stop_libsql_health_pinger()
+    db.stop_turso_dns_monitor()
     db.close_db()
 
 
