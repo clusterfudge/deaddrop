@@ -90,6 +90,15 @@ LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
 # cascade).
 LIBSQL_HEALTH_PING_INTERVAL = 15.0  # seconds between ping sweeps
 LIBSQL_HEALTH_PING_TIMEOUT = 2.0  # seconds to wait for each ping
+
+# DNS/TCP reachability monitor — detects the scenario where Turso's NLB
+# returns an IP in DNS but that IP is TCP-dead. Observed 2026-05-08:
+# `3.212.35.170` was in DNS but refused connections on :443; half of new
+# libsql connections hit it and timed out before the NLB health-checked
+# it out of rotation. This monitor surfaces that state in metrics + a
+# WARNING log BEFORE users see 503s.
+TURSO_DNS_MONITOR_INTERVAL = 15.0  # seconds between DNS/TCP sweeps
+TURSO_DNS_TCP_TIMEOUT = 3.0  # seconds per IP TCP-connect probe
 # Max-age recycle was set to 240s in PR #68. Observed post-deploy: every
 # ~4min, every pooled connection got force-recycled. Writes that landed
 # in the cold-start window paid 2-3s (TCP + TLS + Hrana stream init)
@@ -547,6 +556,146 @@ def start_libsql_health_pinger() -> None:
 def stop_libsql_health_pinger() -> None:
     """Signal the health-ping thread to exit. Safe to call on shutdown."""
     _libsql_pinger_stop.set()
+
+
+# ---------------------------------------------------------------------------
+# Turso DNS/TCP reachability monitor
+# ---------------------------------------------------------------------------
+
+
+def _turso_hostname() -> str | None:
+    """Extract the hostname from TURSO_URL, or None if not libsql."""
+    db_url = os.environ.get("TURSO_URL", "")
+    if not db_url.startswith("libsql://"):
+        return None
+    # libsql://host[:port]/... — strip scheme, then anything after '/' or ':'
+    rest = db_url[len("libsql://") :]
+    for sep in ("/", ":"):
+        idx = rest.find(sep)
+        if idx != -1:
+            rest = rest[:idx]
+    return rest or None
+
+
+def _tcp_reachable(ip: str, port: int = 443, timeout: float = TURSO_DNS_TCP_TIMEOUT) -> bool:
+    """Return True if a TCP handshake to (ip, port) completes within timeout."""
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((ip, port))
+        return True
+    except (OSError, socket.timeout):
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _turso_dns_sweep() -> tuple[int, int]:
+    """Resolve Turso hostname, TCP-probe each IP, emit metrics.
+
+    Returns (ip_count, unreachable_count). Emits a WARNING log if any IP
+    is unreachable — that's the pre-cascade signal we want to page on.
+    """
+    import logging
+    import socket
+
+    from .metrics import statsd_gauge
+    from . import instrument
+
+    host = _turso_hostname()
+    if host is None:
+        return (0, 0)
+
+    try:
+        _name, _aliases, ips = socket.gethostbyname_ex(host)
+    except (socket.gaierror, OSError) as e:
+        logging.warning(f"turso dns monitor: resolution failed for {host}: {e}")
+        statsd_gauge("turso.dns.ip_count", 0)
+        instrument.sink.counter("turso.dns.resolve_error", tags={"host": host})
+        return (0, 0)
+
+    statsd_gauge("turso.dns.ip_count", len(ips))
+
+    unreachable: list[str] = []
+    for ip in ips:
+        ok = _tcp_reachable(ip, port=443, timeout=TURSO_DNS_TCP_TIMEOUT)
+        # Tagged gauge — backend can slice by IP without exploding metric
+        # name cardinality in aggregators that support tags.
+        instrument.sink.gauge(
+            "turso.ip.tcp_reachable", 1.0 if ok else 0.0, tags={"ip": ip, "host": host}
+        )
+        # Also emit a per-IP dotted name for backends that only do flat
+        # metric names (matches the spec in the original ticket).
+        statsd_gauge(f"turso.ip.{ip}.tcp_reachable", 1 if ok else 0)
+        if not ok:
+            unreachable.append(ip)
+
+    if unreachable:
+        logging.warning(
+            f"turso dns monitor: {len(unreachable)}/{len(ips)} IP(s) for {host} "
+            f"TCP-unreachable on :443: {', '.join(unreachable)}"
+        )
+        instrument.sink.counter(
+            "turso.dns.unreachable_ip",
+            value=len(unreachable),
+            tags={"host": host},
+        )
+
+    return (len(ips), len(unreachable))
+
+
+_turso_dns_monitor_thread: threading.Thread | None = None
+_turso_dns_monitor_stop = threading.Event()
+
+
+def start_turso_dns_monitor() -> None:
+    """Start the background DNS/TCP reachability monitor.
+
+    Idempotent. No-op when libsql is not in use. Call from FastAPI
+    lifespan startup alongside ``start_libsql_health_pinger``.
+    """
+    global _turso_dns_monitor_thread
+    if not is_using_libsql():
+        return
+    if _turso_dns_monitor_thread is not None and _turso_dns_monitor_thread.is_alive():
+        return
+
+    import logging
+
+    host = _turso_hostname()
+    if host is None:
+        return
+
+    def _run() -> None:
+        logging.info(
+            f"turso dns monitor started (host={host}, interval={TURSO_DNS_MONITOR_INTERVAL}s)"
+        )
+        # Run one sweep immediately so startup logs show the current state.
+        try:
+            _turso_dns_sweep()
+        except Exception:
+            logging.exception("turso dns monitor: initial sweep crashed")
+
+        while not _turso_dns_monitor_stop.wait(TURSO_DNS_MONITOR_INTERVAL):
+            try:
+                _turso_dns_sweep()
+            except Exception:
+                logging.exception("turso dns monitor sweep crashed")
+        logging.info("turso dns monitor stopping")
+
+    _turso_dns_monitor_stop.clear()
+    _turso_dns_monitor_thread = threading.Thread(target=_run, name="turso-dns-monitor", daemon=True)
+    _turso_dns_monitor_thread.start()
+
+
+def stop_turso_dns_monitor() -> None:
+    """Signal the DNS monitor thread to exit. Safe to call on shutdown."""
+    _turso_dns_monitor_stop.set()
 
 
 def _is_hrana_stream_error(error: Exception) -> bool:
