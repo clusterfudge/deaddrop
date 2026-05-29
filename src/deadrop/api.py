@@ -275,14 +275,41 @@ async def add_timing_middleware(request: Request, call_next):
     if not path.startswith("/static") and path != "/health":
         log = structlog.get_logger("deadrop.access")
         log_method = log.warning if duration_ms > 2000 else log.info
+
+        # Identify the calling client so we can correlate access patterns
+        # (e.g. "which client is auto-marking-read?") with an actual
+        # identity/UA pair. The X-Inbox-Secret header derives directly
+        # to an identity_id; UA tells us which client surface is calling.
+        user_agent = request.headers.get("user-agent")
+        secret = request.headers.get("x-inbox-secret")
+        identity_id = None
+        if secret:
+            try:
+                from .auth import derive_id
+
+                identity_id = derive_id(secret)
+            except Exception:
+                identity_id = None
+
+        # Honor X-Forwarded-For when set (we sit behind nginx on dokku);
+        # fall back to request.client.host for direct connections.
+        forwarded_for = request.headers.get("x-forwarded-for")
+        client_ip = (
+            forwarded_for.split(",")[0].strip()
+            if forwarded_for
+            else (request.client.host if request.client else None)
+        )
+
         log_method(
             "request",
             method=request.method,
             path=path,
             status=response.status_code,
             duration_ms=round(duration_ms, 1),
-            client=request.client.host if request.client else None,
+            client=client_ip,
             endpoint=endpoint,
+            user_agent=user_agent,
+            identity_id=identity_id,
         )
 
         # Emit slow-request diagnostic if over threshold
