@@ -120,6 +120,36 @@ class TestRoomRetrieval:
         assert bob_rooms[0]["room_id"] == room2["room_id"]
 
 
+class TestRoomUpdate:
+    """Tests for updating rooms at the DB layer."""
+
+    def test_update_display_name(self):
+        """Update a room's display name."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], display_name="Old Name")
+
+        updated = db.update_room(room["room_id"], display_name="New Name")
+
+        assert updated is not None
+        assert updated["display_name"] == "New Name"
+        assert db.get_room(room["room_id"])["display_name"] == "New Name"
+
+    def test_update_noop_preserves_name(self):
+        """Calling update with no fields leaves the room unchanged."""
+        ns = db.create_namespace()
+        alice = db.create_identity(ns["ns"])
+        room = db.create_room(ns["ns"], alice["id"], display_name="Keep Me")
+
+        updated = db.update_room(room["room_id"])
+
+        assert updated["display_name"] == "Keep Me"
+
+    def test_update_nonexistent_room(self):
+        """Updating a nonexistent room returns None."""
+        assert db.update_room("nonexistent-room-id", display_name="X") is None
+
+
 class TestRoomDeletion:
     """Tests for deleting rooms."""
 
