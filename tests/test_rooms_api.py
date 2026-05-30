@@ -197,6 +197,99 @@ class TestRoomListing:
         assert response.status_code == 403
 
 
+class TestRoomUpdate:
+    """Tests for the PATCH room endpoint."""
+
+    def test_update_display_name(self, client, setup_identities):
+        """PATCH updates display_name and a subsequent GET reflects it."""
+        data = setup_identities
+
+        room = client.post(
+            f"/{data['ns']}/rooms",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json={"display_name": "Old Name"},
+        ).json()
+
+        response = client.patch(
+            f"/{data['ns']}/rooms/{room['room_id']}",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json={"display_name": "#general"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["display_name"] == "#general"
+
+        # GET it back to confirm persistence (and cache invalidation).
+        fetched = client.get(
+            f"/{data['ns']}/rooms/{room['room_id']}",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        )
+        assert fetched.status_code == 200
+        assert fetched.json()["display_name"] == "#general"
+
+    def test_update_room_not_found(self, client, setup_identities):
+        """PATCH on a nonexistent room returns 404 (via membership check)."""
+        data = setup_identities
+
+        response = client.patch(
+            f"/{data['ns']}/rooms/nonexistent-room-id",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json={"display_name": "Whatever"},
+        )
+
+        # Not a member of a room that doesn't exist -> auth layer rejects.
+        assert response.status_code in (403, 404)
+
+    def test_update_room_unauthorized(self, client, setup_identities):
+        """PATCH without an inbox secret fails."""
+        data = setup_identities
+
+        room = client.post(
+            f"/{data['ns']}/rooms",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        ).json()
+
+        response = client.patch(
+            f"/{data['ns']}/rooms/{room['room_id']}",
+            json={"display_name": "Hijacked"},
+        )
+        assert response.status_code == 401
+
+    def test_update_room_not_member(self, client, setup_identities):
+        """A non-member cannot rename a room."""
+        data = setup_identities
+
+        room = client.post(
+            f"/{data['ns']}/rooms",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+        ).json()
+
+        response = client.patch(
+            f"/{data['ns']}/rooms/{room['room_id']}",
+            headers={"X-Inbox-Secret": data["bob"]["secret"]},
+            json={"display_name": "Bob was here"},
+        )
+        assert response.status_code == 403
+
+    def test_update_room_noop_preserves_name(self, client, setup_identities):
+        """PATCH with no display_name leaves the existing name unchanged."""
+        data = setup_identities
+
+        room = client.post(
+            f"/{data['ns']}/rooms",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json={"display_name": "Keep Me"},
+        ).json()
+
+        response = client.patch(
+            f"/{data['ns']}/rooms/{room['room_id']}",
+            headers={"X-Inbox-Secret": data["alice"]["secret"]},
+            json={},
+        )
+        assert response.status_code == 200
+        assert response.json()["display_name"] == "Keep Me"
+
+
 class TestRoomMembers:
     """Tests for room member management."""
 
