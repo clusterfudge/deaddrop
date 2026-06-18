@@ -283,6 +283,22 @@
         if (diffDays < 7) return `${diffDays}d ago`;
         return date.toLocaleDateString();
     }
+
+    // Absolute, locale/timezone-aware timestamp for hover tooltips.
+    // Returns an attribute-safe string (no double-quotes) from the same
+    // source timestamp formatTime() consumes. Empty string on bad input.
+    function formatAbsolute(isoString) {
+        const date = new Date(isoString);
+        if (isNaN(date.getTime())) return '';
+        const str = date.toLocaleString(undefined, {
+            weekday: 'short', year: 'numeric', month: 'short', day: 'numeric',
+            hour: 'numeric', minute: '2-digit', second: '2-digit',
+            timeZoneName: 'short'
+        });
+        // toLocaleString never emits double-quotes, but strip defensively
+        // so the value is always safe inside a double-quoted HTML attribute.
+        return str.replace(/"/g, '');
+    }
     
     function formatExpiry(expiresAt, ttlHours) {
         if (ttlHours === 0) return null;
@@ -691,7 +707,7 @@
                             <div class="thread-content">
                                 <div class="thread-header">
                                     <span class="thread-name">${thread.name}</span>
-                                    <span class="thread-time">${formatTime(thread.time)}</span>
+                                    <span class="thread-time" title="${formatAbsolute(thread.time)}">${formatTime(thread.time)}</span>
                                 </div>
                                 <div class="thread-preview">${escapeHtml(thread.preview).substring(0, 60)}${thread.preview.length > 60 ? '...' : ''}</div>
                                 ${thread.expiry ? `<span class="ttl-indicator ttl-${thread.expiry.style}">${thread.expiry.text}</span>` : ''}
@@ -705,7 +721,7 @@
                             <div class="thread-content">
                                 <div class="thread-header">
                                     <span class="thread-name">${escapeHtml(thread.name)}</span>
-                                    <span class="thread-time">${formatTime(thread.time)}</span>
+                                    <span class="thread-time" title="${formatAbsolute(thread.time)}">${formatTime(thread.time)}</span>
                                 </div>
                                 <div class="thread-preview">${escapeHtml(thread.preview).substring(0, 60)}${thread.preview.length > 60 ? '...' : ''}</div>
                             </div>
@@ -745,7 +761,7 @@
                 <div class="message ${isSent ? 'message-sent' : 'message-received'}">
                     <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
                     <div class="message-meta">
-                        <span>${formatTime(msg.created_at)}</span>
+                        <span title="${formatAbsolute(msg.created_at)}">${formatTime(msg.created_at)}</span>
                         ${expiry ? `<span class="ttl-indicator ttl-${expiry.style}">${expiry.text}</span>` : ''}
                     </div>
                     <div class="message-actions">
@@ -1063,7 +1079,7 @@
             <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
             ${renderAttachments(msg)}
             ${renderReactionBadges(msg.mid, reactionMap)}
-            <div class="message-time">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
+            <div class="message-time" title="${isPending ? '' : formatAbsolute(msg.created_at)}">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
         `;
         return el;
     }
@@ -1604,7 +1620,7 @@
                         <div>
                             <div class="card-title">From: ${getPeerName(msg.from)}</div>
                             <div style="margin: 8px 0;">${msg.body}</div>
-                            <div class="text-muted text-small">Archived ${formatTime(msg.archived_at)}</div>
+                            <div class="text-muted text-small" title="${formatAbsolute(msg.archived_at)}">Archived ${formatTime(msg.archived_at)}</div>
                         </div>
                         <div style="display: flex; gap: 8px;">
                             <button class="btn btn-small btn-secondary" onclick="unarchiveMessage('${msg.mid}')">Restore</button>
