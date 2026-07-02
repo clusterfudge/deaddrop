@@ -2516,3 +2516,24 @@ def get_debug_state(
     """
     require_admin(authorization, x_admin_token)
     return instrument.get_debug_state()
+
+
+@app.get("/debug/db")
+def get_debug_db(
+    authorization: Annotated[str | None, Header()] = None,
+    x_admin_token: Annotated[str | None, Header()] = None,
+):
+    """Return a DB-layer diagnostics snapshot (issue #51).
+
+    Covers executor pool thread counts + sizes, the executor-replace count and
+    last-replace timestamp, cumulative Hrana stream errors, libsql connect
+    count, and health-check run/failure totals. Correlate the
+    ``executor_replace_count_total`` rate with the every-30-60-min hang (#49).
+
+    Requires admin authentication (``Authorization: Bearer <admin_token>``
+    or ``X-Admin-Token`` header).
+    """
+    require_admin(authorization, x_admin_token)
+    from . import db
+
+    return db.get_db_debug_state()
