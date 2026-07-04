@@ -38,7 +38,7 @@ from typing import Any, Iterator, cast
 from uuid_extensions import uuid7 as make_uuid7
 
 from .auth import derive_id, generate_secret, hash_secret
-from .metrics import InstrumentedConnection, timed_query
+from .metrics import InstrumentedConnection, metrics, timed_query
 
 # Deduplication window in seconds — messages with the same sender,
 # destination, and content hash within this window are considered
@@ -148,6 +148,88 @@ _read_executor = None
 _write_executor = None
 _executor_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Runtime diagnostics state (issue #51)
+#
+# Pure instrumentation: counters + timestamps that let us watch the
+# every-30-60-min hang unfold in Grafana / the /debug/db endpoint. These are
+# incremented alongside the existing behavior; they change no control flow.
+# Guarded by their own lock so the /debug/db snapshot is internally consistent
+# without contending on _executor_lock.
+# ---------------------------------------------------------------------------
+_diag_lock = threading.Lock()
+_executor_replace_count = 0
+_last_executor_replace_at: float = 0.0
+_hrana_stream_errors = 0
+_health_check_runs = 0
+_health_check_failures = 0
+_libsql_connect_count = 0
+
+
+def _executor_thread_count(executor) -> int:
+    """Best-effort count of live worker threads in a ThreadPoolExecutor.
+
+    ThreadPoolExecutor spins threads lazily, so this reflects how many
+    workers have actually been created (not max_workers). Returns 0 for a
+    None executor (local-SQLite mode) or if the internal attribute is
+    unavailable on this Python.
+    """
+    if executor is None:
+        return 0
+    threads = getattr(executor, "_threads", None)
+    if threads is None:
+        return 0
+    return sum(1 for t in threads if t.is_alive())
+
+
+def _libsql_registry_size() -> int:
+    """Number of live libsql connections tracked by the background pinger."""
+    with _libsql_registry_lock:
+        return len(_libsql_conn_registry)
+
+
+def get_db_debug_state() -> dict:
+    """Return a diagnostics snapshot of the DB layer (issue #51).
+
+    Instrumentation only — reads the counters/timestamps maintained by the
+    executor-replace, health-ping, hrana-retry, and connect paths. Powers the
+    ``/debug/db`` admin endpoint so the every-30-60-min hang (#49) can be
+    watched unfolding without attaching a debugger.
+    """
+    import time as _time
+
+    with _diag_lock:
+        replace_count = _executor_replace_count
+        last_replace_at = _last_executor_replace_at
+        hrana_errors = _hrana_stream_errors
+        health_runs = _health_check_runs
+        health_failures = _health_check_failures
+        connect_count = _libsql_connect_count
+
+    last_replace_age = (_time.time() - last_replace_at) if last_replace_at else None
+    return {
+        "backend": "libsql" if is_using_libsql() else "sqlite",
+        "read_pool_threads": _executor_thread_count(_read_executor),
+        "write_pool_threads": _executor_thread_count(_write_executor),
+        "read_pool_size": READ_POOL_SIZE,
+        "write_pool_size": WRITE_POOL_SIZE,
+        "libsql_registry_size": _libsql_registry_size(),
+        "executor_replace_count_total": replace_count,
+        "last_executor_replace_at": (
+            _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(last_replace_at))
+            if last_replace_at
+            else None
+        ),
+        "last_executor_replace_age_seconds": (
+            round(last_replace_age, 1) if last_replace_age is not None else None
+        ),
+        "hrana_stream_errors_total": hrana_errors,
+        "libsql_connect_count_total": connect_count,
+        "health_check_runs_total": health_runs,
+        "health_check_failures_total": health_failures,
+    }
+
+
 # Pool sizes — tunable via environment variables.
 READ_POOL_SIZE = int(os.environ.get("DEADROP_READ_POOL_SIZE", "6"))
 WRITE_POOL_SIZE = int(os.environ.get("DEADROP_WRITE_POOL_SIZE", "4"))
@@ -242,9 +324,20 @@ def _replace_db_executor():
     shut down (that would block waiting for the stuck threads to finish).
     """
     global _read_executor, _write_executor
+    global _executor_replace_count, _last_executor_replace_at
 
     if not is_using_libsql():
         return  # Only relevant for libsql
+
+    import time as _time
+
+    now = _time.time()
+    with _diag_lock:
+        _executor_replace_count += 1
+        prev_at = _last_executor_replace_at
+        _last_executor_replace_at = now
+        replace_count = _executor_replace_count
+    since_prev = (now - prev_at) if prev_at else None
 
     with _executor_lock:
         from concurrent.futures import ThreadPoolExecutor
@@ -257,9 +350,23 @@ def _replace_db_executor():
         _write_executor = ThreadPoolExecutor(
             max_workers=WRITE_POOL_SIZE, thread_name_prefix="db-write"
         )
-        logging.getLogger(__name__).warning(
-            "Replaced stuck DB executors with fresh ones (old threads abandoned)"
+        log = logging.getLogger(__name__)
+        log.warning(
+            "Replaced stuck DB executors with fresh ones (old threads abandoned) "
+            "[replace_count=%d, since_prev=%s]",
+            replace_count,
+            f"{since_prev:.1f}s" if since_prev is not None else "n/a",
         )
+        # A tight replace loop (< 60s between replacements) is the signature of
+        # the cascading pool-exhaustion hang in #49 — surface it loudly.
+        if since_prev is not None and since_prev < 60:
+            log.warning(
+                "DB executor replaced again after only %.1fs — possible "
+                "cascading pool exhaustion (#49)",
+                since_prev,
+            )
+
+    metrics.incr("db.executor.replace_count")
 
 
 def _ping_all_workers_in_executor(executor, pool_size: int) -> list[tuple[str, bool, str]]:
@@ -390,6 +497,21 @@ async def health_ping_loop(stop_event=None) -> None:
                 )
 
                 failures = [r for r in read_results + write_results if not r[1]]
+
+                # Diagnostics (issue #51): count every health-check run and the
+                # per-run failure total, and publish live pool thread-count
+                # gauges on the same interval the loop already fires on.
+                global _health_check_runs, _health_check_failures
+                with _diag_lock:
+                    _health_check_runs += 1
+                    _health_check_failures += len(failures)
+                metrics.incr("db.health_check.count")
+                if failures:
+                    metrics.incr("db.health_check.failures", len(failures))
+                metrics.gauge("db.executor.read_thread_count", _executor_thread_count(read_exec))
+                metrics.gauge("db.executor.write_thread_count", _executor_thread_count(write_exec))
+                metrics.gauge("db.connection.registry_size", _libsql_registry_size())
+
                 if failures:
                     log.warning(
                         "health_ping: recycled %d stale connection(s): %s",
@@ -874,6 +996,7 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
         try:
             import time as _time
 
+            _connect_started = _time.perf_counter()
             _local.libsql_conn = _run_with_timeout(
                 lambda: libsql.connect(
                     db_url,
@@ -885,6 +1008,14 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
             )
             _local.libsql_connected_at = _time.time()
             _is_libsql = True
+
+            global _libsql_connect_count
+            _connect_ms = (_time.perf_counter() - _connect_started) * 1000
+            with _diag_lock:
+                _libsql_connect_count += 1
+            metrics.incr("db.libsql_connect.count")
+            metrics.gauge("db.libsql_connect.duration_ms", _connect_ms)
+
             # Register with the background pinger so idle connections get
             # exercised before Turso's LB / intermediate NATs cull them.
             _register_libsql_conn(_local, _local.libsql_conn, _local.libsql_connected_at)
@@ -1041,6 +1172,11 @@ def _execute_with_retry(
             # Only retry for libsql Hrana stream errors
             if _is_libsql and _is_hrana_stream_error(e) and attempt < max_retries:
                 import logging
+
+                global _hrana_stream_errors
+                with _diag_lock:
+                    _hrana_stream_errors += 1
+                metrics.incr("db.hrana_stream_error")
 
                 logging.warning(
                     f"Libsql connection error (attempt {attempt + 1}/{max_retries + 1}), reconnecting: {e}"
