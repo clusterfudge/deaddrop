@@ -167,6 +167,31 @@ const DeadropAPI = {
     },
 
     /**
+     * Fetch an attachment's raw bytes as a downloadable Blob. The server forces
+     * Content-Disposition: attachment and serves text/html as text/plain, so
+     * the bytes can never render inline as live HTML.
+     */
+    async downloadAttachment(credentials, attachmentId) {
+        const response = await fetch(`/${credentials.ns}/attachments/${attachmentId}/download`, {
+            method: 'GET',
+            headers: { 'X-Inbox-Secret': credentials.secret },
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: response.statusText }));
+            throw new Error(error.detail || 'Download failed');
+        }
+        const filename = this._filenameFromDisposition(response.headers.get('Content-Disposition'));
+        const blob = await response.blob();
+        return { blob, filename };
+    },
+
+    _filenameFromDisposition(header) {
+        if (!header) return null;
+        const match = /filename="?([^"]+)"?/.exec(header);
+        return match ? match[1] : null;
+    },
+
+    /**
      * Get unread count for a room.
      */
     async getRoomUnread(credentials, roomId) {

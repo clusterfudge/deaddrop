@@ -145,6 +145,39 @@
         </div>
     </div>
     
+    <!-- Paste-to-attachment metadata dialog -->
+    <div id="paste-attach-modal" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1500;">
+        <div class="card" style="width: 100%; max-width: 480px; margin: 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h2>Attach pasted text</h2>
+                <button id="paste-attach-cancel" class="btn btn-icon">✕</button>
+            </div>
+
+            <p class="text-muted text-small" id="paste-attach-size" style="margin-bottom: 12px;"></p>
+
+            <div class="form-group">
+                <label class="form-label" for="paste-attach-name">File name</label>
+                <input id="paste-attach-name" class="form-input" type="text">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="paste-attach-type">Content type</label>
+                <select id="paste-attach-type" class="form-input">
+                    <option value="text/plain">text/plain (.txt)</option>
+                    <option value="text/markdown">text/markdown (.md)</option>
+                    <option value="text/csv">text/csv (.csv)</option>
+                    <option value="application/json">application/json (.json)</option>
+                    <option value="text/html">text/html (.html)</option>
+                </select>
+            </div>
+
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+                <button id="paste-attach-close" class="btn btn-secondary">Cancel</button>
+                <button id="paste-attach-confirm" class="btn btn-primary">Attach</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Archived View -->
     <div id="view-archived" class="view hidden">
         <div class="header">
@@ -418,7 +451,10 @@
                             </div>`;
                 }
             } else {
-                return `<div class="file-attachment">📄 ${escapeHtml(att.filename || 'file')} (${formatFileSize(att.size)})</div>`;
+                return `<div class="file-attachment" style="cursor:pointer;"
+                             data-attachment-id="${att.id}"
+                             title="Download"
+                             onclick="downloadFileAttachment('${att.id}')">📄 ${escapeHtml(att.filename || 'file')} (${formatFileSize(att.size)})</div>`;
             }
         });
         return `<div class="message-attachments">${parts.join('')}</div>`;
@@ -493,6 +529,114 @@
         renderAttachmentPreview();
     }
 
+    // Pasted text >= this many bytes becomes a downloadable attachment instead
+    // of a giant inline message body.
+    const LARGE_PASTE_THRESHOLD_BYTES = 10240;
+
+    const CONTENT_TYPE_EXTENSIONS = {
+        'application/json': 'json',
+        'text/html': 'html',
+        'text/markdown': 'md',
+        'text/csv': 'csv',
+        'text/plain': 'txt',
+    };
+
+    function byteLength(text) {
+        return new TextEncoder().encode(text).length;
+    }
+
+    /**
+     * Best-effort content sniff for a pasted text blob. Returns a MIME type
+     * used only to pre-fill the dialog dropdown; the user can override it.
+     */
+    function sniffContentType(text) {
+        const trimmed = text.trim();
+        if (!trimmed) return 'text/plain';
+
+        try {
+            JSON.parse(trimmed);
+            return 'application/json';
+        } catch (e) {
+            // not JSON, keep sniffing
+        }
+
+        const lower = trimmed.toLowerCase();
+        if (lower.startsWith('<!doctype html') || lower.startsWith('<html') ||
+            /<\/?(html|head|body|div|span|p|a|script|table)[\s>]/i.test(trimmed)) {
+            return 'text/html';
+        }
+
+        const lines = text.split('\n');
+        const markdownMarkers = [
+            /^#{1,6}\s/m,
+            /```/,
+            /^\s*[-*]\s/m,
+            /^\s*- \[[ xX]\]/m,
+            /\[[^\]]+\]\([^)]+\)/,
+        ];
+        if (markdownMarkers.some(re => re.test(text))) {
+            return 'text/markdown';
+        }
+
+        const dataLines = lines.filter(l => l.trim().length > 0);
+        if (dataLines.length >= 2) {
+            const commaCounts = dataLines.map(l => (l.match(/,/g) || []).length);
+            if (commaCounts[0] >= 1 && commaCounts.every(c => c === commaCounts[0])) {
+                return 'text/csv';
+            }
+        }
+
+        return 'text/plain';
+    }
+
+    function defaultPasteName() {
+        // pasted-YYYY-MM-DDTHH-MM-SS (colons/dots are invalid in filenames)
+        const iso = new Date().toISOString().replace(/[:.]/g, '-').replace(/-\d{3}Z$/, '');
+        return `pasted-${iso}`;
+    }
+
+    let _pendingPasteText = null;
+
+    /**
+     * Show the metadata dialog for a large pasted text blob. On confirm, builds
+     * a File from the text and hands it to addFileToPreview (chip only).
+     */
+    function openPasteAttachDialog(text) {
+        _pendingPasteText = text;
+        const sniffed = sniffContentType(text);
+        const nameInput = document.getElementById('paste-attach-name');
+        const typeSelect = document.getElementById('paste-attach-type');
+        const sizeEl = document.getElementById('paste-attach-size');
+
+        typeSelect.value = sniffed;
+        nameInput.value = `${defaultPasteName()}.${CONTENT_TYPE_EXTENSIONS[sniffed] || 'txt'}`;
+        sizeEl.textContent = `Pasted ${formatFileSize(byteLength(text))} — will be attached as a file.`;
+
+        document.getElementById('paste-attach-modal').classList.remove('hidden');
+        nameInput.focus();
+    }
+
+    function closePasteAttachDialog() {
+        document.getElementById('paste-attach-modal').classList.add('hidden');
+        _pendingPasteText = null;
+    }
+
+    function confirmPasteAttach() {
+        if (_pendingPasteText === null) {
+            closePasteAttachDialog();
+            return;
+        }
+        const contentType = document.getElementById('paste-attach-type').value;
+        let name = document.getElementById('paste-attach-name').value.trim();
+        if (!name) {
+            const ext = CONTENT_TYPE_EXTENSIONS[contentType] || 'txt';
+            name = `${defaultPasteName()}.${ext}`;
+        }
+        const file = new File([_pendingPasteText], name, { type: contentType });
+        addFileToPreview(file);
+        closePasteAttachDialog();
+    }
+
     function renderAttachmentPreview() {
         const preview = document.getElementById('room-attachment-preview');
         if (!preview) return;
@@ -514,9 +658,31 @@
         }).join('');
     }
 
+    /**
+     * Download a non-image attachment via the forced-download endpoint. The
+     * bytes are fetched as a Blob and saved through an object URL, so text/html
+     * attachments are never inserted into the DOM.
+     */
+    async function downloadFileAttachment(attachmentId) {
+        try {
+            const { blob, filename } = await DeadropAPI.downloadAttachment(credentials, attachmentId);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename || 'attachment';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error('Failed to download attachment:', e);
+        }
+    }
+
     // Make removeAttachment available globally for onclick
     window.removeAttachment = removeAttachment;
     window.loadAndShowAttachment = loadAndShowAttachment;
+    window.downloadFileAttachment = downloadFileAttachment;
 
     function highlightCodeBlocks(container) {
         if (typeof hljs === 'undefined') return;
@@ -1583,16 +1749,37 @@
         e.target.value = '';  // Reset so same file can be re-selected
     });
 
-    // Paste handler for images
+    // Paste handler: images become attachments; large text pastes become a
+    // downloadable file attachment (chip) via the metadata dialog.
     document.getElementById('room-message-input').addEventListener('paste', (e) => {
-        const items = e.clipboardData?.items;
-        if (!items) return;
-        for (const item of items) {
+        const clipboard = e.clipboardData;
+        if (!clipboard) return;
+
+        for (const item of clipboard.items || []) {
             if (item.type.startsWith('image/')) {
                 e.preventDefault();
                 const file = item.getAsFile();
                 if (file) addFileToPreview(file);
+                return;
             }
+        }
+
+        const text = clipboard.getData('text/plain');
+        if (text && byteLength(text) >= LARGE_PASTE_THRESHOLD_BYTES) {
+            e.preventDefault();
+            openPasteAttachDialog(text);
+        }
+        // Smaller text pastes fall through to the browser's default inline paste.
+    });
+
+    // Paste-to-attachment metadata dialog wiring.
+    document.getElementById('paste-attach-confirm').addEventListener('click', confirmPasteAttach);
+    document.getElementById('paste-attach-close').addEventListener('click', closePasteAttachDialog);
+    document.getElementById('paste-attach-cancel').addEventListener('click', closePasteAttachDialog);
+    document.getElementById('paste-attach-name').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            confirmPasteAttach();
         }
     });
     
