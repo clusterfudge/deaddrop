@@ -634,9 +634,12 @@ class TestTextAttachmentAllowlist:
         [
             ("text/plain", b"just some plain text"),
             ("text/csv", b"a,b,c\n1,2,3\n"),
+            ("text/tab-separated-values", b"a\tb\tc\n1\t2\t3\n"),
             ("text/markdown", b"# Heading\n\n- item\n"),
             ("text/html", b"<html><body>hi</body></html>"),
             ("application/json", b'{"k": "v"}'),
+            ("application/yaml", b"key: value\nlist:\n  - a\n"),
+            ("application/xml", b"<?xml version='1.0'?><root/>"),
         ],
     )
     def test_text_types_accepted(self, client, room_setup, content_type, payload):
@@ -701,6 +704,25 @@ class TestSafeAttachmentDownload:
         # The bytes are preserved verbatim (so the user can still read/save them),
         # but the wire content-type prevents inline execution.
         assert resp.content == script
+
+    def test_xml_served_as_text_plain_not_xml(self, client, room_setup):
+        """XSS/XXE: an application/xml attachment must be served as text/plain
+        and forced to download, never as renderable/parseable XML inline."""
+        s = room_setup
+        payload = b"<?xml version='1.0'?><root><script>alert(1)</script></root>"
+        att_id = self._upload(client, s, "data.xml", "application/xml", payload)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        ctype = resp.headers["content-type"]
+        assert "xml" not in ctype
+        assert ctype.startswith("text/plain")
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.content == payload
 
     def test_plain_text_download_forces_attachment(self, client, room_setup):
         s = room_setup

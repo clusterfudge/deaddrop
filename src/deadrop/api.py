@@ -1542,19 +1542,25 @@ ALLOWED_ATTACHMENT_TYPES = frozenset(
         "application/pdf",
         "text/plain",
         "text/csv",
+        "text/tab-separated-values",
         "text/markdown",
         "text/html",
         "application/json",
+        "application/yaml",
+        "application/xml",
     }
 )
 
 # Content types that must never be served with a renderable Content-Type on the
 # wire. text/html attachments (e.g. from a large paste) could contain <script>
-# and would execute if a browser rendered them inline, so the raw download path
-# serves them as text/plain and always forces Content-Disposition: attachment.
+# and would execute if a browser rendered them inline; XML can carry script
+# (e.g. inline SVG) or external-entity payloads. The raw download path serves
+# all of these as text/plain and always forces Content-Disposition: attachment.
 NON_RENDERABLE_ATTACHMENT_TYPES = frozenset(
     {
         "text/html",
+        "application/xml",
+        "text/xml",
     }
 )
 DOWNLOAD_SAFE_CONTENT_TYPE = "text/plain; charset=utf-8"

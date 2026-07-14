@@ -166,8 +166,11 @@
                     <option value="text/plain">text/plain (.txt)</option>
                     <option value="text/markdown">text/markdown (.md)</option>
                     <option value="text/csv">text/csv (.csv)</option>
+                    <option value="text/tab-separated-values">text/tab-separated-values (.tsv)</option>
                     <option value="application/json">application/json (.json)</option>
+                    <option value="application/yaml">application/yaml (.yaml)</option>
                     <option value="text/html">text/html (.html)</option>
+                    <option value="application/xml">application/xml (.xml)</option>
                 </select>
             </div>
 
@@ -535,9 +538,12 @@
 
     const CONTENT_TYPE_EXTENSIONS = {
         'application/json': 'json',
+        'application/yaml': 'yaml',
+        'application/xml': 'xml',
         'text/html': 'html',
         'text/markdown': 'md',
         'text/csv': 'csv',
+        'text/tab-separated-values': 'tsv',
         'text/plain': 'txt',
     };
 
@@ -561,6 +567,11 @@
         }
 
         const lower = trimmed.toLowerCase();
+        // XML declaration is more specific than a generic angle-bracket doc,
+        // so check it before the HTML heuristic.
+        if (lower.startsWith('<?xml')) {
+            return 'application/xml';
+        }
         if (lower.startsWith('<!doctype html') || lower.startsWith('<html') ||
             /<\/?(html|head|body|div|span|p|a|script|table)[\s>]/i.test(trimmed)) {
             return 'text/html';
@@ -579,11 +590,27 @@
         }
 
         const dataLines = lines.filter(l => l.trim().length > 0);
+        // Tab-separated: every non-empty line shares the same (>=1) tab count.
+        if (dataLines.length >= 2) {
+            const tabCounts = dataLines.map(l => (l.match(/\t/g) || []).length);
+            if (tabCounts[0] >= 1 && tabCounts.every(c => c === tabCounts[0])) {
+                return 'text/tab-separated-values';
+            }
+        }
+        // Comma-separated: same, for commas.
         if (dataLines.length >= 2) {
             const commaCounts = dataLines.map(l => (l.match(/,/g) || []).length);
             if (commaCounts[0] >= 1 && commaCounts.every(c => c === commaCounts[0])) {
                 return 'text/csv';
             }
+        }
+
+        // YAML: a document marker (---) or several "key: value" lines. Kept last
+        // because its markers are the loosest — only reached when nothing more
+        // specific matched.
+        const yamlKeyLines = dataLines.filter(l => /^[A-Za-z0-9_-]+\s*:(\s|$)/.test(l));
+        if (trimmed.startsWith('---') || yamlKeyLines.length >= 2) {
+            return 'application/yaml';
         }
 
         return 'text/plain';
