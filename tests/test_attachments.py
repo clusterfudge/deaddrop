@@ -390,8 +390,8 @@ class TestAttachmentAPI:
 
 
 class TestAttachmentValidation:
-    def test_reject_html_content_type(self, client, room_setup):
-        """Stored XSS: text/html must be rejected."""
+    def test_accept_html_content_type(self, client, room_setup):
+        """text/html is accepted (large-paste feature) but must be served safely."""
         s = room_setup
         import base64
 
@@ -399,15 +399,14 @@ class TestAttachmentValidation:
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
             json={
-                "body": "XSS attempt",
+                "body": "HTML paste",
                 "attachments": [
-                    {"filename": "evil.html", "content_type": "text/html", "data": html_b64},
+                    {"filename": "note.html", "content_type": "text/html", "data": html_b64},
                 ],
             },
             headers={"X-Inbox-Secret": s["alice_secret"]},
         )
-        assert resp.status_code == 400
-        assert "Unsupported attachment type" in resp.json()["detail"]
+        assert resp.status_code == 200
 
     def test_reject_svg_content_type(self, client, room_setup):
         """SVG can contain scripts — must be rejected."""
@@ -620,3 +619,150 @@ class TestAttachmentMigration:
         fk = fks[0]
         assert fk[2] == "room_messages"  # table
         assert fk[4] == "mid"  # to column
+
+
+# ---------------------------------------------------------------------------
+# Large-paste text attachment tests (allowlist + safe download)
+# ---------------------------------------------------------------------------
+
+
+class TestTextAttachmentAllowlist:
+    """Each text MIME type added for the large-paste feature is accepted."""
+
+    @pytest.mark.parametrize(
+        ("content_type", "payload"),
+        [
+            ("text/plain", b"just some plain text"),
+            ("text/csv", b"a,b,c\n1,2,3\n"),
+            ("text/tab-separated-values", b"a\tb\tc\n1\t2\t3\n"),
+            ("text/markdown", b"# Heading\n\n- item\n"),
+            ("text/html", b"<html><body>hi</body></html>"),
+            ("application/json", b'{"k": "v"}'),
+            ("application/yaml", b"key: value\nlist:\n  - a\n"),
+            ("application/xml", b"<?xml version='1.0'?><root/>"),
+        ],
+    )
+    def test_text_types_accepted(self, client, room_setup, content_type, payload):
+        s = room_setup
+        b64 = base64.b64encode(payload).decode()
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "paste",
+                "attachments": [
+                    {
+                        "filename": f"pasted.{content_type}",
+                        "content_type": content_type,
+                        "data": b64,
+                    },
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["attachments"][0]["content_type"] == content_type
+
+
+class TestSafeAttachmentDownload:
+    """The raw download path must force download and never render HTML inline."""
+
+    def _upload(self, client, s, filename, content_type, payload):
+        b64 = base64.b64encode(payload).decode()
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "paste",
+                "attachments": [
+                    {"filename": filename, "content_type": content_type, "data": b64},
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["attachments"][0]["id"]
+
+    def test_html_served_as_text_plain_not_html(self, client, room_setup):
+        """XSS: a text/html attachment with <script> must NOT be served as
+        renderable text/html — it is downgraded to text/plain and forced to
+        download so it can't execute in the room."""
+        s = room_setup
+        script = b"<html><body><script>alert('xss')</script></body></html>"
+        att_id = self._upload(client, s, "evil.html", "text/html", script)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        # Wire content-type must not be renderable HTML.
+        ctype = resp.headers["content-type"]
+        assert "text/html" not in ctype
+        assert ctype.startswith("text/plain")
+        # Must force download.
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        # The bytes are preserved verbatim (so the user can still read/save them),
+        # but the wire content-type prevents inline execution.
+        assert resp.content == script
+
+    def test_xml_served_as_text_plain_not_xml(self, client, room_setup):
+        """XSS/XXE: an application/xml attachment must be served as text/plain
+        and forced to download, never as renderable/parseable XML inline."""
+        s = room_setup
+        payload = b"<?xml version='1.0'?><root><script>alert(1)</script></root>"
+        att_id = self._upload(client, s, "data.xml", "application/xml", payload)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        ctype = resp.headers["content-type"]
+        assert "xml" not in ctype
+        assert ctype.startswith("text/plain")
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.content == payload
+
+    def test_plain_text_download_forces_attachment(self, client, room_setup):
+        s = room_setup
+        payload = b"hello world"
+        att_id = self._upload(client, s, "note.txt", "text/plain", payload)
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.content == payload
+
+    def test_download_requires_auth(self, client, room_setup):
+        s = room_setup
+        resp = client.get(f"/{s['ns']}/attachments/any-id/download")
+        assert resp.status_code == 401
+
+    def test_download_requires_room_membership(self, client, two_member_setup):
+        s = two_member_setup
+        att_id = self._upload(client, s, "note.txt", "text/plain", b"secret")
+        charlie = client.post(
+            f"/{s['ns']}/identities",
+            headers={"X-Namespace-Secret": s["ns_secret"]},
+            json={"metadata": {"display_name": "Charlie"}},
+        ).json()
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": charlie["secret"]},
+        )
+        assert resp.status_code == 403
+
+    def test_download_filename_header_sanitized(self, client, room_setup):
+        """Newlines/quotes in filename can't break out of the header."""
+        s = room_setup
+        att_id = self._upload(client, s, 'bad"\r\nname.txt', "text/plain", b"x")
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        cd = resp.headers["content-disposition"]
+        assert "\r" not in cd and "\n" not in cd

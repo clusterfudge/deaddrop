@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -1540,8 +1540,30 @@ ALLOWED_ATTACHMENT_TYPES = frozenset(
         "image/gif",
         "image/webp",
         "application/pdf",
+        "text/plain",
+        "text/csv",
+        "text/tab-separated-values",
+        "text/markdown",
+        "text/html",
+        "application/json",
+        "application/yaml",
+        "application/xml",
     }
 )
+
+# Content types that must never be served with a renderable Content-Type on the
+# wire. text/html attachments (e.g. from a large paste) could contain <script>
+# and would execute if a browser rendered them inline; XML can carry script
+# (e.g. inline SVG) or external-entity payloads. The raw download path serves
+# all of these as text/plain and always forces Content-Disposition: attachment.
+NON_RENDERABLE_ATTACHMENT_TYPES = frozenset(
+    {
+        "text/html",
+        "application/xml",
+        "text/xml",
+    }
+)
+DOWNLOAD_SAFE_CONTENT_TYPE = "text/plain; charset=utf-8"
 
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10MB per attachment
 MAX_ATTACHMENTS_PER_MESSAGE = 10
@@ -2225,6 +2247,84 @@ async def get_attachment(
         created_at=attachment.get("created_at", ""),
         data=attachment["data"],
     ).model_dump()
+
+
+def _safe_download_headers(filename: str | None, content_type: str) -> tuple[str, dict[str, str]]:
+    """Compute the wire content-type and headers for a raw attachment download.
+
+    Always forces Content-Disposition: attachment so browsers download rather
+    than render. text/html (and any other non-renderable type) is downgraded to
+    text/plain on the wire so a pasted .html with <script> cannot execute.
+    """
+    wire_content_type = content_type
+    if content_type in NON_RENDERABLE_ATTACHMENT_TYPES:
+        wire_content_type = DOWNLOAD_SAFE_CONTENT_TYPE
+    safe_name = (filename or "attachment").replace("\r", "").replace("\n", "").replace('"', "")
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_name}"',
+        "X-Content-Type-Options": "nosniff",
+    }
+    return wire_content_type, headers
+
+
+@app.get("/{ns}/attachments/{attachment_id}/download")
+async def download_attachment(
+    ns: str,
+    attachment_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+) -> Response:
+    """Serve an attachment's raw bytes as a forced download.
+
+    Unlike the JSON attachment endpoint, this returns the decoded bytes with
+    Content-Disposition: attachment. text/html is served as text/plain so a
+    pasted HTML blob containing <script> cannot be rendered/executed inline
+    (stored-XSS defense). The caller must be a member of the attachment's room.
+    """
+    if not x_inbox_secret:
+        raise HTTPException(401, "X-Inbox-Secret header required")
+
+    caller_id = derive_id(x_inbox_secret)
+
+    def _fetch_and_verify_attachment():
+        attachment = db.get_attachment(attachment_id, include_data=True)
+        if not attachment:
+            return None, "not_found"
+
+        conn = db.get_connection()
+        cursor = conn.execute(
+            "SELECT room_id FROM room_messages WHERE mid = ?",
+            (attachment["message_mid"],),
+            name="download_attachment.lookup_room",
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None, "not_found"
+
+        room_id = row[0]
+        room = db.get_room(room_id)
+        if not room or room["ns"] != ns:
+            return None, "not_found"
+
+        if not db.is_room_member(room_id, caller_id):
+            return None, "forbidden"
+
+        return attachment, None
+
+    attachment, err = await _run_read(_fetch_and_verify_attachment)
+    if err == "not_found":
+        raise HTTPException(404, "Attachment not found")
+    if err == "forbidden":
+        raise HTTPException(403, "Not a room member")
+    if not attachment:
+        raise HTTPException(404, "Attachment not found")
+
+    import base64
+
+    raw = base64.b64decode(attachment["data"])
+    wire_content_type, headers = _safe_download_headers(
+        attachment.get("filename"), attachment["content_type"]
+    )
+    return Response(content=raw, media_type=wire_content_type, headers=headers)
 
 
 @app.post("/{ns}/subscribe")
