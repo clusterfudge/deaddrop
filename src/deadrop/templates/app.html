@@ -776,6 +776,85 @@
         `).join('');
     }
     
+    // ==================== ROUTING ====================
+
+    const LAST_ROUTE_KEY = 'deadrop_last_route';
+
+    /**
+     * Record the app path so a later bare launch can resume here.
+     * Wrapped because localStorage throws when storage is disabled or full.
+     */
+    function rememberRoute(path) {
+        try {
+            localStorage.setItem(LAST_ROUTE_KEY, path);
+        } catch (e) {
+            /* no persistence available — restore is best-effort */
+        }
+    }
+
+    /** Push a new history entry and record it as the resume point. */
+    function navigate(path) {
+        history.pushState({}, '', path);
+        rememberRoute(path);
+    }
+
+    /**
+     * Show the view for an app path, if credentials exist for its namespace.
+     * Returns false when the path is unroutable so the caller can fall back
+     * to the namespace list. A room that 404s/403s (deleted, or membership
+     * revoked) drops back to the namespace inbox rather than a dead view.
+     */
+    function routeTo(path) {
+        const roomMatch = path.match(/^\/app\/([^/]+)\/room\/([^/]+)$/);
+        const peerMatch = path.match(/^\/app\/([^/]+)\/([^/]+)$/);
+        const nsMatch = path.match(/^\/app\/([^/]+)$/);
+        const slug = (roomMatch || peerMatch || nsMatch || [])[1];
+        if (!slug) return false;
+
+        const creds = CredentialStore.getCredentials(slug);
+        if (!creds) return false;
+        credentials = creds;
+
+        if (roomMatch) {
+            openNamespace(slug)
+                .then(() => openRoom(roomMatch[2], true))
+                .then((opened) => {
+                    if (!opened) {
+                        currentRoomId = null;
+                        openNamespace(slug);
+                    }
+                });
+        } else if (peerMatch && peerMatch[2] !== 'archived' && peerMatch[2] !== 'settings') {
+            openNamespace(slug).then(() => openConversation(peerMatch[2]));
+        } else {
+            openNamespace(slug);
+        }
+        return true;
+    }
+
+    /**
+     * Resume the last route, but only when this load carries no route of its
+     * own. An installed PWA always relaunches at the manifest start_url, so
+     * that case is indistinguishable from a plain visit to /app and is the
+     * only one safe to override. Any explicit route — a shared link, an
+     * invite, a notification tap — wins over the saved one.
+     */
+    function restoreLastRoute() {
+        const path = window.location.pathname;
+        const bareLaunch = (path === '/app' || path === '/app/')
+            && !currentSlug && !currentRoomId && !currentPeerId && !currentView;
+        if (!bareLaunch) return false;
+
+        let saved = null;
+        try {
+            saved = localStorage.getItem(LAST_ROUTE_KEY);
+        } catch (e) {
+            return false;
+        }
+        if (!saved || saved === '/app' || saved === '/app/') return false;
+        return routeTo(saved);
+    }
+
     // ==================== OPEN NAMESPACE ====================
     
     async function openNamespace(slug) {
@@ -789,7 +868,7 @@
         // Hide deep link banner if showing
         document.getElementById('deep-link-banner').classList.add('hidden');
         
-        history.pushState({}, '', `/app/${slug}`);
+        navigate(`/app/${slug}`);
         
         const nsDisplay = CredentialStore.getNamespace(slug)?.displayName || slug;
         document.getElementById('inbox-title').textContent = nsDisplay;
@@ -931,7 +1010,7 @@
     
     function openConversation(peerId) {
         currentPeerId = peerId;
-        history.pushState({}, '', `/app/${currentSlug}/${peerId}`);
+        navigate(`/app/${currentSlug}/${peerId}`);
         
         document.getElementById('conversation-title').textContent = getPeerName(peerId);
         showView('conversation');
@@ -1010,9 +1089,9 @@
     
     // ==================== ROOMS ====================
     
-    async function openRoom(roomId) {
+    async function openRoom(roomId, silent = false) {
         currentRoomId = roomId;
-        history.pushState({}, '', `/app/${currentSlug}/room/${roomId}`);
+        navigate(`/app/${currentSlug}/room/${roomId}`);
         
         // Show room view immediately with loading state
         showView('roomChat');
@@ -1041,9 +1120,11 @@
             // Re-render now that we have member names
             renderRoomMessages();
             document.getElementById('room-message-input').focus();
+            return true;
             
         } catch (e) {
-            alert('Failed to open room: ' + e.message);
+            if (!silent) alert('Failed to open room: ' + e.message);
+            return false;
         }
     }
     
@@ -1679,7 +1760,7 @@
     
     document.getElementById('inbox-back').addEventListener('click', (e) => {
         e.preventDefault();
-        history.pushState({}, '', '/app');
+        navigate('/app');
         currentSlug = null;
         stopSubscription();
         showView('namespaces');
@@ -1688,7 +1769,7 @@
     
     document.getElementById('conversation-back').addEventListener('click', (e) => {
         e.preventDefault();
-        history.pushState({}, '', `/app/${currentSlug}`);
+        navigate(`/app/${currentSlug}`);
         currentPeerId = null;
         showView('inbox');
     });
@@ -1700,7 +1781,7 @@
         roomMembers = {};
         roomHasOlderMessages = true;
         roomLoadingOlder = false;
-        history.pushState({}, '', `/app/${currentSlug}`);
+        navigate(`/app/${currentSlug}`);
         showView('inbox');
     });
     
@@ -1812,7 +1893,7 @@
     
     document.getElementById('archived-link').addEventListener('click', async (e) => {
         e.preventDefault();
-        history.pushState({}, '', `/app/${currentSlug}/archived`);
+        navigate(`/app/${currentSlug}/archived`);
         showView('archived');
         
         const list = document.getElementById('archived-list');
@@ -1850,7 +1931,7 @@
     
     document.getElementById('archived-back').addEventListener('click', (e) => {
         e.preventDefault();
-        history.pushState({}, '', `/app/${currentSlug}`);
+        navigate(`/app/${currentSlug}`);
         showView('inbox');
     });
     
@@ -1952,6 +2033,7 @@
      */
     window.addEventListener('popstate', () => {
         const path = window.location.pathname;
+        rememberRoute(path);
         
         if (path === '/app' || path === '/app/') {
             // Namespace list
@@ -2045,38 +2127,11 @@
             // navigate to the saved destination now
             sessionStorage.removeItem('deadrop_deep_link');
             
-            // Parse the saved path and try to navigate
-            const roomMatch = savedDestination.match(/^\/app\/([^/]+)\/room\/([^/]+)$/);
-            const peerMatch = savedDestination.match(/^\/app\/([^/]+)\/([^/]+)$/);
-            const nsMatch = savedDestination.match(/^\/app\/([^/]+)$/);
-            
-            if (roomMatch) {
-                const [, slug, roomId] = roomMatch;
-                credentials = CredentialStore.getCredentials(slug);
-                if (credentials) {
-                    openNamespace(slug).then(() => openRoom(roomId));
-                    return;
-                }
-            } else if (peerMatch) {
-                const [, slug, peerId] = peerMatch;
-                credentials = CredentialStore.getCredentials(slug);
-                if (credentials) {
-                    openNamespace(slug).then(() => openConversation(peerId));
-                    return;
-                }
-            } else if (nsMatch) {
-                const [, slug] = nsMatch;
-                credentials = CredentialStore.getCredentials(slug);
-                if (credentials) {
-                    openNamespace(slug);
-                    return;
-                }
+            if (!routeTo(savedDestination)) {
+                showView('namespaces');
+                renderNamespaceList();
             }
-            
-            // Couldn't navigate — show namespace list
-            showView('namespaces');
-            renderNamespaceList();
-        } else {
+        } else if (!restoreLastRoute()) {
             showView('namespaces');
             renderNamespaceList();
         }
