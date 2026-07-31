@@ -174,7 +174,13 @@ def _coerce_read_cursor(value: str | None, field_name: str = "cursor") -> str | 
     seeded UUIDv4 cursors into client-held state — localStorage, SSE topic
     subscriptions, the web UI's last-rendered mid. A strict 400 on those
     would wedge the reader forever; instead, quietly fall back to "no
-    cursor" (i.e. latest messages) and log once so we can see the churn.
+    cursor" (i.e. latest messages).
+
+    Each discard emits a `bad_cursor` event on the `deadrop.access` logger,
+    once per request. The access-log contextvars bound by the timing
+    middleware (request_id, identity_id, client, user_agent, endpoint) ride
+    along, so a burst is attributable to an identity without correlating
+    timestamps by hand.
 
     Write paths (POST /read, reply reference_mid) stay strict via
     _require_uuid7 — we do not want new v4s written to the DB.
@@ -183,7 +189,13 @@ def _coerce_read_cursor(value: str | None, field_name: str = "cursor") -> str | 
         return None
     if _is_valid_uuid7(value):
         return value
-    logger.warning("ignoring non-v7 read cursor for %s: %r", field_name, value)
+    import structlog
+
+    structlog.get_logger("deadrop.access").warning(
+        "bad_cursor",
+        field=field_name,
+        cursor=value,
+    )
     return None
 
 
@@ -221,17 +233,6 @@ async def add_timing_middleware(request: Request, call_next):
     query_buffer: list[dict] = []
     buffer_token = _request_query_buffer.set(query_buffer)
 
-    start_time = time.perf_counter()
-
-    response = await call_next(request)
-    # NOTE: endpoint label computed below — instrument.request_start/end
-    # are called after we know the endpoint pattern.
-
-    duration_ms = (time.perf_counter() - start_time) * 1000
-
-    # --- Request END: slow-request flush ---
-    slow_threshold_ms = float(os.environ.get("SLOW_REQUEST_THRESHOLD_MS", "500"))
-
     # Extract endpoint pattern for metrics aggregation.
     # We include the HTTP method for key endpoints so GET vs POST are
     # distinguishable in Grafana (e.g. rooms/messages.GET vs rooms/messages.POST).
@@ -260,26 +261,18 @@ async def add_timing_middleware(request: Request, call_next):
     else:
         endpoint = "other"
 
-    metrics.record_request(endpoint, duration_ms, status=response.status_code)
-
-    # Also emit to pluggable sink via instrument module
-    instrument.sink.timing("request.duration_ms", duration_ms, tags={"endpoint": endpoint})
-    instrument.sink.counter(
-        "request.status", tags={"status": str(response.status_code), "endpoint": endpoint}
-    )
-
-    # Add timing header for debugging
-    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
-
     # Structured request log — skip static assets and health checks
-    if not path.startswith("/static") and path != "/health":
-        log = structlog.get_logger("deadrop.access")
-        log_method = log.warning if duration_ms > 2000 else log.info
+    logged_path = not path.startswith("/static") and path != "/health"
 
-        # Identify the calling client so we can correlate access patterns
-        # (e.g. "which client is auto-marking-read?") with an actual
-        # identity/UA pair. The X-Inbox-Secret header derives directly
-        # to an identity_id; UA tells us which client surface is calling.
+    # Identify the calling client so we can correlate access patterns
+    # (e.g. "which client is auto-marking-read?") with an actual
+    # identity/UA pair. The X-Inbox-Secret header derives directly
+    # to an identity_id; UA tells us which client surface is calling.
+    #
+    # Bound as contextvars before the handler runs so anything the handler
+    # logs — bad_cursor, slow queries — carries the same attribution as the
+    # access log rather than needing timestamp correlation after the fact.
+    if logged_path:
         user_agent = request.headers.get("user-agent")
         secret = request.headers.get("x-inbox-secret")
         identity_id = None
@@ -299,6 +292,36 @@ async def add_timing_middleware(request: Request, call_next):
             if forwarded_for
             else (request.client.host if request.client else None)
         )
+        structlog.contextvars.bind_contextvars(
+            endpoint=endpoint,
+            client=client_ip,
+            user_agent=user_agent,
+            identity_id=identity_id,
+        )
+
+    start_time = time.perf_counter()
+
+    response = await call_next(request)
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+
+    # --- Request END: slow-request flush ---
+    slow_threshold_ms = float(os.environ.get("SLOW_REQUEST_THRESHOLD_MS", "500"))
+
+    metrics.record_request(endpoint, duration_ms, status=response.status_code)
+
+    # Also emit to pluggable sink via instrument module
+    instrument.sink.timing("request.duration_ms", duration_ms, tags={"endpoint": endpoint})
+    instrument.sink.counter(
+        "request.status", tags={"status": str(response.status_code), "endpoint": endpoint}
+    )
+
+    # Add timing header for debugging
+    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+
+    if logged_path:
+        log = structlog.get_logger("deadrop.access")
+        log_method = log.warning if duration_ms > 2000 else log.info
 
         log_method(
             "request",
@@ -306,10 +329,6 @@ async def add_timing_middleware(request: Request, call_next):
             path=path,
             status=response.status_code,
             duration_ms=round(duration_ms, 1),
-            client=client_ip,
-            endpoint=endpoint,
-            user_agent=user_agent,
-            identity_id=identity_id,
         )
 
         # Emit slow-request diagnostic if over threshold
@@ -330,7 +349,9 @@ async def add_timing_middleware(request: Request, call_next):
 
     # Always clean up: reset buffer ContextVar + unbind request_id from structlog
     _request_query_buffer.reset(buffer_token)
-    structlog.contextvars.unbind_contextvars("request_id")
+    structlog.contextvars.unbind_contextvars(
+        "request_id", "endpoint", "client", "user_agent", "identity_id"
+    )
 
     return response
 
@@ -2363,14 +2384,27 @@ async def subscribe(
 
     await _validate_subscription_topics(ns, request.topics, caller_id)
 
-    # Subscribe is a READ path — non-v7 cursors degrade to "no cursor"
-    # so legacy v4 values in client state don't wedge the subscription.
-    request.topics = {
-        topic_key: _coerce_read_cursor(cursor, f"cursor for {topic_key}")
-        for topic_key, cursor in request.topics.items()
-    }
-
     event_bus = get_event_bus()
+
+    # Subscribe is a READ path — non-v7 cursors degrade rather than 400.
+    #
+    # An absent cursor and an unusable cursor are different states and must
+    # not share a value here. The event bus reads None as "never seen this
+    # topic", which reports every non-empty topic as changed; applied to a
+    # cursor we merely failed to parse, that returns the subscription
+    # immediately on every call and converts one client into a poll-rate
+    # load generator. An unusable cursor means "we cannot tell what this
+    # client has seen", so pin it to the topic's current latest mid: the
+    # call blocks for its timeout like any caught-up subscriber, and a
+    # publish inside the window still wakes it with a v7 mid the client can
+    # recover its cursor from.
+    coerced: dict[str, str | None] = {}
+    for topic_key, cursor in request.topics.items():
+        resolved = _coerce_read_cursor(cursor, f"cursor for {topic_key}")
+        if resolved is None and cursor:
+            resolved = event_bus.get_latest(ns, topic_key)
+        coerced[topic_key] = resolved
+    request.topics = coerced
 
     if request.mode == "stream":
         # SSE streaming mode
