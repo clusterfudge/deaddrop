@@ -2,6 +2,22 @@
  * API client for Deadrop.
  */
 
+/**
+ * True when `value` is a UUID v7 string.
+ *
+ * Cursors are ordered by lexicographic string comparison, which is only
+ * meaningful between UUIDv7s. A v4 such as '1e141d46-...' sorts above every
+ * v7 ('0194...', '01f0...'), so a v4 held as a cursor can never be passed by
+ * a real message ID. Callers treat a non-v7 cursor as unset. The pattern
+ * matches the server's _UUID7_RE (api.py) so the client never keeps a cursor
+ * the server would discard; the version nibble is the same '7' at position 14
+ * that db.update_room_read_cursor tests.
+ */
+function isUuidV7(value) {
+    return typeof value === 'string'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 const DeadropAPI = {
     /**
      * Make an authenticated API request.
@@ -297,7 +313,21 @@ class SubscriptionManager {
     _loadCursors() {
         try {
             const stored = localStorage.getItem(this._cursorKey());
-            return stored ? JSON.parse(stored) : {};
+            const parsed = stored ? JSON.parse(stored) : {};
+            if (!parsed || typeof parsed !== 'object') return {};
+            // Drop non-v7 entries: the server discards them and they can
+            // never be advanced past, so a poisoned profile would stay
+            // poisoned for the lifetime of the localStorage entry.
+            const cursors = {};
+            const dropped = [];
+            for (const [topic, mid] of Object.entries(parsed)) {
+                if (isUuidV7(mid)) cursors[topic] = mid;
+                else dropped.push(topic);
+            }
+            if (dropped.length) {
+                console.warn('Dropped non-v7 stored cursors:', dropped.join(', '));
+            }
+            return cursors;
         } catch (e) {
             return {};
         }
@@ -318,11 +348,14 @@ class SubscriptionManager {
      * Update cursor for a topic.
      */
     updateCursor(topic, mid) {
-        if (!this.cursors[topic] || mid > this.cursors[topic]) {
+        if (!isUuidV7(mid)) return;
+        const current = this.cursors[topic];
+        if (!isUuidV7(current) || mid > current) {
             this.cursors[topic] = mid;
             this._saveCursors();
         }
     }
+
 
     /**
      * Build the topics map for subscription from current state.
@@ -522,3 +555,4 @@ class SubscriptionManager {
 }
 
 window.SubscriptionManager = SubscriptionManager;
+window.isUuidV7 = isUuidV7;

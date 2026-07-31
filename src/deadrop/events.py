@@ -288,8 +288,22 @@ class InMemoryEventBus(EventBus):
                 }
 
     def get_latest(self, namespace: str, topic: str) -> str | None:
-        """Get the latest known mid for a topic."""
+        """Get the latest known mid for a topic.
+
+        Consults the DB fallback when this process has seen no publish for
+        the topic, so a freshly-started process reports the same value it
+        would report after a publish. The result is cached in ``_latest``
+        exactly as ``_check_changes`` caches it.
+        """
         entry = self._latest.get(namespace, {}).get(topic)
+        if entry is None and self._db_fallback is not None:
+            try:
+                entry = self._db_fallback(namespace, topic, None)
+            except Exception:
+                logger.warning("db_fallback failed for topic %s", topic, exc_info=True)
+                entry = None
+            if entry is not None:
+                self._latest[namespace][topic] = entry
         if entry is None:
             return None
         mid, _sender_id = entry
