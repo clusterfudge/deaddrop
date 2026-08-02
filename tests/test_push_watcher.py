@@ -256,6 +256,25 @@ class TestWatcherSuppresses:
         assert sender.sent == []
         assert watcher.pending_keys == set()
 
+    async def test_reactions_do_not_notify(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+        original = _send(room, room["bob"], "ship it")
+        reaction = db.send_room_message(
+            room_id=room["room_id"],
+            from_id=room["alice"],
+            body="👍",
+            content_type="reaction",
+            reference_mid=original["mid"],
+        )
+
+        task = watcher.on_room_message(room["ns"], room["room_id"], reaction, room["alice"], "twin")
+        await asyncio.sleep(0.2)
+
+        assert task is None
+        assert sender.sent == []
+
     async def test_push_disabled_is_a_no_op(self, room):
         _subscribe(room, room["bob"])
         sender = RecordingSender()

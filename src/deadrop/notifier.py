@@ -159,11 +159,15 @@ class UnreadWatcher:
     ) -> asyncio.Task | None:
         """Arm notification timers for every recipient of a room message.
 
+        Reactions are skipped: they carry no text and arrive in bursts.
+
         Returns the fan-out task (tests await it); ``None`` when push is
         disabled, which is the default.
         """
         cfg = self.config
         if not cfg.configured:
+            return None
+        if message.get("content_type") == "reaction":
             return None
 
         task = asyncio.create_task(self._fan_out(ns, room_id, message, sender_id, room_name, cfg))
