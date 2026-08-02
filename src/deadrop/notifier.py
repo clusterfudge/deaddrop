@@ -134,6 +134,11 @@ class UnreadWatcher:
         self._tasks: set[asyncio.Task] = set()
 
     @property
+    def sender(self):
+        """The delivery callable, so other call sites share the test stub."""
+        return self._sender
+
+    @property
     def config(self) -> push.PushConfig:
         return self._config if self._config is not None else push.load_config()
 

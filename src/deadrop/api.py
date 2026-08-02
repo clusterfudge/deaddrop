@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import cache, db, instrument
+from . import cache, db, instrument, push
 from .auth import derive_id
 from .auth_provider import (
     extract_bearer_token,
@@ -142,7 +142,25 @@ async def lifespan(app: FastAPI):
     # a user request hits it. Only matters for libsql; the loop itself
     # no-ops for local SQLite.
 
+    push_cfg = push.load_config()
+    if push_cfg.configured:
+        logger.info(
+            "Web Push enabled (unread=%ss, cooldown=%ss)",
+            push_cfg.unread_seconds,
+            push_cfg.cooldown_seconds,
+        )
+    elif push_cfg.enabled:
+        logger.warning(
+            "DEADROP_PUSH_ENABLED is set but the VAPID keypair/subject is incomplete "
+            "— Web Push will stay off"
+        )
+
     yield
+
+    # Cancel any armed notification timers before the loop goes away
+    from .notifier import shutdown_watcher
+
+    await shutdown_watcher()
 
     # Stop background cache refresh
     stop_cache_warming()
@@ -1640,6 +1658,19 @@ class UpdateReadCursorRequest(BaseModel):
     last_read_mid: str
 
 
+class PushSubscriptionKeys(BaseModel):
+    """The key material a browser hands back from PushManager.subscribe()."""
+
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionRequest(BaseModel):
+    endpoint: str
+    keys: PushSubscriptionKeys
+    user_agent: str | None = None
+
+
 # --- Room Helper Functions ---
 
 
@@ -2026,6 +2057,19 @@ async def send_room_message(
         except Exception:
             logger.warning("Failed to publish room event", exc_info=True)
 
+        try:
+            from .notifier import get_watcher
+
+            get_watcher().on_room_message(
+                ns,
+                room_id,
+                message,
+                sender_id=from_id,
+                room_name=room.get("display_name"),
+            )
+        except Exception:
+            logger.warning("Failed to arm push notification", exc_info=True)
+
     response_data = RoomMessageInfo.from_db(message, attachment_records or None).model_dump()
 
     headers = {}
@@ -2033,6 +2077,20 @@ async def send_room_message(
         headers["Dedup-Status"] = "deduplicated"
 
     return JSONResponse(content=response_data, headers=headers)
+
+
+def _disarm_push(room_id: str, identity_id: str, last_read_mid: str) -> None:
+    """Tell the watcher a reader caught up, so a pending push is dropped.
+
+    The watcher re-reads the cursor from the DB before sending anyway; this
+    call just avoids the wait and the round-trip.
+    """
+    try:
+        from .notifier import get_watcher
+
+        get_watcher().on_read_cursor(room_id, identity_id, last_read_mid)
+    except Exception:
+        logger.warning("Failed to disarm push notification", exc_info=True)
 
 
 @app.post("/{ns}/rooms/{room_id}/read")
@@ -2078,6 +2136,7 @@ async def update_read_cursor(
             )
             if not result:
                 raise HTTPException(400, "Failed to update read cursor")
+            _disarm_push(room_id, identity_id, request.last_read_mid)
             return {"ok": True, "last_read_mid": request.last_read_mid}
 
     # Cache miss — combine auth + write in a single executor dispatch
@@ -2106,6 +2165,7 @@ async def update_read_cursor(
     if not result:
         raise HTTPException(400, "Failed to update read cursor")
 
+    _disarm_push(room_id, identity_id, request.last_read_mid)
     return {"ok": True, "last_read_mid": request.last_read_mid}
 
 
@@ -2123,6 +2183,168 @@ async def get_unread_count(
 
     count = await _run_read(db.get_room_unread_count, room_id, identity_id)
     return {"unread_count": count, "room_id": room_id}
+
+
+# --- Web Push Endpoints ---
+
+
+def _validate_push_endpoint(endpoint: str) -> None:
+    """Reject endpoints the server has no business POSTing to.
+
+    Every real push service (Apple, Mozilla, FCM) issues an https URL on a
+    public host. Refusing anything else keeps the subscription table from
+    being usable as an SSRF primitive.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https":
+        raise HTTPException(400, "Push endpoint must be an https URL")
+    host = (parsed.hostname or "").lower()
+    if not host or "." not in host:
+        raise HTTPException(400, "Push endpoint must have a public hostname")
+    if host.endswith(".local") or host in ("localhost", "127.0.0.1", "::1"):
+        raise HTTPException(400, "Push endpoint must not be a local address")
+    if len(endpoint) > 2048:
+        raise HTTPException(400, "Push endpoint too long")
+
+
+@app.get("/push/vapid-public-key")
+def push_vapid_public_key():
+    """Public VAPID key for ``PushManager.subscribe()``.
+
+    Unauthenticated: the application server public key is public by design,
+    and the client needs it before it has picked an identity.
+    """
+
+    cfg = push.load_config()
+    return {
+        "enabled": cfg.configured,
+        "public_key": cfg.public_key if cfg.configured else None,
+        "unread_seconds": cfg.unread_seconds,
+    }
+
+
+@app.post("/{ns}/push/subscriptions")
+async def create_push_subscription(
+    ns: str,
+    request: PushSubscriptionRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Register a Web Push subscription for the calling identity."""
+    import functools
+
+    await _require_active_namespace(ns)
+    identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
+    _validate_push_endpoint(request.endpoint)
+
+    record = await _run_write(
+        functools.partial(
+            db.upsert_push_subscription,
+            ns,
+            identity_id,
+            request.endpoint,
+            request.keys.p256dh,
+            request.keys.auth,
+            request.user_agent,
+        )
+    )
+    return {"ok": True, "endpoint": record.get("endpoint"), "identity_id": identity_id}
+
+
+@app.get("/{ns}/push/subscriptions")
+async def list_push_subscriptions(
+    ns: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """List the calling identity's subscriptions, without key material."""
+    await _require_active_namespace(ns)
+    identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
+
+    rows = await _run_read(db.list_push_subscriptions, ns, identity_id)
+    return {
+        "subscriptions": [
+            {
+                "endpoint": row["endpoint"],
+                "user_agent": row.get("user_agent"),
+                "created_at": row.get("created_at"),
+                "last_ok_at": row.get("last_ok_at"),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.delete("/{ns}/push/subscriptions")
+async def remove_push_subscription(
+    ns: str,
+    endpoint: Annotated[str, Query()],
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Remove one of the calling identity's subscriptions."""
+    import functools
+
+    await _require_active_namespace(ns)
+    identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
+
+    deleted = await _run_write(
+        functools.partial(db.delete_push_subscription, endpoint, ns, identity_id)
+    )
+    if not deleted:
+        raise HTTPException(404, "Subscription not found")
+    return {"ok": True, "endpoint": endpoint}
+
+
+@app.post("/{ns}/push/test")
+async def send_test_push(
+    ns: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Send a test notification to every device the caller has registered.
+
+    The one-tap check that a subscription actually reaches the phone,
+    without waiting for someone to send a message and not read it.
+    """
+
+    from .notifier import get_watcher
+
+    await _require_active_namespace(ns)
+    identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
+
+    cfg = push.load_config()
+    if not cfg.configured:
+        raise HTTPException(503, "Web Push is not configured on this server")
+
+    subscriptions = await _run_read(db.list_push_subscriptions, ns, identity_id)
+    if not subscriptions:
+        raise HTTPException(404, "No push subscriptions registered")
+
+    namespace = await _run_read(db.get_namespace, ns)
+    slug = (namespace or {}).get("slug") or ns
+    payload = push.build_payload(
+        title="Deadrop",
+        body="Test notification — push is working.",
+        navigate=f"/app/{slug}",
+        tag="deadrop-test",
+    )
+
+    sender = get_watcher().sender
+    results = await asyncio.gather(
+        *(sender(sub, payload, cfg) for sub in subscriptions),
+        return_exceptions=True,
+    )
+
+    sent, failed = 0, []
+    for result in results:
+        if isinstance(result, BaseException):
+            failed.append(str(result))
+            continue
+        if result.ok:
+            sent += 1
+        else:
+            failed.append(f"{result.status_code}: {result.error}")
+
+    return {"sent": sent, "total": len(subscriptions), "errors": failed}
 
 
 # --- Subscription Endpoint ---
