@@ -9,7 +9,7 @@
 //
 // Cache version: bump CACHE_NAME when shell assets change to force update.
 
-const CACHE_NAME = 'deadrop-shell-v3';
+const CACHE_NAME = 'deadrop-shell-v4';
 const APP_SHELL = [
   '/app',
   '/static/css/style.css',
@@ -56,6 +56,7 @@ self.addEventListener('activate', (event) => {
 //   /{ns}/invites/**               — invite list (dynamic)
 //   /{ns}/rooms/**                 — room list + messages + unread (dynamic)
 //   /{ns}/attachments/**           — binary attachment data (dynamic)
+//   /{ns}/push/**, /push/**        — push subscription state + VAPID key
 //   /health, /metrics              — ops endpoints
 //
 // HTML shell routes (/app/**, /, /join/**) are intentionally cacheable
@@ -69,6 +70,8 @@ const NO_CACHE_PATTERNS = [
   /^\/[^/]+\/invites(\/|$)/,
   /^\/[^/]+\/rooms(\/|$)/,
   /^\/[^/]+\/attachments(\/|$)/,
+  /^\/[^/]+\/push(\/|$)/,
+  /^\/push(\/|$)/,
   /^\/health$/,
   /^\/metrics$/,
 ];
@@ -114,4 +117,73 @@ self.addEventListener('message', (event) => {
   if (event.data === 'skipWaiting') {
     self.skipWaiting();
   }
+});
+
+// --- Web Push ---
+//
+// The server sends a Declarative Web Push envelope:
+//
+//   { "web_push": 8030,
+//     "notification": { "title", "body", "navigate", "tag" } }
+//
+// iOS >= 18.4 and Safari 18.4 render that envelope themselves and never
+// run this handler. Everything older (including iOS 16.4-18.3, the floor
+// for Web Push in an installed web app) dispatches it here, so both
+// generations are served by one payload shape.
+
+self.addEventListener('push', (event) => {
+  let envelope = {};
+  try {
+    envelope = event.data ? event.data.json() : {};
+  } catch (err) {
+    envelope = { notification: { body: event.data ? event.data.text() : '' } };
+  }
+
+  const n = envelope.notification || envelope || {};
+  const navigateTo = n.navigate || '/app';
+
+  // userVisibleOnly is mandatory on iOS: failing to show a notification
+  // for a delivered push revokes the subscription.
+  event.waitUntil(
+    self.registration.showNotification(n.title || 'Deadrop', {
+      body: n.body || '',
+      tag: n.tag || 'deadrop',
+      icon: '/static/icons/icon-192.png',
+      badge: '/static/icons/icon-192.png',
+      data: { navigate: navigateTo },
+    }),
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+
+  const target = new URL(
+    (event.notification.data && event.notification.data.navigate) || '/app',
+    self.location.origin,
+  );
+
+  // Focus an existing window when one is open — on iOS that is the
+  // installed web app, which is the whole point of owning the
+  // notification instead of routing through a third-party app.
+  event.waitUntil(
+    (async () => {
+      const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      for (const client of windows) {
+        if (new URL(client.url).origin !== target.origin) continue;
+        await client.focus();
+        if ('navigate' in client) {
+          try {
+            await client.navigate(target.href);
+          } catch (err) {
+            client.postMessage({ type: 'navigate', url: target.href });
+          }
+        } else {
+          client.postMessage({ type: 'navigate', url: target.href });
+        }
+        return;
+      }
+      await self.clients.openWindow(target.href);
+    })(),
+  );
 });

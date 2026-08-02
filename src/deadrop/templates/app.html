@@ -49,6 +49,7 @@
                 <div class="subtitle" id="inbox-subtitle">as Identity</div>
             </div>
             <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
+                <button class="theme-toggle hidden" id="push-toggle-btn" onclick="togglePush()" title="Notifications" aria-label="Toggle push notifications">🔕</button>
                 <button class="theme-toggle" id="theme-toggle-btn-inbox" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
                 <a href="#" id="inbox-settings" class="btn btn-icon">⚙️</a>
             </div>
@@ -855,6 +856,51 @@
         return routeTo(saved);
     }
 
+    // ==================== PUSH NOTIFICATIONS ====================
+
+    // The toggle is only rendered when the server has VAPID configured and
+    // this context can actually subscribe. On iOS in a Safari tab that is
+    // never true, so the button stays hidden rather than failing on tap.
+    async function refreshPushToggle() {
+        const btn = document.getElementById('push-toggle-btn');
+        if (!btn) return;
+        btn.classList.add('hidden');
+
+        if (!credentials || DeadropPush.unavailableReason()) return;
+
+        let config;
+        try {
+            config = await DeadropPush.serverConfig();
+        } catch (e) {
+            return;
+        }
+        if (!config.enabled) return;
+
+        const subscription = await DeadropPush.currentSubscription();
+        btn.textContent = subscription ? '\u{1F514}' : '\u{1F515}';
+        btn.title = subscription ? 'Notifications on — tap to disable' : 'Enable notifications';
+        btn.classList.remove('hidden');
+    }
+
+    async function togglePush() {
+        if (!credentials) return;
+        const btn = document.getElementById('push-toggle-btn');
+        btn.disabled = true;
+        try {
+            const subscription = await DeadropPush.currentSubscription();
+            if (subscription) {
+                await DeadropPush.unsubscribe(credentials);
+            } else {
+                await DeadropPush.subscribe(credentials);
+            }
+        } catch (e) {
+            alert(e.message);
+        } finally {
+            btn.disabled = false;
+            await refreshPushToggle();
+        }
+    }
+
     // ==================== OPEN NAMESPACE ====================
     
     async function openNamespace(slug) {
@@ -876,6 +922,7 @@
         
         showView('inbox');
         await loadUnifiedInbox();
+        refreshPushToggle();
         // Start unified subscription after we know which rooms we're in
         startSubscription();
     }
