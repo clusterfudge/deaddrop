@@ -49,7 +49,7 @@ DEDUP_WINDOW_SECONDS = 60
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -1426,6 +1426,38 @@ def _migrate_006_add_attachments(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_007_add_push_subscriptions(conn: sqlite3.Connection) -> None:
+    """Migration 007: Add push_subscriptions table for Web Push delivery.
+
+    Keyed on the endpoint URL, which the browser guarantees unique per
+    (device, installed app, subscription). One identity may therefore hold
+    several rows — a desktop browser, an installed iOS PWA, and a second
+    install of the same PWA are three distinct endpoints.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            endpoint TEXT PRIMARY KEY,
+            ns TEXT NOT NULL,
+            identity_id TEXT NOT NULL,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            user_agent TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_ok_at TIMESTAMP,
+            FOREIGN KEY (ns, identity_id) REFERENCES identities(ns, id) ON DELETE CASCADE
+        )
+    """,
+        name="migrate.007.create_push_subscriptions",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_push_subscriptions_identity "
+        "ON push_subscriptions(ns, identity_id)",
+        name="migrate.007.idx",
+    )
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
@@ -1434,6 +1466,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (4, "Add mid-based indexes for room_messages and messages", _migrate_004_add_mid_indexes),
     (5, "Add content_hash for implicit message deduplication", _migrate_005_add_content_hash),
     (6, "Add attachments table for binary content on messages", _migrate_006_add_attachments),
+    (7, "Add push_subscriptions table for Web Push", _migrate_007_add_push_subscriptions),
 ]
 
 
@@ -1593,6 +1626,8 @@ def reset_db(conn: sqlite3.Connection | None = None):
     """Reset database (for testing)."""
     conn = _get_conn(conn)
     conn.executescript("""
+        DROP TABLE IF EXISTS push_subscriptions;
+        DROP TABLE IF EXISTS attachments;
         DROP TABLE IF EXISTS room_messages;
         DROP TABLE IF EXISTS room_members;
         DROP TABLE IF EXISTS rooms;
@@ -4032,3 +4067,131 @@ def get_topic_latest(
         return None
 
     return None
+
+
+# --- Web Push Subscriptions ---
+
+
+@timed_query("upsert_push_subscription")
+def upsert_push_subscription(
+    ns: str,
+    identity_id: str,
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    user_agent: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Register (or re-register) a Web Push subscription for an identity.
+
+    The endpoint is the primary key: a browser that re-subscribes after the
+    push service rotated its endpoint produces a new row, and a re-subscribe
+    on the same endpoint overwrites the keys in place.
+
+    Args:
+        ns: Namespace ID
+        identity_id: Identity that owns the subscription
+        endpoint: Push service endpoint URL (primary key)
+        p256dh: base64url-encoded P-256 public key of the user agent
+        auth: base64url-encoded 16-byte auth secret
+        user_agent: Optional UA string, for debugging which device this is
+        conn: Optional database connection
+
+    Returns:
+        The stored subscription as a dict.
+    """
+    conn = _get_conn(conn)
+    conn.execute(
+        """INSERT INTO push_subscriptions
+               (endpoint, ns, identity_id, p256dh, auth, user_agent, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(endpoint) DO UPDATE SET
+               ns = excluded.ns,
+               identity_id = excluded.identity_id,
+               p256dh = excluded.p256dh,
+               auth = excluded.auth,
+               user_agent = excluded.user_agent""",
+        (endpoint, ns, identity_id, p256dh, auth, user_agent),
+        name="upsert_push_subscription.upsert",
+    )
+    conn.commit()
+
+    cursor = conn.execute(
+        """SELECT endpoint, ns, identity_id, p256dh, auth, user_agent, created_at, last_ok_at
+           FROM push_subscriptions WHERE endpoint = ?""",
+        (endpoint,),
+        name="upsert_push_subscription.select",
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+    return row or {}
+
+
+@timed_query("list_push_subscriptions")
+def list_push_subscriptions(
+    ns: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """List every Web Push subscription registered by an identity."""
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT endpoint, ns, identity_id, p256dh, auth, user_agent, created_at, last_ok_at
+           FROM push_subscriptions
+           WHERE ns = ? AND identity_id = ?
+           ORDER BY created_at""",
+        (ns, identity_id),
+        name="list_push_subscriptions",
+    )
+    return _rows_to_dicts(cursor.description, cursor.fetchall())
+
+
+@timed_query("delete_push_subscription")
+def delete_push_subscription(
+    endpoint: str,
+    ns: str | None = None,
+    identity_id: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Delete a subscription by endpoint.
+
+    When ``ns``/``identity_id`` are supplied the delete is additionally scoped
+    to that owner, so an authenticated caller can only remove its own rows.
+    The pruning path (410 Gone from the push service) passes neither.
+
+    Returns:
+        True if a row was deleted.
+    """
+    conn = _get_conn(conn)
+    if ns is not None and identity_id is not None:
+        cursor = conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ? AND ns = ? AND identity_id = ?",
+            (endpoint, ns, identity_id),
+            name="delete_push_subscription.scoped",
+        )
+    else:
+        cursor = conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ?",
+            (endpoint,),
+            name="delete_push_subscription",
+        )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+@timed_query("touch_push_subscription")
+def touch_push_subscription(
+    endpoint: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Record a successful delivery against a subscription.
+
+    ``last_ok_at`` is the only liveness signal we have for a subscription
+    that the push service has not yet declared Gone.
+    """
+    conn = _get_conn(conn)
+    conn.execute(
+        "UPDATE push_subscriptions SET last_ok_at = CURRENT_TIMESTAMP WHERE endpoint = ?",
+        (endpoint,),
+        name="touch_push_subscription",
+    )
+    conn.commit()

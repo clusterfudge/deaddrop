@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import pytest
 
 from deadrop.db import (
+    SCHEMA_VERSION,
     get_schema_version,
     run_migrations,
     add_attachment,
@@ -149,7 +150,7 @@ class TestMigrationV5ToV6:
 
     def test_migration_runs(self, v5_database):
         run_migrations(v5_database["conn"])
-        assert get_schema_version(v5_database["conn"]) == 6
+        assert get_schema_version(v5_database["conn"]) == SCHEMA_VERSION
 
     def test_existing_room_messages_intact(self, v5_database):
         run_migrations(v5_database["conn"])
