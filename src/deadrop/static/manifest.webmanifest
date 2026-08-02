@@ -2,7 +2,7 @@
   "id": "/app",
   "name": "Deadrop",
   "short_name": "Deadrop",
-  "description": "End-to-end encrypted messaging for humans and their agents.",
+  "description": "Messaging for humans and their agents.",
   "start_url": "/app",
   "scope": "/",
   "display": "standalone",
