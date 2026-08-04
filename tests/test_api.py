@@ -992,3 +992,122 @@ class TestConcurrency:
     """
 
     pass
+
+
+class TestPerConversationRead:
+    """Read state is scoped to one 1:1 conversation.
+
+    A consumer draining its inbox keeps the mark-on-fetch behaviour; a
+    viewer rendering a thread list opts out and marks a single peer.
+    """
+
+    @pytest.fixture
+    def trio(self, client, admin_headers):
+        """A namespace with an inbox owner and two peers who write to it."""
+        ns_response = client.post(
+            "/admin/namespaces",
+            json={"metadata": {"display_name": "Test"}},
+            headers=admin_headers,
+        )
+        ns_data = ns_response.json()
+        ns_headers = {"X-Namespace-Secret": ns_data["secret"]}
+
+        def identity(name):
+            r = client.post(f"/{ns_data['ns']}/identities", json={}, headers=ns_headers)
+            return r.json()
+
+        owner = identity("Owner")
+        peer_a = identity("Peer A")
+        peer_b = identity("Peer B")
+
+        for peer, body in ((peer_a, "from A"), (peer_b, "from B")):
+            client.post(
+                f"/{ns_data['ns']}/send",
+                json={"to": owner["id"], "body": body},
+                headers={"X-Inbox-Secret": peer["secret"]},
+            )
+
+        return {"ns": ns_data["ns"], "owner": owner, "peer_a": peer_a, "peer_b": peer_b}
+
+    def _inbox(self, client, trio, **params):
+        return client.get(
+            f"/{trio['ns']}/inbox/{trio['owner']['id']}",
+            params=params,
+            headers={"X-Inbox-Secret": trio["owner"]["secret"]},
+        ).json()["messages"]
+
+    def test_fetch_marks_read_by_default(self, client, trio):
+        """The consumer path is unchanged: fetching drains the inbox."""
+        messages = self._inbox(client, trio)
+        assert len(messages) == 2
+        assert all(m["read_at"] for m in self._inbox(client, trio))
+
+    def test_mark_read_false_leaves_every_message_unread(self, client, trio):
+        messages = self._inbox(client, trio, mark_read="false")
+        assert len(messages) == 2
+        assert all(m["read_at"] is None for m in messages)
+        assert all(m["read_at"] is None for m in self._inbox(client, trio, mark_read="false"))
+
+    def test_reading_one_conversation_leaves_the_other_unread(self, client, trio):
+        self._inbox(client, trio, mark_read="false")
+
+        response = client.post(
+            f"/{trio['ns']}/inbox/{trio['owner']['id']}/read",
+            json={"peer_id": trio["peer_a"]["id"]},
+            headers={"X-Inbox-Secret": trio["owner"]["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "peer_id": trio["peer_a"]["id"],
+            "marked": 1,
+        }
+
+        by_peer = {m["from"]: m for m in self._inbox(client, trio, mark_read="false")}
+        assert by_peer[trio["peer_a"]["id"]]["read_at"] is not None
+        assert by_peer[trio["peer_b"]["id"]]["read_at"] is None
+
+    def test_marking_a_read_conversation_again_marks_nothing(self, client, trio):
+        for _ in range(2):
+            response = client.post(
+                f"/{trio['ns']}/inbox/{trio['owner']['id']}/read",
+                json={"peer_id": trio["peer_a"]["id"]},
+                headers={"X-Inbox-Secret": trio["owner"]["secret"]},
+            )
+        assert response.json()["marked"] == 0
+
+    def test_marking_a_peer_who_never_wrote_marks_nothing(self, client, trio):
+        response = client.post(
+            f"/{trio['ns']}/inbox/{trio['owner']['id']}/read",
+            json={"peer_id": trio["owner"]["id"]},
+            headers={"X-Inbox-Secret": trio["owner"]["secret"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["marked"] == 0
+
+    def test_only_the_owner_can_mark_a_conversation_read(self, client, trio):
+        response = client.post(
+            f"/{trio['ns']}/inbox/{trio['owner']['id']}/read",
+            json={"peer_id": trio["peer_a"]["id"]},
+            headers={"X-Inbox-Secret": trio["peer_b"]["secret"]},
+        )
+        assert response.status_code == 403
+        assert all(m["read_at"] is None for m in self._inbox(client, trio, mark_read="false"))
+
+    def test_marking_read_requires_a_secret(self, client, trio):
+        response = client.post(
+            f"/{trio['ns']}/inbox/{trio['owner']['id']}/read",
+            json={"peer_id": trio["peer_a"]["id"]},
+        )
+        assert response.status_code == 401
+
+    def test_the_badge_drops_by_one_conversation(self, client, trio):
+        from deadrop import db
+
+        assert db.count_unread_for_identity(trio["ns"], trio["owner"]["id"]) == 2
+        client.post(
+            f"/{trio['ns']}/inbox/{trio['owner']['id']}/read",
+            json={"peer_id": trio["peer_a"]["id"]},
+            headers={"X-Inbox-Secret": trio["owner"]["secret"]},
+        )
+        assert db.count_unread_for_identity(trio["ns"], trio["owner"]["id"]) == 1

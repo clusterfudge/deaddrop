@@ -842,6 +842,92 @@ class TestDirectMessages:
         assert watcher.on_direct_message(room["ns"], message, room["alice"]) is None
 
 
+@pytest.mark.asyncio
+class TestPerConversationRead:
+    """Reading one peer's thread must not silence another peer's."""
+
+    @staticmethod
+    async def _two_from_each(watcher, room, carol):
+        """Open a cooldown window per peer, then hold a follow-up in each."""
+        for sender_id, body in (
+            (room["alice"], "a1"),
+            (carol, "c1"),
+            (room["alice"], "a2"),
+            (carol, "c2"),
+        ):
+            await watcher.on_direct_message(
+                room["ns"], _dm(room, sender_id, room["bob"], body), sender_id
+            )
+            await asyncio.sleep(0.05)
+
+    @staticmethod
+    def _tags(sender):
+        return [payload["notification"]["tag"] for _, payload in sender.sent]
+
+    async def test_mark_conversation_read_marks_only_that_peer(self, room):
+        carol = db.create_identity(room["ns"], metadata={"display_name": "Carol"})["id"]
+        from_alice = _dm(room, room["alice"], room["bob"], "a1")
+        from_carol = _dm(room, carol, room["bob"], "c1")
+
+        marked = db.mark_conversation_read(room["ns"], room["bob"], room["alice"])
+
+        assert marked == [from_alice["mid"]]
+        assert db.get_message(room["ns"], room["bob"], from_carol["mid"])["read_at"] is None
+
+    async def test_cancellation_is_scoped_to_the_conversation(self, room):
+        carol = db.create_identity(room["ns"], metadata={"display_name": "Carol"})["id"]
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.6))
+
+        await self._two_from_each(watcher, room, carol)
+        assert watcher.pending_keys == {
+            (f"dm:{room['alice']}", room["bob"]),
+            (f"dm:{carol}", room["bob"]),
+        }
+
+        marked = db.mark_conversation_read(room["ns"], room["bob"], room["alice"])
+        assert watcher.on_inbox_read(room["bob"], marked) == 1
+        await asyncio.sleep(1.0)
+
+        tags = self._tags(sender)
+        assert tags.count(f"dm:{room['alice']}") == 1
+        assert tags.count(f"dm:{carol}") == 2
+
+    async def test_staleness_recheck_is_scoped_to_the_conversation(self, room):
+        """Without on_inbox_read, the row's own read_at still decides."""
+        carol = db.create_identity(room["ns"], metadata={"display_name": "Carol"})["id"]
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.6))
+
+        await self._two_from_each(watcher, room, carol)
+        db.mark_conversation_read(room["ns"], room["bob"], room["alice"])
+        await asyncio.sleep(1.0)
+
+        tags = self._tags(sender)
+        assert tags.count(f"dm:{room['alice']}") == 1
+        assert tags.count(f"dm:{carol}") == 2
+
+    async def test_an_unmarked_fetch_cancels_nothing(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.6))
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"], "first"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"], "second"), room["alice"]
+        )
+
+        db.get_messages(ns=room["ns"], identity_id=room["bob"], mark_as_read=False)
+        await asyncio.sleep(0.7)
+
+        assert len(sender.sent) == 2
+
+
 class TestBadgeCountsDirectMessages:
     """The badge is the thread list's unread total: rooms plus the inbox."""
 

@@ -1477,6 +1477,8 @@ class RemoteBackend(Backend):
             params.append("unread=true")
         if after_mid:
             params.append(f"after={after_mid}")
+        if not mark_as_read:
+            params.append("mark_read=false")
 
         path = f"/{ns}/inbox/{identity_id}"
         if params:

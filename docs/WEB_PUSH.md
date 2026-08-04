@@ -36,11 +36,24 @@ The last row is deliberate. A non-v7 cursor cannot be ordered against a v7
 message id, so treating it as "never seen" would leave the room
 permanently unread and push on every message forever.
 
-A direct message has no cursor: `GET /{ns}/inbox/{identity_id}` marks the
-rows it returns, so the trigger message's own `read_at` decides. A message
-that has been read, deleted or expired is silent; anything else pushes.
-The inbox fetch also cancels a pending follow-up directly, which is what
-happens when the recipient opens the app.
+A direct message has no cursor: the trigger message's own `read_at`
+decides. A message that has been read, deleted or expired is silent;
+anything else pushes.
+
+Two call sites set `read_at`, and which one a client uses determines how
+wide its read gesture is:
+
+| Call | Marks read | Cancels follow-ups |
+|---|---|---|
+| `GET /{ns}/inbox/{id}` | every row it returns | for those mids |
+| `GET /{ns}/inbox/{id}?mark_read=false` | nothing | nothing |
+| `POST /{ns}/inbox/{id}/read` `{peer_id}` | that peer's unread rows | for those mids |
+
+The default is mark-on-fetch: an agent draining its inbox consumes each
+message in one call. The web client passes `mark_read=false` to render the
+thread list and posts `/read` when a conversation is opened, so reading
+one peer leaves another peer's unread state — and its pending follow-up —
+intact.
 
 Two further reasons not to send, checked at each delivery:
 
@@ -202,8 +215,8 @@ room messages behind the member's cursor, plus inbox messages with no
 `read_at` — defined once in `db.count_unread_for_identity` and reused by
 both the push payload and `GET /{ns}/push/prefs`. It counts what the
 thread list marks unread. The client mirrors it onto the app icon with
-`setAppBadge()` after a read-cursor update, and the service worker applies
-it on iOS 16.4–18.3 where the OS does not.
+`setAppBadge()` after a read-cursor update or a conversation read, and the
+service worker applies it on iOS 16.4–18.3 where the OS does not.
 
 A subscription endpoint belongs to one (namespace, identity) pair, so a
 device signed into two namespaces badges the one it subscribed with. That
@@ -215,7 +228,4 @@ is the multi-namespace caveat the badge's one-integer shape forces.
 
 * **Per-conversation mute / quiet hours.** The switch is global per
   identity.
-* **Per-conversation DM read state.** An inbox fetch marks every message
-  it returns, so reading one 1:1 conversation clears the unread state of
-  all of them — and with it their pending follow-ups.
 * **Durable throttling.** Pending follow-ups live in the worker process.
