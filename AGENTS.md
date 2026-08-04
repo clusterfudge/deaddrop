@@ -90,6 +90,10 @@ When dispatching to thread executors, context vars (e.g., request-scoped query b
 - **Metrics:** `src/deadrop/metrics.py` — StatsD + in-memory, `InstrumentedConnection`, slow query tracking
 - **Auth:** `src/deadrop/auth.py` — namespace/secret derivation, hashing
 - **Rooms:** `src/deadrop/rooms.py` — room creation, subscription, pub/sub fanout
+- **Web Push:** `src/deadrop/push.py` (VAPID + aes128gcm transport) and
+  `src/deadrop/notifier.py` (the unread watcher that decides *when*). Off
+  by default; see `docs/WEB_PUSH.md`. Cursor handling in the watcher is
+  load-bearing — an invalid cursor means *caught up*, never *never seen*.
 
 ### Attachment Caching
 Attachments are cached client-side in a `Map` keyed by attachment ID. **Never re-fetch an attachment the client has already loaded.** The cache is intentional — don't add server-side cache-busting logic without understanding the client contract.

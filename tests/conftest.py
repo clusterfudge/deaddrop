@@ -11,7 +11,7 @@ os.environ.pop("HEARE_AUTH_URL", None)
 
 
 import pytest
-from deadrop import db
+from deadrop import db, notifier
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -27,6 +27,8 @@ def reset_database():
     # Temporarily disable foreign keys to allow dropping in any order
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.executescript("""
+        DROP TABLE IF EXISTS push_prefs;
+        DROP TABLE IF EXISTS push_subscriptions;
         DROP TABLE IF EXISTS attachments;
         DROP TABLE IF EXISTS room_messages;
         DROP TABLE IF EXISTS room_members;
@@ -46,3 +48,17 @@ def reset_database():
     db.init_db_with_conn(conn)
     yield
     db.close_db()  # Cleanup after test
+
+
+@pytest.fixture(autouse=True, scope="function")
+def reset_push_waiters():
+    """Clear the process-global subscription-waiter registry between tests.
+
+    A closed waiter suppresses push for a few seconds afterwards, so one
+    test's poll would otherwise silence the next test's notification.
+    """
+    notifier._open_waiters.clear()
+    notifier._waiters_closed_at.clear()
+    yield
+    notifier._open_waiters.clear()
+    notifier._waiters_closed_at.clear()
