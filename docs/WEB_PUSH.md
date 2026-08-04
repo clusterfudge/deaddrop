@@ -13,14 +13,17 @@ The feature is **off by default**. Nothing below runs until
 
 ## When a push is sent
 
-A room message notifies each recipient **immediately**, then opens a
-**two-minute cooldown** for that recipient. Messages arriving inside the
-window are folded into a single follow-up push delivered when the window
-expires — its body reads `latest message (+N more)` — and that follow-up
-opens the next window. A window that ends quiet sends nothing and closes
-the throttle, so the next message is again immediate.
+A message — in a room or 1:1 — notifies each recipient **immediately**,
+then opens a **two-minute cooldown** for that recipient on that
+conversation. Messages arriving inside the window are folded into a single
+follow-up push delivered when the window expires — its body reads `latest
+message (+N more)` — and that follow-up opens the next window. A window
+that ends quiet sends nothing and closes the throttle, so the next message
+is again immediate. Rooms and 1:1 conversations throttle separately: a
+busy room never silences a peer.
 
-Before each delivery the server re-reads that recipient's read cursor:
+Before each delivery the server re-reads the recipient's read state. For a
+room that is the member's cursor:
 
 | Cursor state | Result |
 |---|---|
@@ -33,26 +36,33 @@ The last row is deliberate. A non-v7 cursor cannot be ordered against a v7
 message id, so treating it as "never seen" would leave the room
 permanently unread and push on every message forever.
 
+A direct message has no cursor: `GET /{ns}/inbox/{identity_id}` marks the
+rows it returns, so the trigger message's own `read_at` decides. A message
+that has been read, deleted or expired is silent; anything else pushes.
+The inbox fetch also cancels a pending follow-up directly, which is what
+happens when the recipient opens the app.
+
 Two further reasons not to send, checked at each delivery:
 
 * **Switched off.** The identity set `enabled: false` via
   `PUT /{ns}/push/prefs`.
 * **No devices.** The identity holds no subscriptions.
 
-The read cursor is the only staleness signal. An open connection on
+Read state is the only staleness signal. An open connection on
 `/{ns}/subscribe` does not suppress anything — an identity routinely holds
 several idle browser tabs, and none of them imply the message was seen. A
-client that actually renders the message advances its cursor, and that
-drops the coalesced follow-up.
+client that actually renders the message advances the cursor or marks the
+row read, and that drops the coalesced follow-up.
 
 Reactions never notify, and a sender is never notified about its own
 message. A reaction is dropped before the throttle sees it, so it neither
 fires a push nor counts toward the `(+N more)` on a follow-up. The badge
-number is the exception: it comes from the same unread query the room list
-uses, which counts reactions.
+number is the exception: it comes from the same unread query the thread
+list uses, which counts reactions. Only room messages carry reactions —
+`reference_mid` exists on `room_messages` alone.
 
 The windows are in-process (the deployment runs a single uvicorn worker).
-**A restart loses whatever follow-up was pending**; those messages stay unread and the next message in the room
+**A restart loses whatever follow-up was pending**; those messages stay unread and the next message in the conversation
 notifies immediately.
 
 ---
@@ -166,6 +176,11 @@ The server always emits a Declarative Web Push envelope:
 }
 ```
 
+A direct message differs in three fields: the title is the sender's display
+name alone, `navigate` is the conversation route `/app/{slug}/{peer_id}`,
+and `tag` is `dm:{peer_id}`, so a peer's notifications replace each other
+on the lock screen the way a room's do.
+
 iOS ≥ 18.4 renders this with no service worker involvement; iOS 16.4–18.3
 and other browsers dispatch it to the `push` handler in `sw.js`, which
 reads the same fields. One payload serves both.
@@ -182,10 +197,11 @@ not per device. Turning it off leaves the subscription rows in place, so
 turning it back on does not require the permission gesture again. An
 identity with no row is enabled — registering a device is the opt-in.
 
-`app_badge` is a single integer: every unread room message for that
-identity, across every room, defined once in
-`db.count_unread_for_identity` and reused by both the push payload and
-`GET /{ns}/push/prefs`. The client mirrors it onto the app icon with
+`app_badge` is a single integer: every unread message for that identity —
+room messages behind the member's cursor, plus inbox messages with no
+`read_at` — defined once in `db.count_unread_for_identity` and reused by
+both the push payload and `GET /{ns}/push/prefs`. It counts what the
+thread list marks unread. The client mirrors it onto the app icon with
 `setAppBadge()` after a read-cursor update, and the service worker applies
 it on iOS 16.4–18.3 where the OS does not.
 
@@ -197,7 +213,9 @@ is the multi-namespace caveat the badge's one-integer shape forces.
 
 ## What this does not do
 
-* **1:1 messages.** Only room messages notify. Direct messages track
-  read state with `read_at` rather than a cursor and are not wired up.
-* **Per-room mute / quiet hours.** The switch is global per identity.
+* **Per-conversation mute / quiet hours.** The switch is global per
+  identity.
+* **Per-conversation DM read state.** An inbox fetch marks every message
+  it returns, so reading one 1:1 conversation clears the unread state of
+  all of them — and with it their pending follow-ups.
 * **Durable throttling.** Pending follow-ups live in the worker process.
