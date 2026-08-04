@@ -2382,6 +2382,54 @@ def get_messages(
     return messages
 
 
+@timed_query("mark_conversation_read")
+def mark_conversation_read(
+    ns: str,
+    identity_id: str,
+    peer_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> list[str]:
+    """Mark the unread messages ``peer_id`` sent ``identity_id`` as read.
+
+    Scopes read state to one 1:1 conversation. Row selection matches
+    :func:`get_messages` — live and unarchived — and the TTL countdown
+    starts here the same way.
+
+    Returns the mids that changed state; an empty list when there was
+    nothing unread.
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    ttl_hours = get_namespace_ttl_hours(ns, conn=conn)
+
+    cursor = conn.execute(
+        """SELECT mid FROM messages
+           WHERE ns = ? AND to_id = ? AND from_id = ?
+           AND read_at IS NULL
+           AND archived_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?)""",
+        (ns, identity_id, peer_id, now),
+        name="mark_conversation_read.select",
+    )
+    mids = [row[0] for row in cursor.fetchall()]
+    if not mids:
+        return []
+
+    if ttl_hours > 0:
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
+    else:
+        expires_at = None
+
+    placeholders = ",".join("?" * len(mids))
+    conn.execute(
+        f"UPDATE messages SET read_at = ?, expires_at = ? WHERE mid IN ({placeholders})",
+        tuple([now, expires_at] + mids),
+        name="mark_conversation_read.update",
+    )
+    conn.commit()
+    return mids
+
+
 def get_message(
     ns: str,
     identity_id: str,

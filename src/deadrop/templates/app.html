@@ -951,7 +951,7 @@
         try {
             const [peersResult, inboxResult, roomsResult] = await Promise.all([
                 DeadropAPI.listPeers(credentials),
-                DeadropAPI.getInbox(credentials),
+                DeadropAPI.getInbox(credentials, { markRead: false }),
                 DeadropAPI.listRooms(credentials),
             ]);
             
@@ -1073,8 +1073,26 @@
         document.getElementById('conversation-title').textContent = getPeerName(peerId);
         showView('conversation');
         renderConversation();
+        markConversationRead(peerId);
         // Focus the input so the user can start typing immediately
         document.getElementById('message-input').focus();
+    }
+
+    /**
+     * Clear the unread state of one conversation, server-side and locally.
+     */
+    async function markConversationRead(peerId) {
+        if (!peerId || !credentials) return;
+        const unread = messages.filter(m => m.from === peerId && !m.read_at);
+        if (unread.length === 0) return;
+        try {
+            await DeadropAPI.markConversationRead(credentials, peerId);
+            const now = new Date().toISOString();
+            unread.forEach(m => { m.read_at = now; });
+            DeadropPush.syncBadge(credentials);
+        } catch (e) {
+            console.error('Failed to mark conversation read:', e);
+        }
     }
     
     function renderConversation() {
@@ -1115,9 +1133,10 @@
             await DeadropAPI.sendMessage(credentials, currentPeerId, body);
             input.value = '';
             
-            const result = await DeadropAPI.getInbox(credentials);
+            const result = await DeadropAPI.getInbox(credentials, { markRead: false });
             messages = result.messages;
             renderConversation();
+            markConversationRead(currentPeerId);
         } catch (e) {
             alert('Failed to send: ' + e.message);
         }
@@ -1832,6 +1851,7 @@
         navigate(`/app/${currentSlug}`);
         currentPeerId = null;
         showView('inbox');
+        loadUnifiedInbox();
     });
     
     document.getElementById('room-chat-back').addEventListener('click', (e) => {
@@ -2035,7 +2055,10 @@
         if (roomView && !roomView.classList.contains('hidden') && currentRoomId) {
             loadRoomMessages();
         } else if (convView && !convView.classList.contains('hidden') && currentPeerId) {
-            loadUnifiedInbox().then(() => renderConversation());
+            loadUnifiedInbox().then(() => {
+                renderConversation();
+                markConversationRead(currentPeerId);
+            });
         } else if (inboxView && !inboxView.classList.contains('hidden')) {
             loadUnifiedInbox();
         }

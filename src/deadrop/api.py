@@ -416,6 +416,10 @@ class SendMessageRequest(BaseModel):
     ttl_hours: int | None = None  # Optional TTL override (ephemeral messages)
 
 
+class MarkConversationReadRequest(BaseModel):
+    peer_id: str
+
+
 class MessageInfo(BaseModel):
     mid: str
     from_id: str
@@ -1218,15 +1222,20 @@ async def get_inbox(
     identity_id: str,
     unread: Annotated[bool, Query()] = False,
     after: Annotated[str | None, Query()] = None,
+    mark_read: Annotated[bool, Query()] = True,
     x_inbox_secret: Annotated[str | None, Header()] = None,
 ):
     """Get messages for own inbox.
 
-    Reading messages marks them as read and starts the TTL countdown.
+    Reading messages marks them as read and starts the TTL countdown, so a
+    consumer that fetches to drain its inbox needs no second call. A viewer
+    that renders a thread list passes ``mark_read=false`` and marks a single
+    conversation with POST /{ns}/inbox/{identity_id}/read.
 
     Query parameters:
     - unread: Only return unread messages
     - after: Only return messages after this message ID (cursor for pagination)
+    - mark_read: Mark the returned messages read (default true)
 
     For real-time updates, use the POST /{ns}/subscribe endpoint instead.
     """
@@ -1246,10 +1255,12 @@ async def get_inbox(
             identity_id=identity_id,
             unread_only=unread,
             after_mid=after,
+            mark_as_read=mark_read,
         )
     )
 
-    _disarm_inbox_push(identity_id, [m["mid"] for m in messages])
+    if mark_read:
+        _disarm_inbox_push(identity_id, [m["mid"] for m in messages])
 
     return {
         "messages": [
@@ -1267,6 +1278,32 @@ async def get_inbox(
             for m in messages
         ]
     }
+
+
+@app.post("/{ns}/inbox/{identity_id}/read")
+async def mark_conversation_read(
+    ns: str,
+    identity_id: str,
+    request: MarkConversationReadRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Mark one 1:1 conversation read.
+
+    The direct-message counterpart of POST /{ns}/rooms/{room_id}/read: read
+    state is a write the viewer makes when it opens a conversation, scoped
+    to the peer it opened.
+    """
+    import functools
+
+    await _require_inbox_secret(ns, identity_id, x_inbox_secret)
+
+    mids = await _run_write(
+        functools.partial(db.mark_conversation_read, ns, identity_id, request.peer_id)
+    )
+
+    _disarm_inbox_push(identity_id, mids)
+
+    return {"ok": True, "peer_id": request.peer_id, "marked": len(mids)}
 
 
 @app.get("/{ns}/inbox/{identity_id}/archived")

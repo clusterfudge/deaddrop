@@ -57,15 +57,29 @@ const DeadropAPI = {
 
     /**
      * Get inbox messages.
+     *
+     * markRead=false fetches without touching read state; the viewer marks
+     * a single conversation with markConversationRead().
      */
-    async getInbox(credentials, { unread = false, after = null } = {}) {
+    async getInbox(credentials, { unread = false, after = null, markRead = true } = {}) {
         let path = `/${credentials.ns}/inbox/${credentials.id}`;
         const params = new URLSearchParams();
         if (unread) params.set('unread', 'true');
         if (after) params.set('after', after);
+        if (!markRead) params.set('mark_read', 'false');
         if (params.toString()) path += '?' + params.toString();
         
         return this.request('GET', path, { credentials });
+    },
+
+    /**
+     * Mark the messages from one peer as read.
+     */
+    async markConversationRead(credentials, peerId) {
+        return this.request('POST', `/${credentials.ns}/inbox/${credentials.id}/read`, {
+            credentials,
+            body: { peer_id: peerId },
+        });
     },
 
     /**
