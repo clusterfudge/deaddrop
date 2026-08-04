@@ -345,7 +345,7 @@ class TestRoomMessageHook:
         assert response.status_code == 200
         assert _wait_until(lambda: len(stub_sender.calls) == 1)
         # The window is open, so a second message would be held.
-        assert (room["room_id"], bob["id"]) in watcher.cooldown_keys
+        assert (f"room:{room['room_id']}", bob["id"]) in watcher.cooldown_keys
 
     def test_send_succeeds_when_push_is_disabled(
         self, live_client, identities, disabled, stub_sender
@@ -401,13 +401,91 @@ class TestReadCursorHook:
                 headers=alice_headers,
                 json={"body": "and merged"},
             ).json()
-            assert _wait_until(lambda: (room["room_id"], bob["id"]) in watcher.pending_keys)
+            assert _wait_until(
+                lambda: (f"room:{room['room_id']}", bob["id"]) in watcher.pending_keys
+            )
 
             read = live_client.post(
                 f"/{ns}/rooms/{room['room_id']}/read",
                 headers=bob_headers,
                 json={"last_read_mid": message["mid"]},
             )
+
+            assert read.status_code == 200
+            assert watcher.pending_keys == set()
+            assert len(sender.calls) == 1
+        finally:
+            notifier.set_watcher(None)
+
+
+class TestDirectMessageHook:
+    def test_sending_a_dm_notifies_immediately(
+        self, live_client, identities, configured, stub_sender
+    ):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        live_client.post(
+            f"/{ns}/push/subscriptions",
+            headers={"X-Inbox-Secret": bob["secret"]},
+            json=_subscribe_body(),
+        )
+
+        response = live_client.post(
+            f"/{ns}/send",
+            headers={"X-Inbox-Secret": alice["secret"]},
+            json={"to": bob["id"], "body": "ping"},
+        )
+
+        assert response.status_code == 200
+        assert _wait_until(lambda: len(stub_sender.calls) == 1)
+        _, payload = stub_sender.calls[0]
+        assert payload["notification"]["title"] == "Alice"
+        assert payload["notification"]["body"] == "ping"
+        assert payload["notification"]["tag"] == f"dm:{alice['id']}"
+        assert (f"dm:{alice['id']}", bob["id"]) in notifier.get_watcher().cooldown_keys
+
+    def test_send_succeeds_when_push_is_disabled(
+        self, live_client, identities, disabled, stub_sender
+    ):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+
+        response = live_client.post(
+            f"/{ns}/send",
+            headers={"X-Inbox-Secret": alice["secret"]},
+            json={"to": bob["id"], "body": "hi"},
+        )
+
+        assert response.status_code == 200
+        assert notifier.get_watcher().pending_keys == set()
+        assert stub_sender.calls == []
+
+
+class TestInboxReadHook:
+    def test_reading_the_inbox_drops_the_coalesced_push(self, live_client, identities, configured):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        alice_headers = {"X-Inbox-Secret": alice["secret"]}
+        bob_headers = {"X-Inbox-Secret": bob["secret"]}
+
+        sender = _StubSender()
+        watcher = notifier.UnreadWatcher(sender=sender)
+        notifier.set_watcher(watcher)
+        try:
+            live_client.post(
+                f"/{ns}/push/subscriptions", headers=bob_headers, json=_subscribe_body()
+            )
+
+            live_client.post(
+                f"/{ns}/send", headers=alice_headers, json={"to": bob["id"], "body": "ping"}
+            )
+            assert _wait_until(lambda: len(sender.calls) == 1)
+
+            # The second message lands inside the window, so it is held for
+            # the follow-up push the inbox fetch is about to cancel.
+            live_client.post(
+                f"/{ns}/send", headers=alice_headers, json={"to": bob["id"], "body": "pong"}
+            )
+            assert _wait_until(lambda: (f"dm:{alice['id']}", bob["id"]) in watcher.pending_keys)
+
+            read = live_client.get(f"/{ns}/inbox/{bob['id']}", headers=bob_headers)
 
             assert read.status_code == 200
             assert watcher.pending_keys == set()

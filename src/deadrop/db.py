@@ -4278,26 +4278,37 @@ def count_unread_for_identity(
     identity_id: str,
     conn: sqlite3.Connection | None = None,
 ) -> int:
-    """Total unread room messages for an identity, across every room.
+    """Total unread messages for an identity: every room plus the inbox.
 
-    This is the badge number: one integer for the whole app icon. The
-    per-room definition in :func:`get_room_unread_count` is reproduced here
-    as a single aggregate rather than N queries, including its treatment of
-    a non-UUIDv7 cursor as unset.
+    This is the badge number: one integer for the whole app icon, matching
+    what the thread list marks unread. The per-room definition in
+    :func:`get_room_unread_count` is reproduced here as a single aggregate
+    rather than N queries, including its treatment of a non-UUIDv7 cursor
+    as unset; direct messages use ``read_at``, which the inbox fetch sets,
+    and are filtered like :func:`get_messages` (live and unarchived).
     """
     conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        """SELECT COUNT(*)
-           FROM room_members m
-           JOIN room_messages rm ON rm.room_id = m.room_id
-           WHERE m.ns = ? AND m.identity_id = ?
-             AND (
-                 m.last_read_mid IS NULL
-                 OR m.last_read_mid = ''
-                 OR (length(m.last_read_mid) >= 15 AND substr(m.last_read_mid, 15, 1) != '7')
-                 OR rm.mid > m.last_read_mid
-             )""",
-        (ns, identity_id),
+        """SELECT
+             (SELECT COUNT(*)
+                FROM room_members m
+                JOIN room_messages rm ON rm.room_id = m.room_id
+               WHERE m.ns = ? AND m.identity_id = ?
+                 AND (
+                     m.last_read_mid IS NULL
+                     OR m.last_read_mid = ''
+                     OR (length(m.last_read_mid) >= 15 AND substr(m.last_read_mid, 15, 1) != '7')
+                     OR rm.mid > m.last_read_mid
+                 ))
+             +
+             (SELECT COUNT(*)
+                FROM messages
+               WHERE ns = ? AND to_id = ?
+                 AND read_at IS NULL
+                 AND archived_at IS NULL
+                 AND (expires_at IS NULL OR expires_at > ?))""",
+        (ns, identity_id, ns, identity_id, now),
         name="count_unread_for_identity",
     )
     return cursor.fetchone()[0]

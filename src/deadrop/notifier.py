@@ -1,19 +1,32 @@
-"""Unread-message watcher — decides when a room message becomes a push.
+"""Unread-message watcher — decides when a message becomes a push.
 
-The rule: a room message notifies each recipient immediately, then holds
-that recipient's channel closed for a cooldown window. A notification goes
-out when the recipient's read cursor is behind the message, they have push
-enabled, and they hold at least one Web Push subscription. An interactive
-client that renders the message advances the cursor, which drops the
-coalesced follow-up.
+The rule: a message notifies each recipient immediately, then holds that
+recipient's channel closed for a cooldown window. A notification goes out
+when the recipient has not read the message, they have push enabled, and
+they hold at least one Web Push subscription. An interactive client that
+renders the message marks it read, which drops the coalesced follow-up.
 
-The read cursor is the only staleness signal. An open connection is not
-one: an identity routinely holds several idle browser tabs, and none of
-them imply the message was seen.
+Read state is the only staleness signal. An open connection is not one: an
+identity routinely holds several idle browser tabs, and none of them imply
+the message was seen.
+
+Rooms and direct messages share the throttle, the preference gate and the
+payload shape, and differ only in where read state lives:
+
+=========  ================================  =========================
+scope      read state                        deep link
+=========  ================================  =========================
+room       ``room_members.last_read_mid``    ``/app/<slug>/room/<id>``
+dm         ``messages.read_at``              ``/app/<slug>/<peer>``
+=========  ================================  =========================
+
+A DM is read as a side effect of fetching the inbox, which marks every
+message it returns; there is no cursor to compare, so the trigger message
+itself is re-read before delivery.
 
 Cursor semantics
 ----------------
-Three cursor states, deliberately kept distinct:
+Three room-cursor states, deliberately kept distinct:
 
 ===================  ==========================================
 cursor               interpretation
@@ -31,7 +44,8 @@ for *counting*; here the same value must mean *suppress*.
 
 Throttle
 --------
-Leading edge plus a coalesced trailing edge, per (room, identity):
+Leading edge plus a coalesced trailing edge, per (conversation, identity),
+where a conversation is a room or a DM peer:
 
 * the first message delivers straight away and opens a
   ``debounce_seconds`` window,
@@ -47,7 +61,7 @@ Suppression
 -----------
 Two independent reasons not to send, checked at each delivery:
 
-* the read cursor has advanced past the trigger message (or is unusable),
+* the recipient has read the trigger message (or it is gone),
 * the identity has turned push off (``push_prefs``).
 
 The windows and the coalesced state are in-process. A restart loses
@@ -60,6 +74,7 @@ import asyncio
 import functools
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from . import db, instrument, push
@@ -118,20 +133,36 @@ async def _write(fn, *args):
 
 @dataclass
 class _Notification:
-    """One push for a (room, identity), covering ``count`` messages."""
+    """One push for a (conversation, identity), covering ``count`` messages."""
 
     ns: str
-    room_id: str
     identity_id: str
+    kind: str
+    """``room`` or ``dm`` — selects the read-state check and the deep link."""
+    conv_id: str
+    """Room id, or for a DM the peer identity that sent it."""
     trigger_mid: str
-    room_name: str
-    sender_label: str
+    title: str
     preview: str
     count: int = 1
 
+    @property
+    def scope(self) -> str:
+        """Conversation identifier, used as the throttle key and the tag."""
+        return f"{self.kind}:{self.conv_id}"
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.scope, self.identity_id)
+
+    @property
+    def path(self) -> str:
+        """Deep-link path below ``/app/<slug>/``."""
+        return f"room/{self.conv_id}" if self.kind == "room" else self.conv_id
+
 
 class UnreadWatcher:
-    """Schedules Web Push for room messages that go unread."""
+    """Schedules Web Push for room and direct messages that go unread."""
 
     def __init__(
         self,
@@ -198,6 +229,24 @@ class UnreadWatcher:
         self._track(task)
         return task
 
+    def on_direct_message(self, ns: str, message: dict, sender_id: str) -> asyncio.Task | None:
+        """Notify the recipient of a 1:1 message, subject to the throttle.
+
+        ``message`` carries ``mid``, ``to``, ``body`` and ``content_type``.
+
+        Returns the delivery task (tests await it); ``None`` when push is
+        disabled, which is the default.
+        """
+        cfg = self.config
+        if not cfg.configured:
+            return None
+        if message.get("content_type") == "reaction":
+            return None
+
+        task = asyncio.create_task(self._fan_out_dm(ns, message, sender_id, cfg))
+        self._track(task)
+        return task
+
     def on_read_cursor(self, room_id: str, identity_id: str, cursor: str | None) -> bool:
         """Drop a coalesced follow-up when its reader has caught up.
 
@@ -206,7 +255,7 @@ class UnreadWatcher:
 
         Returns True if a follow-up was dropped.
         """
-        key = (room_id, identity_id)
+        key = (f"room:{room_id}", identity_id)
         held = self._pending.get(key)
         if held is None:
             return False
@@ -215,6 +264,29 @@ class UnreadWatcher:
         self._pending.pop(key, None)
         instrument.sink.counter("push.cancelled")
         return True
+
+    def on_inbox_read(self, identity_id: str, mids: Iterable[str]) -> int:
+        """Drop coalesced DM follow-ups whose trigger message was just read.
+
+        A DM has no cursor to compare against: the inbox fetch marks the
+        rows it returns, so the mids it marked are what cancels. The
+        cooldown window keeps running, as it does for a room.
+
+        Returns the number of follow-ups dropped.
+        """
+        read = set(mids)
+        if not read:
+            return 0
+        dropped = 0
+        for key, held in list(self._pending.items()):
+            if key[1] != identity_id or held.kind != "dm":
+                continue
+            if held.trigger_mid not in read:
+                continue
+            self._pending.pop(key, None)
+            instrument.sink.counter("push.cancelled")
+            dropped += 1
+        return dropped
 
     async def shutdown(self) -> None:
         """Cancel every in-flight window and fan-out."""
@@ -273,18 +345,52 @@ class UnreadWatcher:
             self._notify(
                 _Notification(
                     ns=ns,
-                    room_id=room_id,
                     identity_id=identity_id,
+                    kind="room",
+                    conv_id=room_id,
                     trigger_mid=mid,
-                    room_name=label,
-                    sender_label=sender_label,
+                    title=f"{sender_label} in {label}",
                     preview=preview,
                 ),
                 cfg,
             )
 
+    async def _fan_out_dm(
+        self,
+        ns: str,
+        message: dict,
+        sender_id: str,
+        cfg: push.PushConfig,
+    ) -> None:
+        mid = message.get("mid")
+        to_id = message.get("to")
+        if not mid or not to_id or to_id == sender_id:
+            return
+
+        sender_label = sender_id
+        try:
+            identity = await _read(db.get_identity, ns, sender_id)
+        except Exception:
+            logger.warning("push fan-out could not read identity %s", sender_id, exc_info=True)
+            identity = None
+        if identity:
+            sender_label = identity.get("metadata", {}).get("display_name") or sender_id
+
+        self._notify(
+            _Notification(
+                ns=ns,
+                identity_id=to_id,
+                kind="dm",
+                conv_id=sender_id,
+                trigger_mid=mid,
+                title=sender_label,
+                preview=_preview(message.get("body", ""), message.get("content_type")),
+            ),
+            cfg,
+        )
+
     def _notify(self, notification: _Notification, cfg: push.PushConfig) -> None:
-        key = (notification.room_id, notification.identity_id)
+        key = notification.key
         if key not in self._cooldown:
             task = asyncio.create_task(self._send_then_hold(key, notification, cfg))
             self._cooldown[key] = task
@@ -323,17 +429,29 @@ class UnreadWatcher:
             raise
         except Exception:
             logger.warning(
-                "push delivery failed for room=%s identity=%s",
-                notification.room_id,
+                "push delivery failed for scope=%s identity=%s",
+                notification.scope,
                 notification.identity_id,
                 exc_info=True,
             )
 
-    async def _fire(self, note: _Notification, cfg: push.PushConfig) -> None:
-        member = await _read(db.get_room_member_info, note.room_id, note.identity_id)
+    async def _already_read(self, note: _Notification) -> bool:
+        """Has the recipient seen the trigger message, or can't we tell?
+
+        A room compares the member's cursor; a DM re-reads the row, whose
+        ``read_at`` the inbox fetch sets. A message or membership that has
+        gone away answers True: there is nothing left to point at.
+        """
+        if note.kind == "dm":
+            message = await _read(db.get_message, note.ns, note.identity_id, note.trigger_mid)
+            return message is None or message.get("read_at") is not None
+        member = await _read(db.get_room_member_info, note.conv_id, note.identity_id)
         if member is None:
-            return
-        if is_caught_up(member.get("last_read_mid"), note.trigger_mid):
+            return True
+        return is_caught_up(member.get("last_read_mid"), note.trigger_mid)
+
+    async def _fire(self, note: _Notification, cfg: push.PushConfig) -> None:
+        if await self._already_read(note):
             instrument.sink.counter("push.suppressed.read")
             return
 
@@ -345,13 +463,13 @@ class UnreadWatcher:
         if not subscriptions:
             return
 
-        slug = await self._room_slug(note.ns)
+        slug = await self._namespace_slug(note.ns)
         badge = await self._badge(note.ns, note.identity_id)
         payload = push.build_payload(
-            title=f"{note.sender_label} in {note.room_name}",
+            title=note.title,
             body=self._body(note),
-            navigate=f"/app/{slug}/room/{note.room_id}",
-            tag=f"room:{note.room_id}",
+            navigate=f"/app/{slug}/{note.path}",
+            tag=note.scope,
             badge=badge,
         )
 
@@ -392,7 +510,7 @@ class UnreadWatcher:
             logger.warning("badge count failed for %s/%s", ns, identity_id, exc_info=True)
             return None
 
-    async def _room_slug(self, ns: str) -> str:
+    async def _namespace_slug(self, ns: str) -> str:
         """Namespace slug for the deep link, falling back to the raw ns id."""
         try:
             namespace = await _read(db.get_namespace, ns)

@@ -197,7 +197,7 @@ class TestWatcherSuppresses:
         await watcher.on_room_message(room["ns"], room["room_id"], first, room["alice"])
         await asyncio.sleep(0.1)
         await watcher.on_room_message(room["ns"], room["room_id"], second, room["alice"])
-        assert (room["room_id"], room["bob"]) in watcher.pending_keys
+        assert (f"room:{room['room_id']}", room["bob"]) in watcher.pending_keys
 
         cancelled = watcher.on_read_cursor(room["room_id"], room["bob"], second["mid"])
         await asyncio.sleep(0.7)
@@ -326,7 +326,7 @@ class TestThrottle:
         await asyncio.sleep(0.1)
 
         assert len(sender.sent) == 1
-        assert (room["room_id"], room["bob"]) in watcher.pending_keys
+        assert (f"room:{room['room_id']}", room["bob"]) in watcher.pending_keys
 
     async def test_burst_lands_as_one_follow_up_when_the_window_expires(self, room):
         _subscribe(room, room["bob"])
@@ -629,3 +629,242 @@ class TestPushPrefs:
         assert db.get_push_enabled(room["ns"], room["bob"]) is False
         db.set_push_enabled(room["ns"], room["bob"], True)
         assert db.get_push_enabled(room["ns"], room["bob"]) is True
+
+
+def _dm(room, from_id, to_id, body="hello"):
+    return dict(
+        db.send_message(ns=room["ns"], from_id=from_id, to_id=to_id, body=body),
+        body=body,
+    )
+
+
+def _read_inbox(room, identity_id):
+    """Fetch the inbox the way the route does — which marks it read."""
+    return db.get_messages(ns=room["ns"], identity_id=identity_id)
+
+
+@pytest.mark.asyncio
+class TestDirectMessages:
+    """1:1 messages ride the same throttle; read state is ``read_at``."""
+
+    async def test_push_sent_for_a_direct_message(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"]), room["alice"]
+        )
+        await asyncio.sleep(0.2)
+
+        assert len(sender.sent) == 1
+        subscription, payload = sender.sent[0]
+        assert subscription["identity_id"] == room["bob"]
+        notification = payload["notification"]
+        assert notification["title"] == "Alice"
+        assert notification["body"] == "hello"
+        assert notification["navigate"] == f"/app/twin/{room['alice']}"
+        assert notification["tag"] == f"dm:{room['alice']}"
+
+    async def test_sender_is_not_notified_about_its_own_message(self, room):
+        _subscribe(room, room["alice"], "https://push.example.com/sub/alice")
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["alice"]), room["alice"]
+        )
+        await asyncio.sleep(0.2)
+
+        assert sender.sent == []
+
+    async def test_recipient_without_a_subscription_gets_nothing(self, room):
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"]), room["alice"]
+        )
+        await asyncio.sleep(0.2)
+
+        assert sender.sent == []
+
+    async def test_reaction_never_pushes(self, room):
+        _subscribe(room, room["bob"])
+        watcher = notifier.UnreadWatcher(sender=RecordingSender(), config=_cfg())
+        reaction = dict(
+            db.send_message(
+                ns=room["ns"],
+                from_id=room["alice"],
+                to_id=room["bob"],
+                body="👍",
+                content_type="reaction",
+            ),
+            body="👍",
+        )
+
+        assert watcher.on_direct_message(room["ns"], reaction, room["alice"]) is None
+
+    async def test_disabled_identity_is_not_notified(self, room):
+        _subscribe(room, room["bob"])
+        db.set_push_enabled(room["ns"], room["bob"], False)
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"]), room["alice"]
+        )
+        await asyncio.sleep(0.2)
+
+        assert sender.sent == []
+
+    async def test_already_read_message_is_not_notified(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+        message = _dm(room, room["alice"], room["bob"])
+        _read_inbox(room, room["bob"])
+
+        await watcher.on_direct_message(room["ns"], message, room["alice"])
+        await asyncio.sleep(0.2)
+
+        assert sender.sent == []
+
+    async def test_burst_coalesces_into_one_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.3))
+        messages = [_dm(room, room["alice"], room["bob"], f"msg {i}") for i in range(4)]
+
+        for message in messages:
+            await watcher.on_direct_message(room["ns"], message, room["alice"])
+        await asyncio.sleep(0.1)
+        assert len(sender.sent) == 1  # leading edge only
+
+        await asyncio.sleep(0.4)
+        assert len(sender.sent) == 2
+        assert sender.sent[1][1]["notification"]["body"] == "msg 3 (+2 more)"
+
+    async def test_quiet_window_sends_no_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.2))
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"]), room["alice"]
+        )
+        await asyncio.sleep(0.5)
+
+        assert len(sender.sent) == 1
+        assert watcher.pending_keys == set()
+        assert watcher.cooldown_keys == set()
+
+    async def test_reading_the_inbox_cancels_the_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+        first = _dm(room, room["alice"], room["bob"], "first")
+        second = _dm(room, room["alice"], room["bob"], "second")
+
+        await watcher.on_direct_message(room["ns"], first, room["alice"])
+        await asyncio.sleep(0.1)
+        await watcher.on_direct_message(room["ns"], second, room["alice"])
+        assert (f"dm:{room['alice']}", room["bob"]) in watcher.pending_keys
+
+        read = _read_inbox(room, room["bob"])
+        dropped = watcher.on_inbox_read(room["bob"], [m["mid"] for m in read])
+        await asyncio.sleep(0.7)
+
+        assert dropped == 1
+        assert len(sender.sent) == 1  # the leading push only
+        assert watcher.pending_keys == set()
+
+    async def test_unrelated_read_does_not_cancel_the_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.3))
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"], "first"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"], "second"), room["alice"]
+        )
+
+        assert watcher.on_inbox_read(room["bob"], [uuid7str()]) == 0
+        await asyncio.sleep(0.4)
+        assert len(sender.sent) == 2
+
+    async def test_read_before_delivery_suppresses_the_follow_up(self, room):
+        """The DB re-check catches a read that skipped on_inbox_read."""
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.3))
+
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"], "first"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"], "second"), room["alice"]
+        )
+
+        _read_inbox(room, room["bob"])
+        await asyncio.sleep(0.4)
+
+        assert len(sender.sent) == 1
+
+    async def test_room_and_dm_windows_are_independent(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=5.0))
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "in the room"), room["alice"]
+        )
+        await watcher.on_direct_message(
+            room["ns"], _dm(room, room["alice"], room["bob"], "and directly"), room["alice"]
+        )
+        await asyncio.sleep(0.2)
+
+        assert {payload["notification"]["tag"] for _, payload in sender.sent} == {
+            f"room:{room['room_id']}",
+            f"dm:{room['alice']}",
+        }
+
+    async def test_push_disabled_globally_returns_no_task(self, room):
+        watcher = notifier.UnreadWatcher(
+            sender=RecordingSender(), config=push.PushConfig(enabled=False)
+        )
+        message = _dm(room, room["alice"], room["bob"])
+
+        assert watcher.on_direct_message(room["ns"], message, room["alice"]) is None
+
+
+class TestBadgeCountsDirectMessages:
+    """The badge is the thread list's unread total: rooms plus the inbox."""
+
+    def test_unread_direct_messages_count(self, room):
+        _dm(room, room["alice"], room["bob"], "one")
+        _dm(room, room["alice"], room["bob"], "two")
+
+        assert db.count_unread_for_identity(room["ns"], room["bob"]) == 2
+
+    def test_reading_the_inbox_clears_them(self, room):
+        _dm(room, room["alice"], room["bob"], "one")
+        _read_inbox(room, room["bob"])
+
+        assert db.count_unread_for_identity(room["ns"], room["bob"]) == 0
+
+    def test_rooms_and_direct_messages_add_up(self, room):
+        _send(room, room["alice"], "in the room")
+        _dm(room, room["alice"], room["bob"], "and directly")
+
+        assert db.count_unread_for_identity(room["ns"], room["bob"]) == 2
+
+    def test_archived_messages_do_not_count(self, room):
+        message = _dm(room, room["alice"], room["bob"], "filed away")
+        db.archive_message(room["ns"], room["bob"], message["mid"])
+
+        assert db.count_unread_for_identity(room["ns"], room["bob"]) == 0

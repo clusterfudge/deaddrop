@@ -1193,6 +1193,18 @@ async def send_message(
         except Exception:
             logger.warning("Failed to publish inbox event", exc_info=True)
 
+        try:
+            from .notifier import get_watcher
+
+            # db.send_message returns metadata only; the body is the request's.
+            get_watcher().on_direct_message(
+                ns,
+                {**result, "body": request.body},
+                sender_id=from_id,
+            )
+        except Exception:
+            logger.warning("Failed to arm push notification", exc_info=True)
+
     headers = {}
     if deduplicated:
         headers["Dedup-Status"] = "deduplicated"
@@ -1236,6 +1248,8 @@ async def get_inbox(
             after_mid=after,
         )
     )
+
+    _disarm_inbox_push(identity_id, [m["mid"] for m in messages])
 
     return {
         "messages": [
@@ -2079,6 +2093,20 @@ async def send_room_message(
         headers["Dedup-Status"] = "deduplicated"
 
     return JSONResponse(content=response_data, headers=headers)
+
+
+def _disarm_inbox_push(identity_id: str, mids: list[str]) -> None:
+    """Tell the watcher which direct messages the inbox fetch marked read.
+
+    The watcher re-reads ``read_at`` before sending anyway; this call just
+    avoids the wait and the round-trip.
+    """
+    try:
+        from .notifier import get_watcher
+
+        get_watcher().on_inbox_read(identity_id, mids)
+    except Exception:
+        logger.warning("Failed to disarm push notification", exc_info=True)
 
 
 def _disarm_push(room_id: str, identity_id: str, last_read_mid: str) -> None:
