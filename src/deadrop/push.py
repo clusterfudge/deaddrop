@@ -28,12 +28,10 @@ Configuration
     ``mailto:`` or ``https://`` URL. Apple rejects a JWT whose ``sub``
     is absent or not a URL with ``403 BadJwtToken``.
 
-``DEADROP_PUSH_UNREAD_SECONDS``
-    Seconds a message may sit unread before a push is sent (default 60).
-
-``DEADROP_PUSH_COOLDOWN_SECONDS``
-    Minimum gap between pushes for one (room, identity) pair regardless
-    of message volume (default 300).
+``DEADROP_PUSH_DEBOUNCE_SECONDS``
+    Debounce window: the first unread message in a (room, identity) arms a
+    timer this long, and every message arriving before it expires is folded
+    into the same notification (default 120).
 
 ``DEADROP_PUSH_TTL_SECONDS``
     ``TTL`` header on the push request (default 3600).
@@ -102,8 +100,7 @@ class PushConfig:
     public_key: str = ""
     private_key: str = ""
     subject: str = ""
-    unread_seconds: float = 60.0
-    cooldown_seconds: float = 300.0
+    debounce_seconds: float = 120.0
     ttl_seconds: int = 3600
 
     @property
@@ -141,8 +138,7 @@ def load_config() -> PushConfig:
         public_key=os.environ.get("DEADROP_VAPID_PUBLIC_KEY", "").strip(),
         private_key=os.environ.get("DEADROP_VAPID_PRIVATE_KEY", "").strip(),
         subject=os.environ.get("DEADROP_VAPID_SUBJECT", "").strip(),
-        unread_seconds=_env_float("DEADROP_PUSH_UNREAD_SECONDS", 60.0),
-        cooldown_seconds=_env_float("DEADROP_PUSH_COOLDOWN_SECONDS", 300.0),
+        debounce_seconds=_env_float("DEADROP_PUSH_DEBOUNCE_SECONDS", 120.0),
         ttl_seconds=int(_env_float("DEADROP_PUSH_TTL_SECONDS", 3600.0)),
     )
 
@@ -274,6 +270,7 @@ def build_payload(
     body: str,
     navigate: str,
     tag: str | None = None,
+    badge: int | None = None,
 ) -> dict:
     """Build a Declarative Web Push envelope.
 
@@ -281,6 +278,11 @@ def build_payload(
     involvement; older iOS (16.4-18.3) and every other browser dispatch it
     to the ``push`` handler in ``sw.js``, which reads the same fields. One
     payload shape covers both.
+
+    ``badge`` becomes ``app_badge``, the Declarative Web Push member the OS
+    applies to the app icon. It is a JSON number per the specification's
+    ``unsigned long long``; the service-worker fallback coerces it before
+    handing it to ``setAppBadge()``.
     """
     notification: dict[str, object] = {
         "title": title,
@@ -289,6 +291,8 @@ def build_payload(
     }
     if tag:
         notification["tag"] = tag
+    if badge is not None:
+        notification["app_badge"] = int(badge)
     return {"web_push": 8030, "notification": notification}
 
 

@@ -13,8 +13,13 @@ The feature is **off by default**. Nothing below runs until
 
 ## When a push is sent
 
-A room message arms a timer for each recipient. When the timer expires the
-server re-reads that recipient's read cursor:
+A room message arms a **two-minute debounce timer** for each recipient.
+Messages arriving while the timer runs are folded into the same
+notification and do **not** extend the deadline, so a burst produces one
+push two minutes after the burst started. The body reads
+`latest message (+N more)`.
+
+When the timer expires the server re-reads that recipient's read cursor:
 
 | Cursor state | Result |
 |---|---|
@@ -27,10 +32,26 @@ The last row is deliberate. A non-v7 cursor cannot be ordered against a v7
 message id, so treating it as "never seen" would leave the room
 permanently unread and push on every message forever.
 
-A client that renders the message advances its cursor, which cancels the
-timer — so an app you are actively looking at does not also buzz your
-phone. Beyond that, at most one push per (room, identity) per cooldown
-window regardless of how many messages arrive.
+Three further reasons not to send, checked when the timer fires:
+
+* **Foreground.** The identity has an open long-poll or SSE waiter on
+  `/{ns}/subscribe` — a client is attached and will render the message
+  itself. Registration spans exactly the wait, so a client that has gone
+  away stops suppressing as soon as its poll ends.
+* **Switched off.** The identity set `enabled: false` via
+  `PUT /{ns}/push/prefs`.
+* **No devices.** The identity holds no subscriptions.
+
+A client that renders the message also advances its cursor, which cancels
+the timer outright.
+
+Reactions never notify, and a sender is never notified about its own
+message.
+
+The timers and the waiter registry are in-process (the deployment runs a
+single uvicorn worker). **A restart loses whatever debounce timers were
+pending**; those messages stay unread and the next message in the room
+re-arms.
 
 ---
 
@@ -77,8 +98,7 @@ ssh dokku@h1.dokku.heare.io config:set deaddrop \
 | `DEADROP_VAPID_PUBLIC_KEY` | — | base64url of the uncompressed P-256 point (65 bytes). |
 | `DEADROP_VAPID_PRIVATE_KEY` | — | base64url of the raw P-256 scalar (32 bytes). |
 | `DEADROP_VAPID_SUBJECT` | — | `mailto:` or `https://` URL. |
-| `DEADROP_PUSH_UNREAD_SECONDS` | `60` | How long a message may sit unread before a push. |
-| `DEADROP_PUSH_COOLDOWN_SECONDS` | `300` | Minimum gap between pushes for one (room, identity). |
+| `DEADROP_PUSH_DEBOUNCE_SECONDS` | `120` | Debounce window — how long messages coalesce before one push goes out. |
 | `DEADROP_PUSH_TTL_SECONDS` | `3600` | `TTL` header — how long the push service may hold an undelivered message. |
 
 All three keys plus the subject must be present; with any one missing the
@@ -117,6 +137,8 @@ curl -X POST -H "X-Inbox-Secret: $SECRET" \
 | `POST /{ns}/push/subscriptions` | `X-Inbox-Secret` | Register a device. |
 | `GET /{ns}/push/subscriptions` | `X-Inbox-Secret` | List your devices (no key material). |
 | `DELETE /{ns}/push/subscriptions?endpoint=…` | `X-Inbox-Secret` | Remove one device. |
+| `GET /{ns}/push/prefs` | `X-Inbox-Secret` | Read the identity switch and the badge count. |
+| `PUT /{ns}/push/prefs` | `X-Inbox-Secret` | Turn push on/off for this identity everywhere. |
 | `POST /{ns}/push/test` | `X-Inbox-Secret` | Send a test notification to all your devices. |
 
 Subscriptions are keyed on the endpoint URL, so one identity may hold
@@ -136,7 +158,8 @@ The server always emits a Declarative Web Push envelope:
     "title": "sean in twin",
     "body": "PR #78 is green, merging",
     "navigate": "https://deaddrop.dokku.heare.io/app/twin/room/0698e39d-…",
-    "tag": "room:0698e39d-…"
+    "tag": "room:0698e39d-…",
+    "app_badge": 3
   }
 }
 ```
@@ -150,11 +173,29 @@ a push without showing a notification. There is no silent push.
 
 ---
 
+## Preferences and the badge
+
+The switch is **one boolean per identity** (`push_prefs`), not per room and
+not per device. Turning it off leaves the subscription rows in place, so
+turning it back on does not require the permission gesture again. An
+identity with no row is enabled — registering a device is the opt-in.
+
+`app_badge` is a single integer: every unread room message for that
+identity, across every room, defined once in
+`db.count_unread_for_identity` and reused by both the push payload and
+`GET /{ns}/push/prefs`. The client mirrors it onto the app icon with
+`setAppBadge()` after a read-cursor update, and the service worker applies
+it on iOS 16.4–18.3 where the OS does not.
+
+A subscription endpoint belongs to one (namespace, identity) pair, so a
+device signed into two namespaces badges the one it subscribed with. That
+is the multi-namespace caveat the badge's one-integer shape forces.
+
+---
+
 ## What this does not do
 
 * **1:1 messages.** Only room messages notify. Direct messages track
   read state with `read_at` rather than a cursor and are not wired up.
-* **Badges.** The Badging API works on iOS ≥ 16.4, but the badge is one
-  global integer while the app is multi-namespace, so the semantics need
-  deciding before it is worth implementing.
-* **Per-room mute / quiet hours.** The control is global per device.
+* **Per-room mute / quiet hours.** The switch is global per identity.
+* **Durable debounce.** Pending timers live in the worker process.

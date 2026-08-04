@@ -61,6 +61,42 @@ const DeadropPush = {
         return null;
     },
 
+    /** The identity-wide switch and the current badge count. */
+    async prefs(credentials) {
+        return DeadropAPI.request('GET', `/${credentials.ns}/push/prefs`, { credentials });
+    },
+
+    /** Turn push on or off for this identity on every device. */
+    async setEnabled(credentials, enabled) {
+        return DeadropAPI.request('PUT', `/${credentials.ns}/push/prefs`, {
+            credentials,
+            body: { enabled },
+        });
+    },
+
+    /**
+     * Mirror the server's unread total onto the app icon.
+     *
+     * The badge is one integer for the whole app, and the server owns the
+     * definition — the client asks rather than counting, so an icon badge and
+     * a push payload can never disagree.
+     */
+    async syncBadge(credentials) {
+        if (!('setAppBadge' in navigator)) return null;
+        try {
+            const { badge } = await this.prefs(credentials);
+            if (badge > 0) {
+                await navigator.setAppBadge(badge);
+            } else {
+                await navigator.clearAppBadge();
+            }
+            return badge;
+        } catch (err) {
+            console.warn('[push] badge sync failed:', err.message);
+            return null;
+        }
+    },
+
     /**
      * Ask for permission, subscribe, and register with the server.
      * Must be called from a user gesture — iOS requires it.
@@ -98,11 +134,14 @@ const DeadropPush = {
                 user_agent: navigator.userAgent.slice(0, 200),
             },
         });
+        await this.setEnabled(credentials, true);
         return subscription;
     },
 
-    /** Unsubscribe locally and drop the server-side row. */
+    /** Unsubscribe locally, drop the server-side row, and switch push off. */
     async unsubscribe(credentials) {
+        await this.setEnabled(credentials, false);
+
         const subscription = await this.currentSubscription();
         if (!subscription) return false;
 

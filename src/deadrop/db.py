@@ -49,7 +49,7 @@ DEDUP_WINDOW_SECONDS = 60
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -1458,6 +1458,31 @@ def _migrate_007_add_push_subscriptions(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_008_add_push_prefs(conn: sqlite3.Connection) -> None:
+    """Migration 008: Add push_prefs — one on/off switch per identity.
+
+    Separate from ``push_subscriptions`` because the switch outlives any
+    single device: turning notifications off must not require deleting the
+    subscriptions, and turning them back on must not require every device to
+    re-run the permission gesture. An identity with no row is enabled, so
+    registering a subscription is sufficient to receive push.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS push_prefs (
+            ns TEXT NOT NULL,
+            identity_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ns, identity_id),
+            FOREIGN KEY (ns, identity_id) REFERENCES identities(ns, id) ON DELETE CASCADE
+        )
+    """,
+        name="migrate.008.create_push_prefs",
+    )
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
@@ -1467,6 +1492,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (5, "Add content_hash for implicit message deduplication", _migrate_005_add_content_hash),
     (6, "Add attachments table for binary content on messages", _migrate_006_add_attachments),
     (7, "Add push_subscriptions table for Web Push", _migrate_007_add_push_subscriptions),
+    (8, "Add push_prefs table for per-identity push on/off", _migrate_008_add_push_prefs),
 ]
 
 
@@ -1626,6 +1652,7 @@ def reset_db(conn: sqlite3.Connection | None = None):
     """Reset database (for testing)."""
     conn = _get_conn(conn)
     conn.executescript("""
+        DROP TABLE IF EXISTS push_prefs;
         DROP TABLE IF EXISTS push_subscriptions;
         DROP TABLE IF EXISTS attachments;
         DROP TABLE IF EXISTS room_messages;
@@ -4195,3 +4222,82 @@ def touch_push_subscription(
         name="touch_push_subscription",
     )
     conn.commit()
+
+
+# --- Web Push Preferences ---
+
+
+@timed_query("get_push_enabled")
+def get_push_enabled(
+    ns: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Is push delivery enabled for this identity?
+
+    An identity with no row is enabled: registering a subscription is an
+    explicit opt-in already, so the absent row must not mean "off".
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        "SELECT enabled FROM push_prefs WHERE ns = ? AND identity_id = ?",
+        (ns, identity_id),
+        name="get_push_enabled",
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return True
+    return bool(row[0])
+
+
+@timed_query("set_push_enabled")
+def set_push_enabled(
+    ns: str,
+    identity_id: str,
+    enabled: bool,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Set the identity-wide push switch. Returns the stored value."""
+    conn = _get_conn(conn)
+    conn.execute(
+        """INSERT INTO push_prefs (ns, identity_id, enabled, updated_at)
+           VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(ns, identity_id) DO UPDATE SET
+               enabled = excluded.enabled,
+               updated_at = CURRENT_TIMESTAMP""",
+        (ns, identity_id, 1 if enabled else 0),
+        name="set_push_enabled.upsert",
+    )
+    conn.commit()
+    return bool(enabled)
+
+
+@timed_query("count_unread_for_identity")
+def count_unread_for_identity(
+    ns: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Total unread room messages for an identity, across every room.
+
+    This is the badge number: one integer for the whole app icon. The
+    per-room definition in :func:`get_room_unread_count` is reproduced here
+    as a single aggregate rather than N queries, including its treatment of
+    a non-UUIDv7 cursor as unset.
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT COUNT(*)
+           FROM room_members m
+           JOIN room_messages rm ON rm.room_id = m.room_id
+           WHERE m.ns = ? AND m.identity_id = ?
+             AND (
+                 m.last_read_mid IS NULL
+                 OR m.last_read_mid = ''
+                 OR (length(m.last_read_mid) >= 15 AND substr(m.last_read_mid, 15, 1) != '7')
+                 OR rm.mid > m.last_read_mid
+             )""",
+        (ns, identity_id),
+        name="count_unread_for_identity",
+    )
+    return cursor.fetchone()[0]

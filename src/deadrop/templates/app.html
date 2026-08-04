@@ -876,10 +876,20 @@
         }
         if (!config.enabled) return;
 
+        // On requires both: this device subscribed, and the identity switch on.
         const subscription = await DeadropPush.currentSubscription();
-        btn.textContent = subscription ? '\u{1F514}' : '\u{1F515}';
-        btn.title = subscription ? 'Notifications on — tap to disable' : 'Enable notifications';
+        let on = !!subscription;
+        if (on) {
+            try {
+                on = (await DeadropPush.prefs(credentials)).enabled;
+            } catch (e) {
+                // Leave the toggle showing the device state we can see.
+            }
+        }
+        btn.textContent = on ? '\u{1F514}' : '\u{1F515}';
+        btn.title = on ? 'Notifications on — tap to disable' : 'Enable notifications';
         btn.classList.remove('hidden');
+        DeadropPush.syncBadge(credentials);
     }
 
     async function togglePush() {
@@ -888,7 +898,8 @@
         btn.disabled = true;
         try {
             const subscription = await DeadropPush.currentSubscription();
-            if (subscription) {
+            const enabled = subscription && (await DeadropPush.prefs(credentials)).enabled;
+            if (enabled) {
                 await DeadropPush.unsubscribe(credentials);
             } else {
                 await DeadropPush.subscribe(credentials);
@@ -1477,7 +1488,9 @@
             const realMessages = roomMessages.filter(m => !m.pending);
             if (realMessages.length > 0 && currentRoomId) {
                 const lastMid = realMessages[realMessages.length - 1].mid;
-                DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid).catch(() => {});
+                DeadropAPI.updateRoomReadCursor(credentials, currentRoomId, lastMid)
+                    .then(() => DeadropPush.syncBadge(credentials))
+                    .catch(() => {});
             }
         }, 500);
     }

@@ -124,7 +124,7 @@ self.addEventListener('message', (event) => {
 // The server sends a Declarative Web Push envelope:
 //
 //   { "web_push": 8030,
-//     "notification": { "title", "body", "navigate", "tag" } }
+//     "notification": { "title", "body", "navigate", "tag", "app_badge" } }
 //
 // iOS >= 18.4 and Safari 18.4 render that envelope themselves and never
 // run this handler. Everything older (including iOS 16.4-18.3, the floor
@@ -145,13 +145,26 @@ self.addEventListener('push', (event) => {
   // userVisibleOnly is mandatory on iOS: failing to show a notification
   // for a delivered push revokes the subscription.
   event.waitUntil(
-    self.registration.showNotification(n.title || 'Deadrop', {
-      body: n.body || '',
-      tag: n.tag || 'deadrop',
-      icon: '/static/icons/icon-192.png',
-      badge: '/static/icons/icon-192.png',
-      data: { navigate: navigateTo },
-    }),
+    (async () => {
+      await self.registration.showNotification(n.title || 'Deadrop', {
+        body: n.body || '',
+        tag: n.tag || 'deadrop',
+        icon: '/static/icons/icon-192.png',
+        badge: '/static/icons/icon-192.png',
+        data: { navigate: navigateTo },
+      });
+
+      // app_badge is applied by the OS on iOS >= 18.4, which never reaches
+      // this handler; here it has to be applied explicitly.
+      if (n.app_badge !== undefined && n.app_badge !== null && 'setAppBadge' in navigator) {
+        const count = Number(n.app_badge);
+        if (count > 0) {
+          await navigator.setAppBadge(count);
+        } else {
+          await navigator.clearAppBadge();
+        }
+      }
+    })(),
   );
 });
 

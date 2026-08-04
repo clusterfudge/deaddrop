@@ -144,11 +144,7 @@ async def lifespan(app: FastAPI):
 
     push_cfg = push.load_config()
     if push_cfg.configured:
-        logger.info(
-            "Web Push enabled (unread=%ss, cooldown=%ss)",
-            push_cfg.unread_seconds,
-            push_cfg.cooldown_seconds,
-        )
+        logger.info("Web Push enabled (debounce=%ss)", push_cfg.debounce_seconds)
     elif push_cfg.enabled:
         logger.warning(
             "DEADROP_PUSH_ENABLED is set but the VAPID keypair/subject is incomplete "
@@ -1671,6 +1667,12 @@ class PushSubscriptionRequest(BaseModel):
     user_agent: str | None = None
 
 
+class PushPrefsRequest(BaseModel):
+    """The identity-wide push switch."""
+
+    enabled: bool
+
+
 # --- Room Helper Functions ---
 
 
@@ -2221,7 +2223,7 @@ def push_vapid_public_key():
     return {
         "enabled": cfg.configured,
         "public_key": cfg.public_key if cfg.configured else None,
-        "unread_seconds": cfg.unread_seconds,
+        "debounce_seconds": cfg.debounce_seconds,
     }
 
 
@@ -2295,6 +2297,42 @@ async def remove_push_subscription(
     return {"ok": True, "endpoint": endpoint}
 
 
+@app.get("/{ns}/push/prefs")
+async def get_push_prefs(
+    ns: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Read the calling identity's push switch and badge count."""
+    await _require_active_namespace(ns)
+    identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
+
+    enabled = await _run_read(db.get_push_enabled, ns, identity_id)
+    badge = await _run_read(db.count_unread_for_identity, ns, identity_id)
+    return {"enabled": enabled, "badge": badge}
+
+
+@app.put("/{ns}/push/prefs")
+async def set_push_prefs(
+    ns: str,
+    request: PushPrefsRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Turn push on or off for the calling identity, on every device.
+
+    Independent of the subscription rows: switching off keeps the devices
+    registered so switching back on doesn't need the permission gesture again.
+    """
+    import functools
+
+    await _require_active_namespace(ns)
+    identity_id = await _require_inbox_secret_any(ns, x_inbox_secret)
+
+    enabled = await _run_write(
+        functools.partial(db.set_push_enabled, ns, identity_id, request.enabled)
+    )
+    return {"ok": True, "enabled": enabled}
+
+
 @app.post("/{ns}/push/test")
 async def send_test_push(
     ns: str,
@@ -2326,6 +2364,7 @@ async def send_test_push(
         body="Test notification — push is working.",
         navigate=f"/app/{slug}",
         tag="deadrop-test",
+        badge=await _run_read(db.count_unread_for_identity, ns, identity_id),
     )
 
     sender = get_watcher().sender
@@ -2594,6 +2633,11 @@ async def subscribe(
 
     event_bus = get_event_bus()
 
+    # An attached waiter is a client that will render the message itself, so
+    # the push watcher suppresses notifications for this identity while one
+    # is open. Registration spans exactly the wait.
+    from .notifier import open_waiter
+
     if request.mode == "stream":
         # SSE streaming mode
         async def event_generator():
@@ -2601,8 +2645,9 @@ async def subscribe(
             yield "event: connected\ndata: {}\n\n"
 
             try:
-                async for event in event_bus.stream(ns, request.topics):
-                    yield f"event: change\ndata: {json.dumps(event)}\n\n"
+                with open_waiter(ns, caller_id):
+                    async for event in event_bus.stream(ns, request.topics):
+                        yield f"event: change\ndata: {json.dumps(event)}\n\n"
             except asyncio.CancelledError:
                 return
 
@@ -2617,7 +2662,8 @@ async def subscribe(
         )
 
     # Poll mode — block until event or timeout
-    changes = await event_bus.subscribe(ns, request.topics, timeout=request.timeout)
+    with open_waiter(ns, caller_id):
+        changes = await event_bus.subscribe(ns, request.topics, timeout=request.timeout)
 
     # Build response: "events" maps topic -> latest_mid (backward compatible),
     # "details" maps topic -> {latest_mid, sender_id} (new rich info)

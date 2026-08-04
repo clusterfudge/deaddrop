@@ -159,6 +159,19 @@ class TestBuildPayload:
     def test_tag_omitted_when_absent(self):
         assert "tag" not in push.build_payload("t", "b", "/app")["notification"]
 
+    def test_badge_is_a_json_number(self):
+        # Declarative Web Push types app_badge as an unsigned long long.
+        notification = push.build_payload("t", "b", "/app", badge=7)["notification"]
+        assert notification["app_badge"] == 7
+        assert isinstance(notification["app_badge"], int)
+
+    def test_badge_omitted_when_absent(self):
+        assert "app_badge" not in push.build_payload("t", "b", "/app")["notification"]
+
+    def test_zero_badge_is_still_sent(self):
+        # Zero is how a badge gets cleared; it must not be dropped as falsy.
+        assert push.build_payload("t", "b", "/app", badge=0)["notification"]["app_badge"] == 0
+
 
 class TestLoadConfig:
     def test_defaults_are_disabled(self, monkeypatch):
@@ -167,15 +180,13 @@ class TestLoadConfig:
             "DEADROP_VAPID_PUBLIC_KEY",
             "DEADROP_VAPID_PRIVATE_KEY",
             "DEADROP_VAPID_SUBJECT",
-            "DEADROP_PUSH_UNREAD_SECONDS",
-            "DEADROP_PUSH_COOLDOWN_SECONDS",
+            "DEADROP_PUSH_DEBOUNCE_SECONDS",
         ):
             monkeypatch.delenv(key, raising=False)
         cfg = push.load_config()
         assert cfg.enabled is False
         assert cfg.configured is False
-        assert cfg.unread_seconds == 60.0
-        assert cfg.cooldown_seconds == 300.0
+        assert cfg.debounce_seconds == 120.0
 
     def test_enabled_requires_full_keypair(self, monkeypatch):
         monkeypatch.setenv("DEADROP_PUSH_ENABLED", "true")
@@ -187,9 +198,13 @@ class TestLoadConfig:
         monkeypatch.setenv("DEADROP_VAPID_PRIVATE_KEY", "priv")
         assert push.load_config().configured is True
 
+    def test_debounce_window_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("DEADROP_PUSH_DEBOUNCE_SECONDS", "30")
+        assert push.load_config().debounce_seconds == 30.0
+
     def test_invalid_numeric_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("DEADROP_PUSH_UNREAD_SECONDS", "not-a-number")
-        assert push.load_config().unread_seconds == 60.0
+        monkeypatch.setenv("DEADROP_PUSH_DEBOUNCE_SECONDS", "not-a-number")
+        assert push.load_config().debounce_seconds == 120.0
 
 
 class _FakeResponse:

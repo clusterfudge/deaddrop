@@ -101,7 +101,7 @@ def _subscribe_body(endpoint=ENDPOINT):
 class TestVapidPublicKeyRoute:
     def test_reports_disabled_without_config(self, client, disabled):
         body = client.get("/push/vapid-public-key").json()
-        assert body == {"enabled": False, "public_key": None, "unread_seconds": 60.0}
+        assert body == {"enabled": False, "public_key": None, "debounce_seconds": 120.0}
 
     def test_exposes_the_public_key_when_configured(self, client, configured):
         body = client.get("/push/vapid-public-key").json()
@@ -401,5 +401,146 @@ class TestReadCursorHook:
             assert read.status_code == 200
             assert watcher.pending_keys == set()
             assert sender.calls == []
+        finally:
+            notifier.set_watcher(None)
+
+
+class TestPrefsRoute:
+    def test_defaults_to_enabled_with_a_zero_badge(self, client, identities):
+        ns, alice = identities["ns"], identities["alice"]
+        body = client.get(f"/{ns}/push/prefs", headers={"X-Inbox-Secret": alice["secret"]}).json()
+        assert body == {"enabled": True, "badge": 0}
+
+    def test_switch_round_trips(self, client, identities):
+        ns, alice = identities["ns"], identities["alice"]
+        headers = {"X-Inbox-Secret": alice["secret"]}
+
+        put = client.put(f"/{ns}/push/prefs", headers=headers, json={"enabled": False})
+        assert put.json() == {"ok": True, "enabled": False}
+        assert client.get(f"/{ns}/push/prefs", headers=headers).json()["enabled"] is False
+
+        client.put(f"/{ns}/push/prefs", headers=headers, json={"enabled": True})
+        assert client.get(f"/{ns}/push/prefs", headers=headers).json()["enabled"] is True
+
+    def test_switching_off_keeps_the_subscription(self, client, identities):
+        ns, alice = identities["ns"], identities["alice"]
+        headers = {"X-Inbox-Secret": alice["secret"]}
+        client.post(f"/{ns}/push/subscriptions", headers=headers, json=_subscribe_body())
+
+        client.put(f"/{ns}/push/prefs", headers=headers, json={"enabled": False})
+
+        listed = client.get(f"/{ns}/push/subscriptions", headers=headers).json()["subscriptions"]
+        assert [s["endpoint"] for s in listed] == [ENDPOINT]
+
+    def test_switch_is_per_identity(self, client, identities):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        client.put(
+            f"/{ns}/push/prefs",
+            headers={"X-Inbox-Secret": alice["secret"]},
+            json={"enabled": False},
+        )
+        bob_prefs = client.get(
+            f"/{ns}/push/prefs", headers={"X-Inbox-Secret": bob["secret"]}
+        ).json()
+        assert bob_prefs["enabled"] is True
+
+    def test_requires_auth(self, client, identities):
+        ns = identities["ns"]
+        assert client.get(f"/{ns}/push/prefs").status_code == 401
+        assert client.put(f"/{ns}/push/prefs", json={"enabled": True}).status_code == 401
+        wrong = client.get(f"/{ns}/push/prefs", headers={"X-Inbox-Secret": "wrong"})
+        assert wrong.status_code == 403
+
+    def test_badge_counts_unread_room_messages(self, client, identities):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        alice_headers = {"X-Inbox-Secret": alice["secret"]}
+        room = client.post(
+            f"/{ns}/rooms", headers=alice_headers, json={"display_name": "twin"}
+        ).json()
+        client.post(
+            f"/{ns}/rooms/{room['room_id']}/members",
+            headers=alice_headers,
+            json={"identity_id": bob["id"]},
+        )
+        for body in ("one", "two"):
+            client.post(
+                f"/{ns}/rooms/{room['room_id']}/messages",
+                headers=alice_headers,
+                json={"body": body},
+            )
+
+        prefs = client.get(f"/{ns}/push/prefs", headers={"X-Inbox-Secret": bob["secret"]}).json()
+        assert prefs["badge"] == 2
+
+
+class TestSubscribeRouteRegistersAWaiter:
+    """A long-poll on /subscribe is what "foreground" means to the watcher."""
+
+    def test_the_poll_route_registers_a_waiter_while_it_waits(
+        self, live_client, identities, monkeypatch
+    ):
+        ns, alice = identities["ns"], identities["alice"]
+        observed: list[bool] = []
+
+        class ObservingBus:
+            """Records the waiter registry as seen from inside the wait."""
+
+            async def subscribe(self, namespace, topics, timeout=30.0):
+                observed.append(notifier.has_open_waiter(namespace, alice["id"]))
+                return {}
+
+        monkeypatch.setattr("deadrop.events.get_event_bus", lambda: ObservingBus())
+
+        response = live_client.post(
+            f"/{ns}/subscribe",
+            headers={"X-Inbox-Secret": alice["secret"]},
+            json={"topics": {f"inbox:{alice['id']}": None}, "timeout": 1},
+        )
+
+        assert response.status_code == 200
+        assert observed == [True]
+        # Balanced: the count does not outlive the request.
+        assert (ns, alice["id"]) not in notifier._open_waiters
+
+    def test_open_waiter_suppresses_a_pending_room_push(
+        self, live_client, identities, configured, stub_sender
+    ):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        alice_headers = {"X-Inbox-Secret": alice["secret"]}
+        bob_headers = {"X-Inbox-Secret": bob["secret"]}
+
+        watcher = notifier.UnreadWatcher(
+            sender=stub_sender,
+            config=push.PushConfig(
+                enabled=True,
+                public_key="pub",
+                private_key="priv",
+                subject="mailto:ops@example.com",
+                debounce_seconds=0.05,
+            ),
+        )
+        notifier.set_watcher(watcher)
+        try:
+            room = live_client.post(
+                f"/{ns}/rooms", headers=alice_headers, json={"display_name": "twin"}
+            ).json()
+            live_client.post(
+                f"/{ns}/rooms/{room['room_id']}/members",
+                headers=alice_headers,
+                json={"identity_id": bob["id"]},
+            )
+            live_client.post(
+                f"/{ns}/push/subscriptions", headers=bob_headers, json=_subscribe_body()
+            )
+
+            with notifier.open_waiter(ns, bob["id"]):
+                live_client.post(
+                    f"/{ns}/rooms/{room['room_id']}/messages",
+                    headers=alice_headers,
+                    json={"body": "PR is green"},
+                )
+                assert _wait_until(lambda: (room["room_id"], bob["id"]) not in watcher.pending_keys)
+
+            assert stub_sender.calls == []
         finally:
             notifier.set_watcher(None)

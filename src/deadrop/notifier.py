@@ -1,10 +1,11 @@
 """Unread-message watcher — decides when a room message becomes a push.
 
-The rule: a room message arms a timer per recipient. If that recipient's
-read cursor has not advanced past the message when the timer expires, and
-they hold at least one Web Push subscription, they get a notification.
-An interactive client that renders the message advances the cursor, which
-disarms the timer.
+The rule: a room message arms a debounce timer per recipient. If that
+recipient's read cursor has not advanced past the message when the timer
+expires, they have push enabled, they are not holding an open long-poll
+waiter, and they hold at least one Web Push subscription, they get a
+notification. An interactive client that renders the message advances the
+cursor, which disarms the timer.
 
 Cursor semantics
 ----------------
@@ -24,23 +25,38 @@ would make the room permanently unread and push on every message forever.
 The read paths in ``db.py`` already treat a non-v7 stored cursor as unset
 for *counting*; here the same value must mean *suppress*.
 
-Storm control
--------------
-At most one push per (room, identity) per cooldown window regardless of
-message volume. A burst re-uses the timer armed by the first message
-rather than pushing the deadline out, so a chatty room notifies once at
-``unread_seconds`` after the burst started, not once per message and not
-never.
+Debounce
+--------
+The first unread message for a (room, identity) arms the timer; every
+message arriving before it expires is folded into the same notification
+and the deadline is *not* extended. A chatty room therefore notifies once,
+``debounce_seconds`` after the burst started — not once per message, and
+not never (which is what extending the deadline would produce).
+
+Suppression
+-----------
+Three independent reasons not to send, checked when the timer fires:
+
+* the read cursor has advanced past the trigger message (or is unusable),
+* the identity has turned push off (``push_prefs``),
+* the identity has an attached long-poll/SSE waiter — a client is there
+  and will render the message itself.
+
+The timers, the waiter registry, and the debounce state are all in-process.
+A restart loses whatever was pending; the next message re-arms.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
+from typing import Iterator
 
 from . import db, instrument, push
 
@@ -54,7 +70,52 @@ _UUID7_RE = re.compile(
 )
 
 # Notification bodies are truncated for the lock screen.
-_BODY_LIMIT = 140
+_BODY_LIMIT = 100
+
+# Identities with an attached long-poll/SSE waiter, counted because one
+# identity can hold several (a phone and a desktop tab). api.py increments
+# around the wait; the watcher reads it to decide whether a client is
+# already going to render the message.
+_open_waiters: Counter[tuple[str, str]] = Counter()
+
+# Monotonic time each identity's last waiter closed.
+_waiters_closed_at: dict[tuple[str, str], float] = {}
+
+# An identity counts as attached for this long after its waiter closes.
+#
+# Poll mode returns as soon as anything is published in the namespace, so
+# the very message being notified about ends the poll that would have
+# suppressed it; the client re-polls immediately. Without a grace window
+# the check would only ever work for SSE clients.
+_WAITER_GRACE_SECONDS = 5.0
+
+
+@contextlib.contextmanager
+def open_waiter(ns: str, identity_id: str) -> Iterator[None]:
+    """Mark an identity as having an attached subscription waiter."""
+    key = (ns, identity_id)
+    _open_waiters[key] += 1
+    try:
+        yield
+    finally:
+        if _open_waiters[key] <= 1:
+            del _open_waiters[key]
+        else:
+            _open_waiters[key] -= 1
+        now = time.monotonic()
+        _waiters_closed_at[key] = now
+        horizon = now - _WAITER_GRACE_SECONDS
+        for stale in [k for k, ts in _waiters_closed_at.items() if ts < horizon]:
+            del _waiters_closed_at[stale]
+
+
+def has_open_waiter(ns: str, identity_id: str) -> bool:
+    """Is a client attached — now, or within the grace window?"""
+    key = (ns, identity_id)
+    if _open_waiters.get(key, 0) > 0:
+        return True
+    closed_at = _waiters_closed_at.get(key)
+    return closed_at is not None and (time.monotonic() - closed_at) < _WAITER_GRACE_SECONDS
 
 
 def is_caught_up(cursor: str | None, mid: str) -> bool:
@@ -130,7 +191,6 @@ class UnreadWatcher:
         self._sender = sender or push.send_web_push
         self._config = config
         self._armed: dict[tuple[str, str], _Armed] = {}
-        self._last_push: dict[tuple[str, str], float] = {}
         self._tasks: set[asyncio.Task] = set()
 
     @property
@@ -278,7 +338,7 @@ class UnreadWatcher:
 
     async def _wait_and_fire(self, key: tuple[str, str], cfg: push.PushConfig) -> None:
         try:
-            await asyncio.sleep(cfg.unread_seconds)
+            await asyncio.sleep(cfg.debounce_seconds)
         except asyncio.CancelledError:
             return
 
@@ -299,8 +359,6 @@ class UnreadWatcher:
             )
 
     async def _fire(self, armed: _Armed, cfg: push.PushConfig) -> None:
-        key = (armed.room_id, armed.identity_id)
-
         member = await _read(db.get_room_member_info, armed.room_id, armed.identity_id)
         if member is None:
             return
@@ -308,10 +366,13 @@ class UnreadWatcher:
             instrument.sink.counter("push.suppressed.read")
             return
 
-        now = time.monotonic()
-        last = self._last_push.get(key)
-        if last is not None and now - last < cfg.cooldown_seconds:
-            instrument.sink.counter("push.suppressed.cooldown")
+        if has_open_waiter(armed.ns, armed.identity_id):
+            # A client is attached and about to render this message itself.
+            instrument.sink.counter("push.suppressed.foreground")
+            return
+
+        if not await _read(db.get_push_enabled, armed.ns, armed.identity_id):
+            instrument.sink.counter("push.suppressed.disabled")
             return
 
         subscriptions = await _read(db.list_push_subscriptions, armed.ns, armed.identity_id)
@@ -319,11 +380,13 @@ class UnreadWatcher:
             return
 
         slug = await self._room_slug(armed.ns)
+        badge = await self._badge(armed.ns, armed.identity_id)
         payload = push.build_payload(
             title=f"{armed.sender_label} in {armed.room_name}",
             body=self._body(armed),
             navigate=f"/app/{slug}/room/{armed.room_id}",
             tag=f"room:{armed.room_id}",
+            badge=badge,
         )
 
         results = await asyncio.gather(
@@ -344,14 +407,24 @@ class UnreadWatcher:
                 await _write(db.touch_push_subscription, result.endpoint)
 
         if delivered:
-            self._last_push[key] = now
             instrument.sink.counter("push.sent", delivered)
-            self._sweep(cfg)
 
     def _body(self, armed: _Armed) -> str:
         if armed.count > 1:
             return f"{armed.preview} (+{armed.count - 1} more)"
         return armed.preview
+
+    async def _badge(self, ns: str, identity_id: str) -> int | None:
+        """Unread total for the app icon, or None if it can't be computed.
+
+        A failure here must not cost the notification, so the badge is
+        dropped rather than raised.
+        """
+        try:
+            return await _read(db.count_unread_for_identity, ns, identity_id)
+        except Exception:
+            logger.warning("badge count failed for %s/%s", ns, identity_id, exc_info=True)
+            return None
 
     async def _room_slug(self, ns: str) -> str:
         """Namespace slug for the deep link, falling back to the raw ns id."""
@@ -362,12 +435,6 @@ class UnreadWatcher:
         if namespace:
             return namespace.get("slug") or ns
         return ns
-
-    def _sweep(self, cfg: push.PushConfig) -> None:
-        """Drop cooldown entries that can no longer suppress anything."""
-        horizon = time.monotonic() - (cfg.cooldown_seconds * 2)
-        for key in [k for k, ts in self._last_push.items() if ts < horizon]:
-            self._last_push.pop(key, None)
 
 
 # --- Global singleton ---
