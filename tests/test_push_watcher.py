@@ -346,6 +346,57 @@ class TestThrottle:
         assert len(sender.sent) == 2
         assert sender.sent[1][1]["notification"]["body"] == "msg 4 (+3 more)"
 
+    async def test_a_reaction_in_the_window_does_not_inflate_the_count(self, room):
+        # A thumbs-up is not a message the follow-up should claim to cover.
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+
+        first = _send(room, room["alice"], "msg 0")
+        await watcher.on_room_message(room["ns"], room["room_id"], first, room["alice"])
+        await asyncio.sleep(0.1)
+
+        for emoji in ("\U0001f44d", "\U0001f680", "\u2764\ufe0f"):
+            reaction = db.send_room_message(
+                room_id=room["room_id"],
+                from_id=room["alice"],
+                body=emoji,
+                content_type="reaction",
+                reference_mid=first["mid"],
+            )
+            # Returns None (not a task): reactions never enter the throttle.
+            assert (
+                watcher.on_room_message(room["ns"], room["room_id"], reaction, room["alice"])
+                is None
+            )
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "msg 1"), room["alice"]
+        )
+        await asyncio.sleep(0.7)
+
+        assert len(sender.sent) == 2
+        assert sender.sent[1][1]["notification"]["body"] == "msg 1"
+
+    async def test_a_window_of_only_reactions_sends_no_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.2))
+
+        first = _send(room, room["alice"], "msg 0")
+        await watcher.on_room_message(room["ns"], room["room_id"], first, room["alice"])
+        await asyncio.sleep(0.05)
+        reaction = db.send_room_message(
+            room_id=room["room_id"],
+            from_id=room["alice"],
+            body="\U0001f44d",
+            content_type="reaction",
+            reference_mid=first["mid"],
+        )
+        assert watcher.on_room_message(room["ns"], room["room_id"], reaction, room["alice"]) is None
+        await asyncio.sleep(0.4)
+
+        assert len(sender.sent) == 1
+
     async def test_quiet_window_sends_no_follow_up(self, room):
         _subscribe(room, room["bob"])
         sender = RecordingSender()
@@ -414,25 +465,6 @@ class TestThrottle:
 
         assert len(sender.sent) == 1
 
-    async def test_open_waiter_suppresses_the_follow_up(self, room):
-        _subscribe(room, room["bob"])
-        sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
-
-        await watcher.on_room_message(
-            room["ns"], room["room_id"], _send(room, room["alice"], "one"), room["alice"]
-        )
-        await asyncio.sleep(0.1)
-        assert len(sender.sent) == 1
-
-        with notifier.open_waiter(room["ns"], room["bob"]):
-            await watcher.on_room_message(
-                room["ns"], room["room_id"], _send(room, room["alice"], "two"), room["alice"]
-            )
-            await asyncio.sleep(0.7)
-
-        assert len(sender.sent) == 1
-
 
 @pytest.mark.asyncio
 class TestPruning:
@@ -476,82 +508,6 @@ class TestBodyCap:
         # The lock screen is the product surface; 100 is the agreed cap.
         assert notifier._BODY_LIMIT == 100
         assert len(notifier._preview("y" * 400, "text/plain")) == 100
-
-
-@pytest.mark.asyncio
-class TestForegroundSuppression:
-    """An attached long-poll waiter means a client will render the message."""
-
-    async def test_open_waiter_suppresses_the_push(self, room):
-        _subscribe(room, room["bob"])
-        sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
-
-        with notifier.open_waiter(room["ns"], room["bob"]):
-            await watcher.on_room_message(
-                room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
-            )
-            await asyncio.sleep(0.2)
-
-        assert sender.sent == []
-
-    async def test_waiter_for_another_identity_does_not_suppress(self, room):
-        _subscribe(room, room["bob"])
-        sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
-
-        with notifier.open_waiter(room["ns"], room["alice"]):
-            await watcher.on_room_message(
-                room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
-            )
-            await asyncio.sleep(0.2)
-
-        assert len(sender.sent) == 1
-
-    async def test_a_just_closed_waiter_still_suppresses(self, room):
-        # Poll mode ends the moment anything is published in the namespace,
-        # so the message being notified about closes the poll that should
-        # have suppressed it. The grace window is what makes the check work
-        # for poll clients at all.
-        _subscribe(room, room["bob"])
-        sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
-
-        with notifier.open_waiter(room["ns"], room["bob"]):
-            pass
-        await watcher.on_room_message(
-            room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
-        )
-        await asyncio.sleep(0.2)
-
-        assert sender.sent == []
-
-    async def test_push_resumes_once_the_grace_window_expires(self, room, monkeypatch):
-        _subscribe(room, room["bob"])
-        sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
-
-        monkeypatch.setattr(notifier, "_WAITER_GRACE_SECONDS", 0.01)
-        with notifier.open_waiter(room["ns"], room["bob"]):
-            pass
-        await asyncio.sleep(0.05)
-        await watcher.on_room_message(
-            room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
-        )
-        await asyncio.sleep(0.2)
-
-        assert len(sender.sent) == 1
-
-    async def test_nested_waiters_are_counted(self, room):
-        # One identity, two attached clients: the outer close must not
-        # un-suppress while the inner one is still waiting.
-        with notifier.open_waiter(room["ns"], room["bob"]):
-            with notifier.open_waiter(room["ns"], room["bob"]):
-                assert notifier.has_open_waiter(room["ns"], room["bob"]) is True
-            assert notifier.has_open_waiter(room["ns"], room["bob"]) is True
-        assert notifier.has_open_waiter(room["ns"], room["bob"]) is True
-        # The count itself is balanced; what remains is the grace window.
-        assert (room["ns"], room["bob"]) not in notifier._open_waiters
 
 
 @pytest.mark.asyncio

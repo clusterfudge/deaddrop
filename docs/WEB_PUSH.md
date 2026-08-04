@@ -33,25 +33,26 @@ The last row is deliberate. A non-v7 cursor cannot be ordered against a v7
 message id, so treating it as "never seen" would leave the room
 permanently unread and push on every message forever.
 
-Three further reasons not to send, checked at each delivery:
+Two further reasons not to send, checked at each delivery:
 
-* **Foreground.** The identity has an open long-poll or SSE waiter on
-  `/{ns}/subscribe` — a client is attached and will render the message
-  itself. Registration spans exactly the wait, so a client that has gone
-  away stops suppressing as soon as its poll ends.
 * **Switched off.** The identity set `enabled: false` via
   `PUT /{ns}/push/prefs`.
 * **No devices.** The identity holds no subscriptions.
 
-A client that renders the message also advances its cursor, which drops
-the coalesced follow-up.
+The read cursor is the only staleness signal. An open connection on
+`/{ns}/subscribe` does not suppress anything — an identity routinely holds
+several idle browser tabs, and none of them imply the message was seen. A
+client that actually renders the message advances its cursor, and that
+drops the coalesced follow-up.
 
 Reactions never notify, and a sender is never notified about its own
-message.
+message. A reaction is dropped before the throttle sees it, so it neither
+fires a push nor counts toward the `(+N more)` on a follow-up. The badge
+number is the exception: it comes from the same unread query the room list
+uses, which counts reactions.
 
-The windows and the waiter registry are in-process (the deployment runs a
-single uvicorn worker). **A restart loses whatever follow-up was
-pending**; those messages stay unread and the next message in the room
+The windows are in-process (the deployment runs a single uvicorn worker).
+**A restart loses whatever follow-up was pending**; those messages stay unread and the next message in the room
 notifies immediately.
 
 ---

@@ -2633,11 +2633,6 @@ async def subscribe(
 
     event_bus = get_event_bus()
 
-    # An attached waiter is a client that will render the message itself, so
-    # the push watcher suppresses notifications for this identity while one
-    # is open. Registration spans exactly the wait.
-    from .notifier import open_waiter
-
     if request.mode == "stream":
         # SSE streaming mode
         async def event_generator():
@@ -2645,9 +2640,8 @@ async def subscribe(
             yield "event: connected\ndata: {}\n\n"
 
             try:
-                with open_waiter(ns, caller_id):
-                    async for event in event_bus.stream(ns, request.topics):
-                        yield f"event: change\ndata: {json.dumps(event)}\n\n"
+                async for event in event_bus.stream(ns, request.topics):
+                    yield f"event: change\ndata: {json.dumps(event)}\n\n"
             except asyncio.CancelledError:
                 return
 
@@ -2662,8 +2656,7 @@ async def subscribe(
         )
 
     # Poll mode — block until event or timeout
-    with open_waiter(ns, caller_id):
-        changes = await event_bus.subscribe(ns, request.topics, timeout=request.timeout)
+    changes = await event_bus.subscribe(ns, request.topics, timeout=request.timeout)
 
     # Build response: "events" maps topic -> latest_mid (backward compatible),
     # "details" maps topic -> {latest_mid, sender_id} (new rich info)

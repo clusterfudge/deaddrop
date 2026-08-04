@@ -3,9 +3,13 @@
 The rule: a room message notifies each recipient immediately, then holds
 that recipient's channel closed for a cooldown window. A notification goes
 out when the recipient's read cursor is behind the message, they have push
-enabled, they are not holding an open long-poll waiter, and they hold at
-least one Web Push subscription. An interactive client that renders the
-message advances the cursor, which drops the coalesced follow-up.
+enabled, and they hold at least one Web Push subscription. An interactive
+client that renders the message advances the cursor, which drops the
+coalesced follow-up.
+
+The read cursor is the only staleness signal. An open connection is not
+one: an identity routinely holds several idle browser tabs, and none of
+them imply the message was seen.
 
 Cursor semantics
 ----------------
@@ -41,29 +45,22 @@ hears about the first message the moment it lands.
 
 Suppression
 -----------
-Three independent reasons not to send, checked at each delivery:
+Two independent reasons not to send, checked at each delivery:
 
 * the read cursor has advanced past the trigger message (or is unusable),
-* the identity has turned push off (``push_prefs``),
-* the identity has an attached long-poll/SSE waiter — a client is there
-  and will render the message itself.
+* the identity has turned push off (``push_prefs``).
 
-The windows, the waiter registry, and the coalesced state are all
-in-process. A restart loses whatever follow-up was pending; the next
-message delivers immediately.
+The windows and the coalesced state are in-process. A restart loses
+whatever follow-up was pending; the next message delivers immediately.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import logging
 import re
-import time
-from collections import Counter
 from dataclasses import dataclass
-from typing import Iterator
 
 from . import db, instrument, push
 
@@ -78,51 +75,6 @@ _UUID7_RE = re.compile(
 
 # Notification bodies are truncated for the lock screen.
 _BODY_LIMIT = 100
-
-# Identities with an attached long-poll/SSE waiter, counted because one
-# identity can hold several (a phone and a desktop tab). api.py increments
-# around the wait; the watcher reads it to decide whether a client is
-# already going to render the message.
-_open_waiters: Counter[tuple[str, str]] = Counter()
-
-# Monotonic time each identity's last waiter closed.
-_waiters_closed_at: dict[tuple[str, str], float] = {}
-
-# An identity counts as attached for this long after its waiter closes.
-#
-# Poll mode returns as soon as anything is published in the namespace, so
-# the very message being notified about ends the poll that would have
-# suppressed it; the client re-polls immediately. Without a grace window
-# the check would only ever work for SSE clients.
-_WAITER_GRACE_SECONDS = 5.0
-
-
-@contextlib.contextmanager
-def open_waiter(ns: str, identity_id: str) -> Iterator[None]:
-    """Mark an identity as having an attached subscription waiter."""
-    key = (ns, identity_id)
-    _open_waiters[key] += 1
-    try:
-        yield
-    finally:
-        if _open_waiters[key] <= 1:
-            del _open_waiters[key]
-        else:
-            _open_waiters[key] -= 1
-        now = time.monotonic()
-        _waiters_closed_at[key] = now
-        horizon = now - _WAITER_GRACE_SECONDS
-        for stale in [k for k, ts in _waiters_closed_at.items() if ts < horizon]:
-            del _waiters_closed_at[stale]
-
-
-def has_open_waiter(ns: str, identity_id: str) -> bool:
-    """Is a client attached — now, or within the grace window?"""
-    key = (ns, identity_id)
-    if _open_waiters.get(key, 0) > 0:
-        return True
-    closed_at = _waiters_closed_at.get(key)
-    return closed_at is not None and (time.monotonic() - closed_at) < _WAITER_GRACE_SECONDS
 
 
 def is_caught_up(cursor: str | None, mid: str) -> bool:
@@ -383,11 +335,6 @@ class UnreadWatcher:
             return
         if is_caught_up(member.get("last_read_mid"), note.trigger_mid):
             instrument.sink.counter("push.suppressed.read")
-            return
-
-        if has_open_waiter(note.ns, note.identity_id):
-            # A client is attached and about to render this message itself.
-            instrument.sink.counter("push.suppressed.foreground")
             return
 
         if not await _read(db.get_push_enabled, note.ns, note.identity_id):
