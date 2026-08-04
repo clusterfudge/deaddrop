@@ -579,6 +579,8 @@ class TestReactionsNeverPush:
                 public_key="pub",
                 private_key="priv",
                 subject="mailto:ops@example.com",
+                delay_seconds=0.01,
+                activity_window_seconds=0.0,
                 debounce_seconds=0.05,
             ),
         )
@@ -638,6 +640,8 @@ class TestSubscribeDoesNotSuppressPush:
                 public_key="pub",
                 private_key="priv",
                 subject="mailto:ops@example.com",
+                delay_seconds=0.01,
+                activity_window_seconds=0.0,
                 debounce_seconds=0.05,
             ),
         )

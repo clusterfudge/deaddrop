@@ -1,14 +1,16 @@
 """Unread-message watcher — decides when a message becomes a push.
 
-The rule: a message notifies each recipient immediately, then holds that
-recipient's channel closed for a cooldown window. A notification goes out
-when the recipient has not read the message, they have push enabled, and
-they hold at least one Web Push subscription. An interactive client that
-renders the message marks it read, which drops the coalesced follow-up.
+The rule: a message is held for a short delay, then notifies each recipient
+who is neither caught up nor currently present, then holds that recipient's
+channel closed for a cooldown window. A notification goes out when the
+recipient has not read the message, has not been active recently, has push
+enabled, and holds at least one Web Push subscription.
 
 Read state is the only staleness signal. An open connection is not one: an
 identity routinely holds several idle browser tabs, and none of them imply
-the message was seen.
+the message was seen. Nor is a delivery over that connection: it would let
+one backgrounded tab silence every device the identity owns, while an
+identity reading on a laptop would still have its phone notified.
 
 Rooms and direct messages share the throttle, the preference gate and the
 payload shape, and differ only in where read state lives:
@@ -42,30 +44,56 @@ would make the room permanently unread and push on every message forever.
 The read paths in ``db.py`` already treat a non-v7 stored cursor as unset
 for *counting*; here the same value must mean *suppress*.
 
+Presence
+--------
+An identity is *present* when it has read or written something inside
+``activity_window_seconds``. Three signals mark it, all of them already
+arriving at this module's entry points:
+
+=================  ===============================================
+signal             entry point
+=================  ===============================================
+room read cursor   :meth:`UnreadWatcher.on_read_cursor`
+inbox marked read  :meth:`UnreadWatcher.on_inbox_read` (non-empty)
+sent a message     ``on_room_message`` / ``on_direct_message``
+=================  ===============================================
+
+Each is a write the identity caused by consuming or producing content, so
+none of them fires for a client that merely holds a connection or polls an
+empty inbox. A present identity is not notified at all: it is looking at
+the app on some device, and the device that would ring is usually not that
+one.
+
 Throttle
 --------
-Leading edge plus a coalesced trailing edge, per (conversation, identity),
-where a conversation is a room or a DM peer:
+Delayed leading edge plus a coalesced trailing edge, per (conversation,
+identity), where a conversation is a room or a DM peer:
 
-* the first message delivers straight away and opens a
-  ``debounce_seconds`` window,
-* every message arriving inside that window folds into one follow-up push
-  delivered when the window expires, which opens the next window,
+* the first message is staged and delivered ``delay_seconds`` later, so a
+  client that reads it inside the delay cancels the push outright,
+* delivering opens a ``debounce_seconds`` window; every message arriving
+  inside it folds into one follow-up push delivered when it expires,
+  which opens the next window,
 * a window that ends quiet sends nothing and closes the throttle, so the
-  next message is again immediate.
+  next message is again delayed-then-delivered.
 
-A chatty room therefore notifies at most once per window, and the reader
-hears about the first message the moment it lands.
+A chatty room therefore notifies at most once per window, and a reader who
+is away hears about the first message a few seconds after it lands.
 
 Suppression
 -----------
-Two independent reasons not to send, checked at each delivery:
+Three independent reasons not to send, checked at each delivery:
 
 * the recipient has read the trigger message (or it is gone),
+* the recipient has been active inside the presence window,
 * the identity has turned push off (``push_prefs``).
 
-The windows and the coalesced state are in-process. A restart loses
-whatever follow-up was pending; the next message delivers immediately.
+The first two can flip on the next message, so neither opens a cooldown:
+suppressing closes the window and the next message is judged afresh.
+
+The windows, the coalesced state and the presence map are in-process. A
+restart loses whatever push was pending — a few notifications, in exchange
+for no scheduler state to persist — and the next message starts over.
 """
 
 from __future__ import annotations
@@ -74,6 +102,7 @@ import asyncio
 import functools
 import logging
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -181,6 +210,7 @@ class UnreadWatcher:
         self._config = config
         self._pending: dict[tuple[str, str], _Notification] = {}
         self._cooldown: dict[tuple[str, str], asyncio.Task] = {}
+        self._active: dict[str, float] = {}
         self._tasks: set[asyncio.Task] = set()
 
     @property
@@ -194,7 +224,7 @@ class UnreadWatcher:
 
     @property
     def pending_keys(self) -> set[tuple[str, str]]:
-        """Keys holding a coalesced follow-up. For tests and diagnostics."""
+        """Keys holding an undelivered notification. For tests and diagnostics."""
         return set(self._pending)
 
     @property
@@ -222,6 +252,7 @@ class UnreadWatcher:
         cfg = self.config
         if not cfg.configured:
             return None
+        self.mark_active(sender_id)
         if message.get("content_type") == "reaction":
             return None
 
@@ -240,6 +271,7 @@ class UnreadWatcher:
         cfg = self.config
         if not cfg.configured:
             return None
+        self.mark_active(sender_id)
         if message.get("content_type") == "reaction":
             return None
 
@@ -248,13 +280,17 @@ class UnreadWatcher:
         return task
 
     def on_read_cursor(self, room_id: str, identity_id: str, cursor: str | None) -> bool:
-        """Drop a coalesced follow-up when its reader has caught up.
+        """Drop an undelivered notification when its reader has caught up.
 
-        The cooldown window itself keeps running: the reader has already
-        been notified once, so the next message still respects the hold.
+        Also marks the reader present: advancing a cursor is the strongest
+        activity signal there is.
 
-        Returns True if a follow-up was dropped.
+        The cooldown window itself keeps running: if a push already went out
+        the next message still respects the hold.
+
+        Returns True if a notification was dropped.
         """
+        self.mark_active(identity_id)
         key = (f"room:{room_id}", identity_id)
         held = self._pending.get(key)
         if held is None:
@@ -266,17 +302,21 @@ class UnreadWatcher:
         return True
 
     def on_inbox_read(self, identity_id: str, mids: Iterable[str]) -> int:
-        """Drop coalesced DM follow-ups whose trigger message was just read.
+        """Drop undelivered DM notifications whose trigger was just read.
 
         A DM has no cursor to compare against: the inbox fetch marks the
         rows it returns, so the mids it marked are what cancels. The
         cooldown window keeps running, as it does for a room.
 
-        Returns the number of follow-ups dropped.
+        A fetch that marked nothing is not an activity signal — a polling
+        background tab must not be able to silence push.
+
+        Returns the number of notifications dropped.
         """
         read = set(mids)
         if not read:
             return 0
+        self.mark_active(identity_id)
         dropped = 0
         for key, held in list(self._pending.items()):
             if key[1] != identity_id or held.kind != "dm":
@@ -288,9 +328,23 @@ class UnreadWatcher:
             dropped += 1
         return dropped
 
+    def mark_active(self, identity_id: str) -> None:
+        """Record that ``identity_id`` just read or wrote something.
+
+        Expired entries are dropped on the way through, which bounds the map
+        to the identities seen inside one presence window.
+        """
+        now = time.monotonic()
+        horizon = now - self.config.activity_window_seconds
+        for other, seen in list(self._active.items()):
+            if seen < horizon:
+                del self._active[other]
+        self._active[identity_id] = now
+
     async def shutdown(self) -> None:
         """Cancel every in-flight window and fan-out."""
         self._pending.clear()
+        self._active.clear()
         for task in list(self._cooldown.values()):
             task.cancel()
         self._cooldown.clear()
@@ -390,41 +444,56 @@ class UnreadWatcher:
         )
 
     def _notify(self, notification: _Notification, cfg: push.PushConfig) -> None:
-        key = notification.key
-        if key not in self._cooldown:
-            task = asyncio.create_task(self._send_then_hold(key, notification, cfg))
-            self._cooldown[key] = task
-            self._track(task)
-            return
+        """Stage a notification, opening a window if the key doesn't hold one.
 
-        # Inside the window: fold into the single follow-up sent when it
-        # expires, describing the newest message and how many it covers.
+        Staging always goes through ``_pending``, including the leading edge,
+        so the cancellation hooks reach a notification that is still waiting
+        out its delay as readily as one waiting out a cooldown.
+        """
+        key = notification.key
         held = self._pending.get(key)
         if held is not None:
+            # Fold into the single push for this key, describing the newest
+            # message and how many it covers.
             notification.count = held.count + 1
         self._pending[key] = notification
-        instrument.sink.counter("push.throttled")
 
-    async def _send_then_hold(
-        self, key: tuple[str, str], notification: _Notification, cfg: push.PushConfig
-    ) -> None:
-        """Deliver now, then keep the window open while messages coalesce."""
+        if key not in self._cooldown:
+            task = asyncio.create_task(self._send_then_hold(key, cfg))
+            self._cooldown[key] = task
+            self._track(task)
+        else:
+            instrument.sink.counter("push.throttled")
+
+    async def _send_then_hold(self, key: tuple[str, str], cfg: push.PushConfig) -> None:
+        """Wait out the delay, deliver, then hold the window while it coalesces.
+
+        The staged notification is popped after the delay rather than before,
+        so a read that lands inside the delay leaves nothing to send. A
+        delivery that answers False closes the window instead of holding it.
+        """
         try:
-            await self._deliver(notification, cfg)
+            await asyncio.sleep(cfg.delay_seconds)
             while True:
-                await asyncio.sleep(cfg.debounce_seconds)
                 held = self._pending.pop(key, None)
                 if held is None:
                     return
-                await self._deliver(held, cfg)
+                if not await self._deliver(held, cfg):
+                    return
+                await asyncio.sleep(cfg.debounce_seconds)
         finally:
             if self._cooldown.get(key) is asyncio.current_task():
                 del self._cooldown[key]
             self._pending.pop(key, None)
 
-    async def _deliver(self, notification: _Notification, cfg: push.PushConfig) -> None:
+    async def _deliver(self, notification: _Notification, cfg: push.PushConfig) -> bool:
+        """Fire one notification, reporting whether the window should hold.
+
+        A raised delivery answers False: the next message re-evaluates rather
+        than being held by a window nothing was ever sent in.
+        """
         try:
-            await self._fire(notification, cfg)
+            return await self._fire(notification, cfg)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -434,6 +503,7 @@ class UnreadWatcher:
                 notification.identity_id,
                 exc_info=True,
             )
+            return False
 
     async def _already_read(self, note: _Notification) -> bool:
         """Has the recipient seen the trigger message, or can't we tell?
@@ -450,18 +520,38 @@ class UnreadWatcher:
             return True
         return is_caught_up(member.get("last_read_mid"), note.trigger_mid)
 
-    async def _fire(self, note: _Notification, cfg: push.PushConfig) -> None:
+    def _is_present(self, identity_id: str, cfg: push.PushConfig) -> bool:
+        """Has ``identity_id`` read or written inside the presence window?"""
+        window = cfg.activity_window_seconds
+        if window <= 0:
+            return False
+        seen = self._active.get(identity_id)
+        return seen is not None and (time.monotonic() - seen) < window
+
+    async def _fire(self, note: _Notification, cfg: push.PushConfig) -> bool:
+        """Deliver one notification, reporting whether to open a cooldown.
+
+        False for the two states that can flip on the next message — caught
+        up, and present — so the next one is judged afresh. Every other
+        outcome (delivered, no subscription, push turned off) answers True:
+        that answer will not change inside the window, and holding it saves
+        the re-check.
+        """
         if await self._already_read(note):
             instrument.sink.counter("push.suppressed.read")
-            return
+            return False
+
+        if self._is_present(note.identity_id, cfg):
+            instrument.sink.counter("push.suppressed.present")
+            return False
 
         if not await _read(db.get_push_enabled, note.ns, note.identity_id):
             instrument.sink.counter("push.suppressed.disabled")
-            return
+            return True
 
         subscriptions = await _read(db.list_push_subscriptions, note.ns, note.identity_id)
         if not subscriptions:
-            return
+            return True
 
         slug = await self._namespace_slug(note.ns)
         badge = await self._badge(note.ns, note.identity_id)
@@ -492,6 +582,7 @@ class UnreadWatcher:
 
         if delivered:
             instrument.sink.counter("push.sent", delivered)
+        return True
 
     def _body(self, note: _Notification) -> str:
         if note.count > 1:
