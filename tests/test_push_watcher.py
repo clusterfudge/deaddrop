@@ -2,7 +2,8 @@
 
 These run against the real in-memory DB (rooms, members, cursors,
 subscriptions) with only the push *sender* stubbed — there is no push
-service to talk to. Timers are configured in tens of milliseconds.
+service to talk to. Cooldown windows are configured in tens of
+milliseconds.
 """
 
 import asyncio
@@ -186,51 +187,58 @@ class TestWatcherSuppresses:
 
         assert sender.sent == []
 
-    async def test_cursor_advance_cancels_the_pending_push(self, room):
+    async def test_cursor_advance_cancels_the_follow_up(self, room):
         _subscribe(room, room["bob"])
         sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.3))
-        message = _send(room, room["alice"])
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+        first = _send(room, room["alice"], "first")
+        second = _send(room, room["alice"], "second")
 
-        await watcher.on_room_message(room["ns"], room["room_id"], message, room["alice"])
+        await watcher.on_room_message(room["ns"], room["room_id"], first, room["alice"])
+        await asyncio.sleep(0.1)
+        await watcher.on_room_message(room["ns"], room["room_id"], second, room["alice"])
         assert (room["room_id"], room["bob"]) in watcher.pending_keys
 
-        cancelled = watcher.on_read_cursor(room["room_id"], room["bob"], message["mid"])
-        await asyncio.sleep(0.5)
+        cancelled = watcher.on_read_cursor(room["room_id"], room["bob"], second["mid"])
+        await asyncio.sleep(0.7)
 
         assert cancelled is True
-        assert sender.sent == []
+        assert len(sender.sent) == 1  # the leading push only
         assert watcher.pending_keys == set()
 
-    async def test_stale_cursor_does_not_cancel(self, room):
+    async def test_stale_cursor_does_not_cancel_the_follow_up(self, room):
         _subscribe(room, room["bob"])
         sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.2))
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
         older = _send(room, room["alice"], "first")
         newer = _send(room, room["alice"], "second")
 
         await watcher.on_room_message(room["ns"], room["room_id"], older, room["alice"])
-        # Bob read the first message but not the second.
-        assert watcher.on_read_cursor(room["room_id"], room["bob"], older["mid"]) is True
-
-        await watcher.on_room_message(room["ns"], room["room_id"], newer, room["alice"])
-        db.update_room_read_cursor(room["room_id"], room["bob"], older["mid"])
-        await asyncio.sleep(0.4)
-
+        await asyncio.sleep(0.1)
         assert len(sender.sent) == 1
+        await watcher.on_room_message(room["ns"], room["room_id"], newer, room["alice"])
+        # Bob read the first message but not the second.
+        assert watcher.on_read_cursor(room["room_id"], room["bob"], older["mid"]) is False
+        db.update_room_read_cursor(room["room_id"], room["bob"], older["mid"])
+        await asyncio.sleep(0.7)
+
+        assert len(sender.sent) == 2
 
     async def test_cursor_written_to_the_db_suppresses_at_fire_time(self, room):
         """The DB re-check catches a read that happened without on_read_cursor."""
         _subscribe(room, room["bob"])
         sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.2))
-        message = _send(room, room["alice"])
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+        first = _send(room, room["alice"], "one")
+        second = _send(room, room["alice"], "two")
 
-        await watcher.on_room_message(room["ns"], room["room_id"], message, room["alice"])
-        db.update_room_read_cursor(room["room_id"], room["bob"], message["mid"])
-        await asyncio.sleep(0.4)
+        await watcher.on_room_message(room["ns"], room["room_id"], first, room["alice"])
+        await asyncio.sleep(0.1)
+        await watcher.on_room_message(room["ns"], room["room_id"], second, room["alice"])
+        db.update_room_read_cursor(room["room_id"], room["bob"], second["mid"])
+        await asyncio.sleep(0.7)
 
-        assert sender.sent == []
+        assert len(sender.sent) == 1  # the leading push only
 
     async def test_invalid_stored_cursor_is_treated_as_caught_up(self, room):
         """A poisoned v4 cursor must silence push, not spam it."""
@@ -289,20 +297,141 @@ class TestWatcherSuppresses:
 
 
 @pytest.mark.asyncio
-class TestDebounce:
-    async def test_a_burst_produces_one_push(self, room):
+class TestThrottle:
+    """Leading edge, then a cooldown that coalesces whatever arrives in it."""
+
+    async def test_first_message_pushes_immediately(self, room):
         _subscribe(room, room["bob"])
         sender = RecordingSender()
-        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.2))
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=5.0))
 
-        for i in range(5):
-            await watcher.on_room_message(
-                room["ns"], room["room_id"], _send(room, room["alice"], f"msg {i}"), room["alice"]
-            )
-        await asyncio.sleep(0.5)
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "PR is green"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
 
         assert len(sender.sent) == 1
-        assert sender.sent[0][1]["notification"]["body"] == "msg 4 (+4 more)"
+        assert sender.sent[0][1]["notification"]["body"] == "PR is green"
+
+    async def test_cooldown_suppresses_an_immediate_second_push(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=5.0))
+
+        # Written up front: a send on this thread races the watcher's reads.
+        messages = [_send(room, room["alice"], body) for body in ("one", "two")]
+
+        for message in messages:
+            await watcher.on_room_message(room["ns"], room["room_id"], message, room["alice"])
+        await asyncio.sleep(0.1)
+
+        assert len(sender.sent) == 1
+        assert (room["room_id"], room["bob"]) in watcher.pending_keys
+
+    async def test_burst_lands_as_one_follow_up_when_the_window_expires(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+
+        messages = [_send(room, room["alice"], f"msg {i}") for i in range(5)]
+
+        for message in messages:
+            await watcher.on_room_message(room["ns"], room["room_id"], message, room["alice"])
+        await asyncio.sleep(0.1)
+        assert len(sender.sent) == 1
+        assert sender.sent[0][1]["notification"]["body"] == "msg 0"
+
+        await asyncio.sleep(0.7)
+
+        assert len(sender.sent) == 2
+        assert sender.sent[1][1]["notification"]["body"] == "msg 4 (+3 more)"
+
+    async def test_quiet_window_sends_no_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.1))
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
+        )
+        await asyncio.sleep(0.7)
+
+        assert len(sender.sent) == 1
+        assert watcher.pending_keys == set()
+        assert watcher.cooldown_keys == set()
+
+    async def test_the_follow_up_opens_a_fresh_window(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+
+        first, second, third = (_send(room, room["alice"], b) for b in ("one", "two", "three"))
+
+        await watcher.on_room_message(room["ns"], room["room_id"], first, room["alice"])
+        await watcher.on_room_message(room["ns"], room["room_id"], second, room["alice"])
+        await asyncio.sleep(0.7)
+        assert len(sender.sent) == 2  # leading + follow-up
+
+        await watcher.on_room_message(room["ns"], room["room_id"], third, room["alice"])
+        await asyncio.sleep(0.1)
+
+        assert len(sender.sent) == 2  # still held by the follow-up's window
+
+    async def test_the_cooldown_is_per_identity(self, room):
+        carol = db.create_identity(room["ns"], metadata={"display_name": "Carol"})
+        _subscribe(room, room["bob"], "https://push.example.com/sub/bob")
+        _subscribe(room, carol["id"], "https://push.example.com/sub/carol")
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=5.0))
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "one"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+        db.add_room_member(room["room_id"], carol["id"])
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "two"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+
+        # Bob's window holds his second message; Carol's first is unthrottled.
+        assert [s["identity_id"] for s, _ in sender.sent] == [room["bob"], carol["id"]]
+
+    async def test_suppression_still_applies_to_the_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "one"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+        db.set_push_enabled(room["ns"], room["bob"], False)
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "two"), room["alice"]
+        )
+        await asyncio.sleep(0.7)
+
+        assert len(sender.sent) == 1
+
+    async def test_open_waiter_suppresses_the_follow_up(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.5))
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "one"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+        assert len(sender.sent) == 1
+
+        with notifier.open_waiter(room["ns"], room["bob"]):
+            await watcher.on_room_message(
+                room["ns"], room["room_id"], _send(room, room["alice"], "two"), room["alice"]
+            )
+            await asyncio.sleep(0.7)
+
+        assert len(sender.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -321,20 +450,25 @@ class TestPruning:
 
 @pytest.mark.asyncio
 class TestShutdown:
-    async def test_shutdown_cancels_pending_timers(self, room):
+    async def test_shutdown_drops_the_pending_follow_up(self, room):
         _subscribe(room, room["bob"])
         sender = RecordingSender()
         watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=5.0))
 
         await watcher.on_room_message(
-            room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
+            room["ns"], room["room_id"], _send(room, room["alice"], "one"), room["alice"]
+        )
+        await asyncio.sleep(0.05)
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "two"), room["alice"]
         )
         assert watcher.pending_keys
 
         await watcher.shutdown()
 
         assert watcher.pending_keys == set()
-        assert sender.sent == []
+        assert watcher.cooldown_keys == set()
+        assert len(sender.sent) == 1
 
 
 class TestBodyCap:

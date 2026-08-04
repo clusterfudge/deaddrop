@@ -314,10 +314,10 @@ class TestTestPushRoute:
 
 
 class TestRoomMessageHook:
-    def test_sending_a_message_arms_the_watcher(
+    def test_sending_a_message_notifies_immediately(
         self, live_client, identities, configured, stub_sender
     ):
-        """The send path schedules a notification instead of firing one."""
+        """The send path delivers on the leading edge and opens the window."""
         ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
         alice_headers = {"X-Inbox-Secret": alice["secret"]}
         watcher = notifier.get_watcher()
@@ -343,9 +343,9 @@ class TestRoomMessageHook:
         )
 
         assert response.status_code == 200
-        assert _wait_until(lambda: (room["room_id"], bob["id"]) in watcher.pending_keys)
-        # The unread window has not elapsed, so nothing has been delivered.
-        assert stub_sender.calls == []
+        assert _wait_until(lambda: len(stub_sender.calls) == 1)
+        # The window is open, so a second message would be held.
+        assert (room["room_id"], bob["id"]) in watcher.cooldown_keys
 
     def test_send_succeeds_when_push_is_disabled(
         self, live_client, identities, disabled, stub_sender
@@ -364,7 +364,9 @@ class TestRoomMessageHook:
 
 
 class TestReadCursorHook:
-    def test_advancing_the_cursor_disarms_a_pending_push(self, live_client, identities, configured):
+    def test_advancing_the_cursor_drops_the_coalesced_push(
+        self, live_client, identities, configured
+    ):
         ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
         alice_headers = {"X-Inbox-Secret": alice["secret"]}
         bob_headers = {"X-Inbox-Secret": bob["secret"]}
@@ -385,10 +387,19 @@ class TestReadCursorHook:
                 f"/{ns}/push/subscriptions", headers=bob_headers, json=_subscribe_body()
             )
 
-            message = live_client.post(
+            live_client.post(
                 f"/{ns}/rooms/{room['room_id']}/messages",
                 headers=alice_headers,
                 json={"body": "PR is green"},
+            )
+            assert _wait_until(lambda: len(sender.calls) == 1)
+
+            # The second message lands inside the window, so it is held for
+            # the follow-up push the read cursor is about to cancel.
+            message = live_client.post(
+                f"/{ns}/rooms/{room['room_id']}/messages",
+                headers=alice_headers,
+                json={"body": "and merged"},
             ).json()
             assert _wait_until(lambda: (room["room_id"], bob["id"]) in watcher.pending_keys)
 
@@ -400,7 +411,7 @@ class TestReadCursorHook:
 
             assert read.status_code == 200
             assert watcher.pending_keys == set()
-            assert sender.calls == []
+            assert len(sender.calls) == 1
         finally:
             notifier.set_watcher(None)
 
@@ -539,7 +550,9 @@ class TestSubscribeRouteRegistersAWaiter:
                     headers=alice_headers,
                     json={"body": "PR is green"},
                 )
-                assert _wait_until(lambda: (room["room_id"], bob["id"]) not in watcher.pending_keys)
+                assert _wait_until(
+                    lambda: (room["room_id"], bob["id"]) not in watcher.cooldown_keys
+                )
 
             assert stub_sender.calls == []
         finally:
