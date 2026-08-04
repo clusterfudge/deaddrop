@@ -4320,6 +4320,26 @@ def set_push_enabled(
     return bool(enabled)
 
 
+BADGE_UNREAD_SQL = """SELECT
+     (SELECT COUNT(*)
+        FROM room_members m
+        JOIN room_messages rm ON rm.room_id = m.room_id
+       WHERE m.ns = ? AND m.identity_id = ?
+         AND rm.mid > CASE
+             WHEN m.last_read_mid IS NULL OR m.last_read_mid = '' THEN ''
+             WHEN length(m.last_read_mid) >= 15
+                  AND substr(m.last_read_mid, 15, 1) != '7' THEN ''
+             ELSE m.last_read_mid
+         END)
+     +
+     (SELECT COUNT(*)
+        FROM messages
+       WHERE ns = ? AND to_id = ?
+         AND read_at IS NULL
+         AND archived_at IS NULL
+         AND (expires_at IS NULL OR expires_at > ?))"""
+
+
 @timed_query("count_unread_for_identity")
 def count_unread_for_identity(
     ns: str,
@@ -4334,28 +4354,20 @@ def count_unread_for_identity(
     rather than N queries, including its treatment of a non-UUIDv7 cursor
     as unset; direct messages use ``read_at``, which the inbox fetch sets,
     and are filtered like :func:`get_messages` (live and unarchived).
+
+    The room half normalises the cursor to a floor value first, so the only
+    predicate on ``room_messages`` is a single ``mid >`` comparison. That
+    keeps the range seek on ``idx_room_messages_room_mid`` bounded to the
+    unread tail: an unset or uncomparable cursor becomes ``''``, which every
+    mid sorts above, and so still counts the whole room. Spelling the three
+    cursor states as OR branches instead degrades the seek to ``room_id = ?``
+    and reads every message in every room the identity belongs to on every
+    call.
     """
     conn = _get_conn(conn)
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
-        """SELECT
-             (SELECT COUNT(*)
-                FROM room_members m
-                JOIN room_messages rm ON rm.room_id = m.room_id
-               WHERE m.ns = ? AND m.identity_id = ?
-                 AND (
-                     m.last_read_mid IS NULL
-                     OR m.last_read_mid = ''
-                     OR (length(m.last_read_mid) >= 15 AND substr(m.last_read_mid, 15, 1) != '7')
-                     OR rm.mid > m.last_read_mid
-                 ))
-             +
-             (SELECT COUNT(*)
-                FROM messages
-               WHERE ns = ? AND to_id = ?
-                 AND read_at IS NULL
-                 AND archived_at IS NULL
-                 AND (expires_at IS NULL OR expires_at > ?))""",
+        BADGE_UNREAD_SQL,
         (ns, identity_id, ns, identity_id, now),
         name="count_unread_for_identity",
     )
