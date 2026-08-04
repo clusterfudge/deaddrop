@@ -1,11 +1,11 @@
 """Unread-message watcher — decides when a room message becomes a push.
 
-The rule: a room message arms a debounce timer per recipient. If that
-recipient's read cursor has not advanced past the message when the timer
-expires, they have push enabled, they are not holding an open long-poll
-waiter, and they hold at least one Web Push subscription, they get a
-notification. An interactive client that renders the message advances the
-cursor, which disarms the timer.
+The rule: a room message notifies each recipient immediately, then holds
+that recipient's channel closed for a cooldown window. A notification goes
+out when the recipient's read cursor is behind the message, they have push
+enabled, they are not holding an open long-poll waiter, and they hold at
+least one Web Push subscription. An interactive client that renders the
+message advances the cursor, which drops the coalesced follow-up.
 
 Cursor semantics
 ----------------
@@ -25,25 +25,32 @@ would make the room permanently unread and push on every message forever.
 The read paths in ``db.py`` already treat a non-v7 stored cursor as unset
 for *counting*; here the same value must mean *suppress*.
 
-Debounce
+Throttle
 --------
-The first unread message for a (room, identity) arms the timer; every
-message arriving before it expires is folded into the same notification
-and the deadline is *not* extended. A chatty room therefore notifies once,
-``debounce_seconds`` after the burst started — not once per message, and
-not never (which is what extending the deadline would produce).
+Leading edge plus a coalesced trailing edge, per (room, identity):
+
+* the first message delivers straight away and opens a
+  ``debounce_seconds`` window,
+* every message arriving inside that window folds into one follow-up push
+  delivered when the window expires, which opens the next window,
+* a window that ends quiet sends nothing and closes the throttle, so the
+  next message is again immediate.
+
+A chatty room therefore notifies at most once per window, and the reader
+hears about the first message the moment it lands.
 
 Suppression
 -----------
-Three independent reasons not to send, checked when the timer fires:
+Three independent reasons not to send, checked at each delivery:
 
 * the read cursor has advanced past the trigger message (or is unusable),
 * the identity has turned push off (``push_prefs``),
 * the identity has an attached long-poll/SSE waiter — a client is there
   and will render the message itself.
 
-The timers, the waiter registry, and the debounce state are all in-process.
-A restart loses whatever was pending; the next message re-arms.
+The windows, the waiter registry, and the coalesced state are all
+in-process. A restart loses whatever follow-up was pending; the next
+message delivers immediately.
 """
 
 from __future__ import annotations
@@ -55,7 +62,7 @@ import logging
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterator
 
 from . import db, instrument, push
@@ -158,8 +165,8 @@ async def _write(fn, *args):
 
 
 @dataclass
-class _Armed:
-    """A pending notification for one (room, identity)."""
+class _Notification:
+    """One push for a (room, identity), covering ``count`` messages."""
 
     ns: str
     room_id: str
@@ -169,7 +176,6 @@ class _Armed:
     sender_label: str
     preview: str
     count: int = 1
-    task: asyncio.Task | None = field(default=None, repr=False)
 
 
 class UnreadWatcher:
@@ -190,7 +196,8 @@ class UnreadWatcher:
         """
         self._sender = sender or push.send_web_push
         self._config = config
-        self._armed: dict[tuple[str, str], _Armed] = {}
+        self._pending: dict[tuple[str, str], _Notification] = {}
+        self._cooldown: dict[tuple[str, str], asyncio.Task] = {}
         self._tasks: set[asyncio.Task] = set()
 
     @property
@@ -204,8 +211,13 @@ class UnreadWatcher:
 
     @property
     def pending_keys(self) -> set[tuple[str, str]]:
-        """Keys with an armed timer. Exposed for tests and diagnostics."""
-        return set(self._armed)
+        """Keys holding a coalesced follow-up. For tests and diagnostics."""
+        return set(self._pending)
+
+    @property
+    def cooldown_keys(self) -> set[tuple[str, str]]:
+        """Keys inside a cooldown window. For tests and diagnostics."""
+        return set(self._cooldown)
 
     # -- entry points ----------------------------------------------------
 
@@ -217,7 +229,7 @@ class UnreadWatcher:
         sender_id: str,
         room_name: str | None = None,
     ) -> asyncio.Task | None:
-        """Arm notification timers for every recipient of a room message.
+        """Notify every recipient of a room message, subject to the throttle.
 
         Reactions are skipped: they carry no text and arrive in bursts.
 
@@ -235,28 +247,29 @@ class UnreadWatcher:
         return task
 
     def on_read_cursor(self, room_id: str, identity_id: str, cursor: str | None) -> bool:
-        """Disarm a pending notification when its reader has caught up.
+        """Drop a coalesced follow-up when its reader has caught up.
 
-        Returns True if a timer was cancelled.
+        The cooldown window itself keeps running: the reader has already
+        been notified once, so the next message still respects the hold.
+
+        Returns True if a follow-up was dropped.
         """
         key = (room_id, identity_id)
-        armed = self._armed.get(key)
-        if armed is None:
+        held = self._pending.get(key)
+        if held is None:
             return False
-        if not is_caught_up(cursor, armed.trigger_mid):
+        if not is_caught_up(cursor, held.trigger_mid):
             return False
-        self._armed.pop(key, None)
-        if armed.task is not None:
-            armed.task.cancel()
+        self._pending.pop(key, None)
         instrument.sink.counter("push.cancelled")
         return True
 
     async def shutdown(self) -> None:
-        """Cancel every in-flight timer and fan-out."""
-        for armed in list(self._armed.values()):
-            if armed.task is not None:
-                armed.task.cancel()
-        self._armed.clear()
+        """Cancel every in-flight window and fan-out."""
+        self._pending.clear()
+        for task in list(self._cooldown.values()):
+            task.cancel()
+        self._cooldown.clear()
         pending = [t for t in self._tasks if not t.done()]
         for task in pending:
             task.cancel()
@@ -305,8 +318,8 @@ class UnreadWatcher:
                 # Cursor is already past this message (or unusable) — the
                 # recipient is not behind, so nothing to notify about.
                 continue
-            self._arm(
-                _Armed(
+            self._notify(
+                _Notification(
                     ns=ns,
                     room_id=room_id,
                     identity_id=identity_id,
@@ -318,74 +331,80 @@ class UnreadWatcher:
                 cfg,
             )
 
-    def _arm(self, armed: _Armed, cfg: push.PushConfig) -> None:
-        key = (armed.room_id, armed.identity_id)
-        existing = self._armed.get(key)
-        if existing is not None:
-            # A timer is already counting down for this reader. Refresh the
-            # preview so the notification describes the newest message, but
-            # leave the deadline alone: a chatty room must still notify.
-            existing.count += 1
-            existing.preview = armed.preview
-            existing.sender_label = armed.sender_label
+    def _notify(self, notification: _Notification, cfg: push.PushConfig) -> None:
+        key = (notification.room_id, notification.identity_id)
+        if key not in self._cooldown:
+            task = asyncio.create_task(self._send_then_hold(key, notification, cfg))
+            self._cooldown[key] = task
+            self._track(task)
             return
 
-        self._armed[key] = armed
-        task = asyncio.create_task(self._wait_and_fire(key, cfg))
-        armed.task = task
-        self._track(task)
-        instrument.sink.counter("push.armed")
+        # Inside the window: fold into the single follow-up sent when it
+        # expires, describing the newest message and how many it covers.
+        held = self._pending.get(key)
+        if held is not None:
+            notification.count = held.count + 1
+        self._pending[key] = notification
+        instrument.sink.counter("push.throttled")
 
-    async def _wait_and_fire(self, key: tuple[str, str], cfg: push.PushConfig) -> None:
+    async def _send_then_hold(
+        self, key: tuple[str, str], notification: _Notification, cfg: push.PushConfig
+    ) -> None:
+        """Deliver now, then keep the window open while messages coalesce."""
         try:
-            await asyncio.sleep(cfg.debounce_seconds)
-        except asyncio.CancelledError:
-            return
+            await self._deliver(notification, cfg)
+            while True:
+                await asyncio.sleep(cfg.debounce_seconds)
+                held = self._pending.pop(key, None)
+                if held is None:
+                    return
+                await self._deliver(held, cfg)
+        finally:
+            if self._cooldown.get(key) is asyncio.current_task():
+                del self._cooldown[key]
+            self._pending.pop(key, None)
 
-        armed = self._armed.pop(key, None)
-        if armed is None:
-            return
-
+    async def _deliver(self, notification: _Notification, cfg: push.PushConfig) -> None:
         try:
-            await self._fire(armed, cfg)
+            await self._fire(notification, cfg)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning(
                 "push delivery failed for room=%s identity=%s",
-                armed.room_id,
-                armed.identity_id,
+                notification.room_id,
+                notification.identity_id,
                 exc_info=True,
             )
 
-    async def _fire(self, armed: _Armed, cfg: push.PushConfig) -> None:
-        member = await _read(db.get_room_member_info, armed.room_id, armed.identity_id)
+    async def _fire(self, note: _Notification, cfg: push.PushConfig) -> None:
+        member = await _read(db.get_room_member_info, note.room_id, note.identity_id)
         if member is None:
             return
-        if is_caught_up(member.get("last_read_mid"), armed.trigger_mid):
+        if is_caught_up(member.get("last_read_mid"), note.trigger_mid):
             instrument.sink.counter("push.suppressed.read")
             return
 
-        if has_open_waiter(armed.ns, armed.identity_id):
+        if has_open_waiter(note.ns, note.identity_id):
             # A client is attached and about to render this message itself.
             instrument.sink.counter("push.suppressed.foreground")
             return
 
-        if not await _read(db.get_push_enabled, armed.ns, armed.identity_id):
+        if not await _read(db.get_push_enabled, note.ns, note.identity_id):
             instrument.sink.counter("push.suppressed.disabled")
             return
 
-        subscriptions = await _read(db.list_push_subscriptions, armed.ns, armed.identity_id)
+        subscriptions = await _read(db.list_push_subscriptions, note.ns, note.identity_id)
         if not subscriptions:
             return
 
-        slug = await self._room_slug(armed.ns)
-        badge = await self._badge(armed.ns, armed.identity_id)
+        slug = await self._room_slug(note.ns)
+        badge = await self._badge(note.ns, note.identity_id)
         payload = push.build_payload(
-            title=f"{armed.sender_label} in {armed.room_name}",
-            body=self._body(armed),
-            navigate=f"/app/{slug}/room/{armed.room_id}",
-            tag=f"room:{armed.room_id}",
+            title=f"{note.sender_label} in {note.room_name}",
+            body=self._body(note),
+            navigate=f"/app/{slug}/room/{note.room_id}",
+            tag=f"room:{note.room_id}",
             badge=badge,
         )
 
@@ -409,10 +428,10 @@ class UnreadWatcher:
         if delivered:
             instrument.sink.counter("push.sent", delivered)
 
-    def _body(self, armed: _Armed) -> str:
-        if armed.count > 1:
-            return f"{armed.preview} (+{armed.count - 1} more)"
-        return armed.preview
+    def _body(self, note: _Notification) -> str:
+        if note.count > 1:
+            return f"{note.preview} (+{note.count - 1} more)"
+        return note.preview
 
     async def _badge(self, ns: str, identity_id: str) -> int | None:
         """Unread total for the app icon, or None if it can't be computed.

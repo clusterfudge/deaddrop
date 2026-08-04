@@ -29,9 +29,9 @@ Configuration
     is absent or not a URL with ``403 BadJwtToken``.
 
 ``DEADROP_PUSH_DEBOUNCE_SECONDS``
-    Debounce window: the first unread message in a (room, identity) arms a
-    timer this long, and every message arriving before it expires is folded
-    into the same notification (default 120).
+    Cooldown window: a (room, identity) is notified immediately, then held
+    for this long, and every message arriving inside the window is folded
+    into one follow-up notification sent when it expires (default 120).
 
 ``DEADROP_PUSH_TTL_SECONDS``
     ``TTL`` header on the push request (default 3600).

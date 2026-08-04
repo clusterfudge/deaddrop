@@ -144,7 +144,7 @@ async def lifespan(app: FastAPI):
 
     push_cfg = push.load_config()
     if push_cfg.configured:
-        logger.info("Web Push enabled (debounce=%ss)", push_cfg.debounce_seconds)
+        logger.info("Web Push enabled (cooldown=%ss)", push_cfg.debounce_seconds)
     elif push_cfg.enabled:
         logger.warning(
             "DEADROP_PUSH_ENABLED is set but the VAPID keypair/subject is incomplete "

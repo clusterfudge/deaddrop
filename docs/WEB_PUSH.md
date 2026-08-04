@@ -13,13 +13,14 @@ The feature is **off by default**. Nothing below runs until
 
 ## When a push is sent
 
-A room message arms a **two-minute debounce timer** for each recipient.
-Messages arriving while the timer runs are folded into the same
-notification and do **not** extend the deadline, so a burst produces one
-push two minutes after the burst started. The body reads
-`latest message (+N more)`.
+A room message notifies each recipient **immediately**, then opens a
+**two-minute cooldown** for that recipient. Messages arriving inside the
+window are folded into a single follow-up push delivered when the window
+expires — its body reads `latest message (+N more)` — and that follow-up
+opens the next window. A window that ends quiet sends nothing and closes
+the throttle, so the next message is again immediate.
 
-When the timer expires the server re-reads that recipient's read cursor:
+Before each delivery the server re-reads that recipient's read cursor:
 
 | Cursor state | Result |
 |---|---|
@@ -32,7 +33,7 @@ The last row is deliberate. A non-v7 cursor cannot be ordered against a v7
 message id, so treating it as "never seen" would leave the room
 permanently unread and push on every message forever.
 
-Three further reasons not to send, checked when the timer fires:
+Three further reasons not to send, checked at each delivery:
 
 * **Foreground.** The identity has an open long-poll or SSE waiter on
   `/{ns}/subscribe` — a client is attached and will render the message
@@ -42,16 +43,16 @@ Three further reasons not to send, checked when the timer fires:
   `PUT /{ns}/push/prefs`.
 * **No devices.** The identity holds no subscriptions.
 
-A client that renders the message also advances its cursor, which cancels
-the timer outright.
+A client that renders the message also advances its cursor, which drops
+the coalesced follow-up.
 
 Reactions never notify, and a sender is never notified about its own
 message.
 
-The timers and the waiter registry are in-process (the deployment runs a
-single uvicorn worker). **A restart loses whatever debounce timers were
+The windows and the waiter registry are in-process (the deployment runs a
+single uvicorn worker). **A restart loses whatever follow-up was
 pending**; those messages stay unread and the next message in the room
-re-arms.
+notifies immediately.
 
 ---
 
@@ -98,7 +99,7 @@ ssh dokku@h1.dokku.heare.io config:set deaddrop \
 | `DEADROP_VAPID_PUBLIC_KEY` | — | base64url of the uncompressed P-256 point (65 bytes). |
 | `DEADROP_VAPID_PRIVATE_KEY` | — | base64url of the raw P-256 scalar (32 bytes). |
 | `DEADROP_VAPID_SUBJECT` | — | `mailto:` or `https://` URL. |
-| `DEADROP_PUSH_DEBOUNCE_SECONDS` | `120` | Debounce window — how long messages coalesce before one push goes out. |
+| `DEADROP_PUSH_DEBOUNCE_SECONDS` | `120` | Cooldown window — how long after a push messages coalesce before the next one goes out. |
 | `DEADROP_PUSH_TTL_SECONDS` | `3600` | `TTL` header — how long the push service may hold an undelivered message. |
 
 All three keys plus the subject must be present; with any one missing the
@@ -198,4 +199,4 @@ is the multi-namespace caveat the badge's one-integer shape forces.
 * **1:1 messages.** Only room messages notify. Direct messages track
   read state with `read_at` rather than a cursor and are not wired up.
 * **Per-room mute / quiet hours.** The switch is global per identity.
-* **Durable debounce.** Pending timers live in the worker process.
+* **Durable throttling.** Pending follow-ups live in the worker process.
