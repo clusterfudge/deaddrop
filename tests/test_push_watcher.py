@@ -619,6 +619,30 @@ class TestBadgeCount:
         stranger = db.create_identity(room["ns"], metadata={"display_name": "Nobody"})
         assert db.count_unread_for_identity(room["ns"], stranger["id"]) == 0
 
+    def test_room_half_seeks_the_unread_tail(self, room):
+        """The badge scans forward from the cursor, not over the whole room.
+
+        Without the range predicate the plan degrades to `room_id=?` and the
+        count reads every message in every room the identity is a member of,
+        which turns one badge refresh into a full scan.
+        """
+        message = _send(room, room["alice"], "hi")
+        db.update_room_read_cursor(room["room_id"], room["bob"], message["mid"])
+        db.count_unread_for_identity(room["ns"], room["bob"])
+
+        plan = (
+            db.get_connection()
+            .execute(
+                "EXPLAIN QUERY PLAN " + db.BADGE_UNREAD_SQL,
+                (room["ns"], room["bob"], room["ns"], room["bob"], "2026-01-01T00:00:00Z"),
+                name="test.badge_plan",
+            )
+            .fetchall()
+        )
+        detail = " ".join(str(row[3]) for row in plan)
+
+        assert "idx_room_messages_room_mid (room_id=? AND mid>?)" in detail
+
 
 class TestPushPrefs:
     def test_absent_row_means_enabled(self, room):
