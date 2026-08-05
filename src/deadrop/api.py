@@ -97,12 +97,6 @@ async def lifespan(app: FastAPI):
 
     db.init_db()
 
-    # Start the libsql health-ping background thread. No-op when the
-    # backend is local SQLite. For Turso, exercises idle connections
-    # every ~15s so stale TCP (NAT/LB culled) is detected pre-emptively
-    # instead of blowing up the first request after an idle window.
-    db.start_libsql_health_pinger()
-
     # Background monitor: resolves Turso hostname and TCP-probes each IP
     # every 15s. Surfaces the "DNS returns a dead IP" scenario (2026-05-08
     # incident) in metrics + WARNING logs BEFORE it cascades into 503s.
@@ -137,10 +131,14 @@ async def lifespan(app: FastAPI):
     # never surface to callers.
     asyncio.create_task(asyncio.to_thread(_post_deploy_annotation))
 
-    # Active libsql health-ping: probes every worker's thread-local
-    # connection every ~15s so that stale TCP to Turso is recycled before
-    # a user request hits it. Only matters for libsql; the loop itself
-    # no-ops for local SQLite.
+    # Active libsql health-ping: submits SELECT 1 into every read/write
+    # pool worker every ~15s. The ping has to run *on* the worker, because
+    # a libsql connection lives in that thread's thread-local and may only
+    # be used from there. Exercising the connection keeps the Hrana stream
+    # warm, so the cold-start cost (TCP + TLS + stream init, 0.4-1.5s
+    # measured) is not charged to the first request after an idle gap.
+    # No-ops for local SQLite.
+    health_ping_task = asyncio.create_task(db.health_ping_loop())
 
     push_cfg = push.load_config()
     if push_cfg.configured:
@@ -160,7 +158,7 @@ async def lifespan(app: FastAPI):
 
     # Stop background cache refresh
     stop_cache_warming()
-    db.stop_libsql_health_pinger()
+    health_ping_task.cancel()
     db.stop_turso_dns_monitor()
     db.close_db()
 

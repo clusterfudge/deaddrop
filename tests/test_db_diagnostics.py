@@ -31,7 +31,6 @@ class TestDbDebugState:
             "write_pool_threads",
             "read_pool_size",
             "write_pool_size",
-            "libsql_registry_size",
             "executor_replace_count_total",
             "last_executor_replace_at",
             "last_executor_replace_age_seconds",
@@ -55,10 +54,6 @@ class TestDbDebugState:
 
     def test_executor_thread_count_none_is_zero(self):
         assert db._executor_thread_count(None) == 0
-
-    def test_libsql_registry_size_reads_registry(self):
-        # Consistent with the live registry length, whatever it is.
-        assert db._libsql_registry_size() == len(db._libsql_conn_registry)
 
 
 class TestReplaceExecutorInstrumentation:
@@ -94,3 +89,66 @@ class TestDebugDbEndpoint:
         body = resp.json()
         assert "executor_replace_count_total" in body
         assert "backend" in body
+
+
+class TestHealthPing:
+    """The ping must run on the worker that owns the connection.
+
+    A libsql connection lives in its worker thread's thread-local and may
+    only be used from there, so the ping is submitted into the pool rather
+    than driven from a central registry.
+    """
+
+    def test_ping_worker_uses_the_calling_threads_connection(self):
+        import threading
+
+        class FakeConn:
+            def __init__(self):
+                self.pings = 0
+
+            def execute(self, sql, *args, **kwargs):
+                self.pings += 1
+
+            def close(self):
+                pass
+
+        conn = FakeConn()
+        results = {}
+
+        def worker():
+            db._local.libsql_conn = conn
+            try:
+                results["owner"] = db._ping_worker_connection()
+            finally:
+                db._local.libsql_conn = None
+
+        t = threading.Thread(target=worker, name="db-write-0")
+        t.start()
+        t.join()
+
+        assert results["owner"][1] is True
+        assert results["owner"][2] == "ok"
+        assert conn.pings == 1
+
+        # A thread that owns no connection reports no-conn and pings nothing.
+        assert db._ping_worker_connection()[2] == "no-conn"
+        assert conn.pings == 1
+
+    @pytest.mark.asyncio
+    async def test_loop_counts_each_sweep(self, monkeypatch):
+        import asyncio
+
+        monkeypatch.setattr(db, "is_using_libsql", lambda: True)
+        monkeypatch.setattr(db, "HEALTH_PING_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(
+            db, "_ping_all_workers_in_executor", lambda ex, size: [("db-read-0", True, "ok")]
+        )
+
+        before = db.get_db_debug_state()["health_check_runs_total"]
+        task = asyncio.create_task(db.health_ping_loop())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert db.get_db_debug_state()["health_check_runs_total"] > before

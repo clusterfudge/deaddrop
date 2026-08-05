@@ -88,9 +88,6 @@ LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
 # after ~5min of inactivity; without this, the first request after idle
 # hangs for the full TCP timeout, pile up workers, and Sean hits a 503
 # cascade).
-LIBSQL_HEALTH_PING_INTERVAL = 15.0  # seconds between ping sweeps
-LIBSQL_HEALTH_PING_TIMEOUT = 2.0  # seconds to wait for each ping
-
 # DNS/TCP reachability monitor — detects the scenario where Turso's NLB
 # returns an IP in DNS but that IP is TCP-dead. Observed 2026-05-08:
 # `3.212.35.170` was in DNS but refused connections on :443; half of new
@@ -99,33 +96,15 @@ LIBSQL_HEALTH_PING_TIMEOUT = 2.0  # seconds to wait for each ping
 # WARNING log BEFORE users see 503s.
 TURSO_DNS_MONITOR_INTERVAL = 15.0  # seconds between DNS/TCP sweeps
 TURSO_DNS_TCP_TIMEOUT = 3.0  # seconds per IP TCP-connect probe
+# Maximum age of a libsql connection before it is proactively recycled.
+#
 # Max-age recycle was set to 240s in PR #68. Observed post-deploy: every
 # ~4min, every pooled connection got force-recycled. Writes that landed
 # in the cold-start window paid 2-3s (TCP + TLS + Hrana stream init)
-# instead of the normal ~50ms. The active ping-every-15s already catches
-# broken connections; proactive rotation was solving a non-problem and
-# introducing a regular latency penalty.
-#
-# Set to None to disable proactive max-age recycling. Keep the setting
-# in place so we can re-enable with a saner value (e.g. 1800s / 30min)
-# if we discover a real silent-stale scenario the ping misses.
-LIBSQL_CONNECTION_MAX_AGE: float | None = None
-
-# Registry of live libsql connections for the background pinger.
-# (conn, thread_local_ref, created_at) tuples. We hold a WEAK reference to
-# the owning thread's _local so that a dead thread's entry can be GC'd.
-_libsql_conn_registry: list = []
-_libsql_registry_lock = threading.Lock()
-
-# Maximum age of a libsql connection before it is proactively recycled.
-#
-# Idle TCP connections to Turso frequently get silently culled by
-# intermediaries (NAT tables, load balancers, firewalls) after a few
-# minutes, leaving the process with a half-open socket that only reveals
-# itself as stale after a multi-second send/recv timeout on the next
-# query. Proactively recycling on a short clock pre-empts that failure
-# mode — the sin of a few extra reconnects is cheap; a 134s user-facing
-# hang is not.
+# instead of the normal ~50ms. The ping-every-15s sweep already catches
+# broken connections, so nothing recycles on age today; the setting stays
+# so it can be re-enabled with a saner value if a silent-stale scenario
+# the ping misses turns up.
 MAX_CONNECTION_AGE_SECONDS = float(os.environ.get("DEADROP_MAX_LIBSQL_AGE", "300"))
 
 # How often the background health-ping fires against each worker.
@@ -182,12 +161,6 @@ def _executor_thread_count(executor) -> int:
     return sum(1 for t in threads if t.is_alive())
 
 
-def _libsql_registry_size() -> int:
-    """Number of live libsql connections tracked by the background pinger."""
-    with _libsql_registry_lock:
-        return len(_libsql_conn_registry)
-
-
 def get_db_debug_state() -> dict:
     """Return a diagnostics snapshot of the DB layer (issue #51).
 
@@ -213,7 +186,6 @@ def get_db_debug_state() -> dict:
         "write_pool_threads": _executor_thread_count(_write_executor),
         "read_pool_size": READ_POOL_SIZE,
         "write_pool_size": WRITE_POOL_SIZE,
-        "libsql_registry_size": _libsql_registry_size(),
         "executor_replace_count_total": replace_count,
         "last_executor_replace_at": (
             _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(last_replace_at))
@@ -510,7 +482,6 @@ async def health_ping_loop(stop_event=None) -> None:
                     metrics.incr("db.health_check.failures", len(failures))
                 metrics.gauge("db.executor.read_thread_count", _executor_thread_count(read_exec))
                 metrics.gauge("db.executor.write_thread_count", _executor_thread_count(write_exec))
-                metrics.gauge("db.connection.registry_size", _libsql_registry_size())
 
                 if failures:
                     log.warning(
@@ -551,133 +522,6 @@ def _reset_libsql_connection() -> None:
             pass  # Abandon the stale connection
         _local.libsql_conn = None
         _local.libsql_connected_at = 0.0
-
-
-def _register_libsql_conn(local_obj, conn, created_at: float) -> None:
-    """Register a freshly-created libsql connection with the pinger registry.
-
-    The background pinger sweeps the registry every
-    ``LIBSQL_HEALTH_PING_INTERVAL`` seconds and closes any connection that
-    fails a trivial SELECT 1 (or is past ``LIBSQL_CONNECTION_MAX_AGE``).
-    Closed connections leave the thread-local slot set to ``None`` so the
-    next request on that thread will create a fresh one.
-    """
-    with _libsql_registry_lock:
-        _libsql_conn_registry.append((local_obj, conn, created_at))
-
-
-def _libsql_health_ping_sweep() -> tuple[int, int]:
-    """Sweep all tracked libsql connections; close stale/expired ones.
-
-    Returns (ok_count, recycled_count). Exceptions are swallowed — the
-    pinger must not bring down the process.
-    """
-    import logging
-    import time as _time
-
-    now = _time.time()
-    with _libsql_registry_lock:
-        snapshot = list(_libsql_conn_registry)
-        _libsql_conn_registry.clear()
-
-    ok = 0
-    recycled = 0
-    survivors: list = []
-    for local_obj, conn, created_at in snapshot:
-        # If the thread-local has already swapped this connection out,
-        # drop the registry entry — it's stale state.
-        current = getattr(local_obj, "libsql_conn", None)
-        if current is not conn:
-            continue
-
-        age = now - created_at
-        if LIBSQL_CONNECTION_MAX_AGE is not None and age > LIBSQL_CONNECTION_MAX_AGE:
-            try:
-                _run_with_timeout(
-                    lambda c=conn: c.close(),
-                    timeout=LIBSQL_HEALTH_PING_TIMEOUT,
-                    description="proactive_close_old_conn",
-                )
-            except Exception:
-                pass
-            local_obj.libsql_conn = None
-            local_obj.libsql_connected_at = 0.0
-            recycled += 1
-            logging.info(
-                f"libsql health_ping: recycled age={age:.0f}s "
-                f"(> max {LIBSQL_CONNECTION_MAX_AGE:.0f}s)"
-            )
-            continue
-
-        try:
-            _run_with_timeout(
-                lambda c=conn: c.execute("SELECT 1"),
-                timeout=LIBSQL_HEALTH_PING_TIMEOUT,
-                description="health_ping_select1",
-            )
-            ok += 1
-            survivors.append((local_obj, conn, created_at))
-        except Exception as e:
-            try:
-                _run_with_timeout(
-                    lambda c=conn: c.close(),
-                    timeout=LIBSQL_HEALTH_PING_TIMEOUT,
-                    description="close_failed_ping_conn",
-                )
-            except Exception:
-                pass
-            local_obj.libsql_conn = None
-            local_obj.libsql_connected_at = 0.0
-            recycled += 1
-            logging.warning(f"libsql health_ping: recycled failed ping age={age:.0f}s: {e}")
-
-    # Re-add surviving entries
-    with _libsql_registry_lock:
-        _libsql_conn_registry.extend(survivors)
-
-    return ok, recycled
-
-
-_libsql_pinger_thread: threading.Thread | None = None
-_libsql_pinger_stop = threading.Event()
-
-
-def start_libsql_health_pinger() -> None:
-    """Start the background thread that sweeps libsql connections.
-
-    Idempotent. Only starts when libsql is in use. Call from FastAPI
-    lifespan on startup.
-    """
-    global _libsql_pinger_thread
-    if not is_using_libsql():
-        return
-    if _libsql_pinger_thread is not None and _libsql_pinger_thread.is_alive():
-        return
-
-    import logging
-
-    def _run() -> None:
-        logging.info(
-            f"libsql health pinger started (interval={LIBSQL_HEALTH_PING_INTERVAL}s, "
-            f"max_age={LIBSQL_CONNECTION_MAX_AGE}s)"
-        )
-        while not _libsql_pinger_stop.wait(LIBSQL_HEALTH_PING_INTERVAL):
-            try:
-                ok, recycled = _libsql_health_ping_sweep()
-                if recycled > 0:
-                    logging.info(f"libsql health_ping sweep: ok={ok} recycled={recycled}")
-            except Exception:
-                logging.exception("libsql health_ping sweep crashed")
-        logging.info("libsql health pinger stopping")
-
-    _libsql_pinger_stop.clear()
-    _libsql_pinger_thread = threading.Thread(target=_run, name="libsql-health-pinger", daemon=True)
-    _libsql_pinger_thread.start()
-
-
-def stop_libsql_health_pinger() -> None:
-    """Signal the health-ping thread to exit. Safe to call on shutdown."""
-    _libsql_pinger_stop.set()
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +623,7 @@ def start_turso_dns_monitor() -> None:
     """Start the background DNS/TCP reachability monitor.
 
     Idempotent. No-op when libsql is not in use. Call from FastAPI
-    lifespan startup alongside ``start_libsql_health_pinger``.
+    lifespan startup alongside ``health_ping_loop``.
     """
     global _turso_dns_monitor_thread
     if not is_using_libsql():
@@ -1016,9 +860,6 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
             metrics.incr("db.libsql_connect.count")
             metrics.gauge("db.libsql_connect.duration_ms", _connect_ms)
 
-            # Register with the background pinger so idle connections get
-            # exercised before Turso's LB / intermediate NATs cull them.
-            _register_libsql_conn(_local, _local.libsql_conn, _local.libsql_connected_at)
         except TimeoutError:
             logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
             raise RuntimeError(
