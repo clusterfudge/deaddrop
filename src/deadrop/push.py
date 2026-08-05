@@ -28,10 +28,19 @@ Configuration
     ``mailto:`` or ``https://`` URL. Apple rejects a JWT whose ``sub``
     is absent or not a URL with ``403 BadJwtToken``.
 
+``DEADROP_PUSH_DELAY_SECONDS``
+    How long a notification waits before it is delivered, giving a client
+    that is about to read the message a chance to cancel it (default 5).
+
+``DEADROP_PUSH_ACTIVITY_WINDOW_SECONDS``
+    An identity that has read or sent anything inside this window is
+    treated as present and is not notified at all (default 120). ``0``
+    disables presence suppression.
+
 ``DEADROP_PUSH_DEBOUNCE_SECONDS``
-    Cooldown window: a (room, identity) is notified immediately, then held
-    for this long, and every message arriving inside the window is folded
-    into one follow-up notification sent when it expires (default 120).
+    Cooldown window: once a (conversation, identity) has been notified the
+    channel is held for this long, and every message arriving inside the
+    window is folded into one follow-up sent when it expires (default 120).
 
 ``DEADROP_PUSH_TTL_SECONDS``
     ``TTL`` header on the push request (default 3600).
@@ -100,6 +109,8 @@ class PushConfig:
     public_key: str = ""
     private_key: str = ""
     subject: str = ""
+    delay_seconds: float = 5.0
+    activity_window_seconds: float = 120.0
     debounce_seconds: float = 120.0
     ttl_seconds: int = 3600
 
@@ -138,6 +149,8 @@ def load_config() -> PushConfig:
         public_key=os.environ.get("DEADROP_VAPID_PUBLIC_KEY", "").strip(),
         private_key=os.environ.get("DEADROP_VAPID_PRIVATE_KEY", "").strip(),
         subject=os.environ.get("DEADROP_VAPID_SUBJECT", "").strip(),
+        delay_seconds=_env_float("DEADROP_PUSH_DELAY_SECONDS", 5.0),
+        activity_window_seconds=_env_float("DEADROP_PUSH_ACTIVITY_WINDOW_SECONDS", 120.0),
         debounce_seconds=_env_float("DEADROP_PUSH_DEBOUNCE_SECONDS", 120.0),
         ttl_seconds=int(_env_float("DEADROP_PUSH_TTL_SECONDS", 3600.0)),
     )

@@ -13,14 +13,35 @@ The feature is **off by default**. Nothing below runs until
 
 ## When a push is sent
 
-A message — in a room or 1:1 — notifies each recipient **immediately**,
-then opens a **two-minute cooldown** for that recipient on that
-conversation. Messages arriving inside the window are folded into a single
-follow-up push delivered when the window expires — its body reads `latest
-message (+N more)` — and that follow-up opens the next window. A window
-that ends quiet sends nothing and closes the throttle, so the next message
-is again immediate. Rooms and 1:1 conversations throttle separately: a
+A message — in a room or 1:1 — is staged for each recipient and delivered
+**five seconds later**, which gives a client that is about to read it time
+to cancel the push outright. Delivering opens a **two-minute cooldown** for
+that recipient on that conversation. Messages arriving inside the delay or
+the window are folded into a single push — its body reads `latest message
+(+N more)` — and each delivery opens the next window. A window that ends
+quiet sends nothing and closes the throttle, so the next message is again
+delayed-then-delivered. Rooms and 1:1 conversations throttle separately: a
 busy room never silences a peer.
+
+A recipient who is **present** is not notified at all. Presence means the
+identity has read or written something inside the last two minutes:
+
+| Signal | Counts as presence |
+|---|---|
+| `POST /{ns}/rooms/{id}/read` (cursor advance) | yes |
+| `POST /{ns}/inbox/{id}/read`, or a fetch that marked rows | yes |
+| Sending a message or a reaction | yes |
+| Holding a `/{ns}/subscribe` connection | no |
+| A fetch that marked nothing | no |
+
+Every signal that counts is a write the identity caused by consuming or
+producing content. Connection state deliberately counts for nothing: it
+would let one backgrounded tab silence every device the identity owns,
+while an identity reading on a laptop would still have its phone rung.
+
+Neither *caught up* nor *present* opens a cooldown — both can flip on the
+next message, so suppressing closes the window and the next message is
+judged afresh.
 
 Before each delivery the server re-reads the recipient's read state. For a
 room that is the member's cursor:
@@ -65,7 +86,7 @@ Read state is the only staleness signal. An open connection on
 `/{ns}/subscribe` does not suppress anything — an identity routinely holds
 several idle browser tabs, and none of them imply the message was seen. A
 client that actually renders the message advances the cursor or marks the
-row read, and that drops the coalesced follow-up.
+row read, and that drops the staged push.
 
 Reactions never notify, and a sender is never notified about its own
 message. A reaction is dropped before the throttle sees it, so it neither
@@ -74,9 +95,10 @@ number is the exception: it comes from the same unread query the thread
 list uses, which counts reactions. Only room messages carry reactions —
 `reference_mid` exists on `room_messages` alone.
 
-The windows are in-process (the deployment runs a single uvicorn worker).
-**A restart loses whatever follow-up was pending**; those messages stay unread and the next message in the conversation
-notifies immediately.
+The windows and the presence map are in-process (the deployment runs a
+single uvicorn worker). **A restart loses whatever push was staged**; those
+messages stay unread, everyone reads as absent, and the next message in the
+conversation starts the cycle over.
 
 ---
 
@@ -123,6 +145,8 @@ ssh dokku@h1.dokku.heare.io config:set deaddrop \
 | `DEADROP_VAPID_PUBLIC_KEY` | — | base64url of the uncompressed P-256 point (65 bytes). |
 | `DEADROP_VAPID_PRIVATE_KEY` | — | base64url of the raw P-256 scalar (32 bytes). |
 | `DEADROP_VAPID_SUBJECT` | — | `mailto:` or `https://` URL. |
+| `DEADROP_PUSH_DELAY_SECONDS` | `5` | How long a push is held before delivery, so a client that reads the message can cancel it. |
+| `DEADROP_PUSH_ACTIVITY_WINDOW_SECONDS` | `120` | Presence window — an identity that read or wrote inside it is not notified. `0` disables presence suppression. |
 | `DEADROP_PUSH_DEBOUNCE_SECONDS` | `120` | Cooldown window — how long after a push messages coalesce before the next one goes out. |
 | `DEADROP_PUSH_TTL_SECONDS` | `3600` | `TTL` header — how long the push service may hold an undelivered message. |
 

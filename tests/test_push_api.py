@@ -58,12 +58,20 @@ def identities(client, admin_headers):
 
 @pytest.fixture
 def configured(monkeypatch):
-    """Enable push with a real generated keypair."""
+    """Enable push with a real generated keypair.
+
+    The delay drops to 10ms so a route's push lands inside ``_wait_until``,
+    and presence suppression is off so these cases exercise the route hooks
+    one mechanism at a time — the presence window has its own coverage in
+    ``test_push_watcher.py``.
+    """
     public, private = push.generate_vapid_keys()
     monkeypatch.setenv("DEADROP_PUSH_ENABLED", "1")
     monkeypatch.setenv("DEADROP_VAPID_PUBLIC_KEY", public)
     monkeypatch.setenv("DEADROP_VAPID_PRIVATE_KEY", private)
     monkeypatch.setenv("DEADROP_VAPID_SUBJECT", "mailto:ops@example.com")
+    monkeypatch.setenv("DEADROP_PUSH_DELAY_SECONDS", "0.01")
+    monkeypatch.setenv("DEADROP_PUSH_ACTIVITY_WINDOW_SECONDS", "0")
     return public
 
 
@@ -314,10 +322,10 @@ class TestTestPushRoute:
 
 
 class TestRoomMessageHook:
-    def test_sending_a_message_notifies_immediately(
+    def test_sending_a_message_notifies_the_recipient(
         self, live_client, identities, configured, stub_sender
     ):
-        """The send path delivers on the leading edge and opens the window."""
+        """The send path delivers the leading edge and opens the window."""
         ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
         alice_headers = {"X-Inbox-Secret": alice["secret"]}
         watcher = notifier.get_watcher()
@@ -419,7 +427,7 @@ class TestReadCursorHook:
 
 
 class TestDirectMessageHook:
-    def test_sending_a_dm_notifies_immediately(
+    def test_sending_a_dm_notifies_the_recipient(
         self, live_client, identities, configured, stub_sender
     ):
         ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
@@ -579,6 +587,8 @@ class TestReactionsNeverPush:
                 public_key="pub",
                 private_key="priv",
                 subject="mailto:ops@example.com",
+                delay_seconds=0.01,
+                activity_window_seconds=0.0,
                 debounce_seconds=0.05,
             ),
         )
@@ -638,6 +648,8 @@ class TestSubscribeDoesNotSuppressPush:
                 public_key="pub",
                 private_key="priv",
                 subject="mailto:ops@example.com",
+                delay_seconds=0.01,
+                activity_window_seconds=0.0,
                 debounce_seconds=0.05,
             ),
         )
