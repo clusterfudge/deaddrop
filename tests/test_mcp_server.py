@@ -1,6 +1,7 @@
 """Tests for the MCP server mounted at /mcp/{ns}/{secret}."""
 
 import json
+import re
 from contextlib import asynccontextmanager
 
 import mcp.types as types
@@ -96,6 +97,85 @@ def second_identity(room, admin_headers):
 
 
 @pytest.fixture
+def shared_room(room, second_identity):
+    """Bob joins Alice's room, so Alice has exactly one peer in it.
+
+    Bob keeps his own room, which Alice is not a member of.
+    """
+    with TestClient(deaddrop_app) as client:
+        response = client.post(
+            f"/{room['ns']}/rooms/{room['room_id']}/members",
+            headers={"X-Inbox-Secret": room["secret"]},
+            json={"identity_id": second_identity["identity_id"]},
+        )
+        assert response.status_code == 200, response.text
+    return room
+
+
+@pytest.fixture
+def group_room(shared_room, second_identity):
+    """Alice's room plus a third member, mirroring Sean + Fritz + Claude.
+
+    The returned ``caller`` is the third member: two peers, one room.
+    """
+    with TestClient(deaddrop_app) as client:
+        carol = client.post(
+            f"/{shared_room['ns']}/identities",
+            headers={"X-Namespace-Secret": shared_room["ns_secret"]},
+            json={"metadata": {"display_name": "Carol"}},
+        ).json()
+        response = client.post(
+            f"/{shared_room['ns']}/rooms/{shared_room['room_id']}/members",
+            headers={"X-Inbox-Secret": shared_room["secret"]},
+            json={"identity_id": carol["id"]},
+        )
+        assert response.status_code == 200, response.text
+    return {
+        "room_id": shared_room["room_id"],
+        "caller": {
+            "ns": shared_room["ns"],
+            "secret": carol["secret"],
+            "identity_id": carol["id"],
+        },
+    }
+
+
+@pytest.fixture
+def roomless(room):
+    """An identity in the same namespace that belongs to no room."""
+    with TestClient(deaddrop_app) as client:
+        identity = client.post(
+            f"/{room['ns']}/identities",
+            headers={"X-Namespace-Secret": room["ns_secret"]},
+            json={"metadata": {"display_name": "Roomless"}},
+        ).json()
+    return {
+        "ns": room["ns"],
+        "ns_secret": room["ns_secret"],
+        "secret": identity["secret"],
+        "identity_id": identity["id"],
+    }
+
+
+@pytest.fixture
+def foreign_room(admin_headers):
+    """A room in a different namespace, which no other namespace may observe."""
+    with TestClient(deaddrop_app) as client:
+        ns = client.post("/admin/namespaces", headers=admin_headers).json()
+        zoe = client.post(
+            f"/{ns['ns']}/identities",
+            headers={"X-Namespace-Secret": ns["secret"]},
+            json={"metadata": {"display_name": "Zoe"}},
+        ).json()
+        created = client.post(
+            f"/{ns['ns']}/rooms",
+            headers={"X-Inbox-Secret": zoe["secret"]},
+            json={"display_name": "Foreign Room"},
+        ).json()
+    return {"ns": ns["ns"], "room_id": created["room_id"]}
+
+
+@pytest.fixture
 def other_ns(admin_headers):
     """A second namespace, which the first namespace's secrets must not open."""
     with TestClient(deaddrop_app) as client:
@@ -118,6 +198,21 @@ def _rpc(client, path, method, params=None):
     response = client.post(path, headers=MCP_HEADERS, json=body, follow_redirects=False)
     assert response.status_code == 200, response.text
     return response.json()["result"]
+
+
+def _instructions(client, path) -> str:
+    """Complete a real initialize handshake and return its instructions field."""
+    result = _rpc(
+        client,
+        path,
+        "initialize",
+        {
+            "protocolVersion": types.LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "instructions-test", "version": "1.0"},
+        },
+    )
+    return result["instructions"]
 
 
 def _call_tool_raw(client, path, name, arguments=None):
@@ -426,3 +521,113 @@ class TestInstrumentation:
         }
         assert "bad_argument" in outcomes
         assert any(o.startswith("http_") for o in outcomes)
+
+
+class TestHandshakeInstructions:
+    """The initialize result describes the caller's own corner of the namespace."""
+
+    def test_instructions_name_the_identity_and_its_room(self, mcp_client, shared_room):
+        text = _instructions(mcp_client, identity_path(shared_room))
+        assert f"namespace `{shared_room['ns']}`" in text
+        assert "`Alice`" in text
+        assert "MCP Room" in text
+        assert shared_room["room_id"] in text
+        assert "Bob" in text
+
+    def test_instructions_carry_the_message_a_peer_hint(self, mcp_client, shared_room):
+        """The point of the feature: 'message Bob' resolves to a room_id."""
+        text = _instructions(mcp_client, identity_path(shared_room))
+        assert f"to message Bob: send_message with room_id=`{shared_room['room_id']}`" in text
+
+    def test_a_group_room_yields_a_hint_for_every_peer(self, mcp_client, group_room):
+        """The target shape: one room, two peers, a hint for each.
+
+        A per-peer hint only for two-member rooms would miss the Sean + Fritz +
+        Claude room entirely, which is the room this feature exists for.
+        """
+        text = _instructions(mcp_client, identity_path(group_room["caller"]))
+        room_id = group_room["room_id"]
+        assert f"to message Alice: send_message with room_id=`{room_id}`" in text
+        assert f"to message Bob: send_message with room_id=`{room_id}`" in text
+        assert "group room" in text
+
+    def test_instructions_keep_the_static_guidance(self, mcp_client, shared_room):
+        text = _instructions(mcp_client, identity_path(shared_room))
+        assert mcp_server.BASE_INSTRUCTIONS in text
+
+    def test_an_identity_with_no_rooms_gets_a_sane_minimal_string(self, mcp_client, roomless):
+        text = _instructions(mcp_client, identity_path(roomless))
+        assert mcp_server.BASE_INSTRUCTIONS in text
+        assert f"namespace `{roomless['ns']}`" in text
+        assert "`Roomless`" in text
+        assert "not a member of any deaddrop room" in text
+        # No roster block, and no id-shaped token: the only "room_id" mention is
+        # the static guidance's reference to the tool argument.
+        assert "You are a member of these rooms" not in text
+        assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-", text)
+
+    def test_instructions_never_carry_the_secret(self, mcp_client, shared_room):
+        text = _instructions(mcp_client, identity_path(shared_room))
+        assert shared_room["secret"] not in text
+        assert shared_room["ns_secret"] not in text
+
+    def test_instructions_omit_a_same_namespace_room_the_identity_is_not_in(
+        self, mcp_client, shared_room, second_identity
+    ):
+        """Membership scoping inside one namespace, not just across namespaces.
+
+        Bob owns a room Alice is not in. Neither its id, its name, nor its
+        member list may reach Alice's handshake.
+        """
+        text = _instructions(mcp_client, identity_path(shared_room))
+        assert second_identity["room_id"] not in text
+        assert "Bob Room" not in text
+
+    def test_instructions_omit_another_namespaces_rooms(
+        self, mcp_client, shared_room, foreign_room
+    ):
+        text = _instructions(mcp_client, identity_path(shared_room))
+        assert foreign_room["room_id"] not in text
+        assert "Foreign Room" not in text
+        assert "Zoe" not in text
+
+    def test_each_identity_gets_its_own_instructions(self, mcp_client, shared_room, roomless):
+        """Composed per handshake, so one connection's roster is not reused."""
+        assert "MCP Room" in _instructions(mcp_client, identity_path(shared_room))
+        assert "MCP Room" not in _instructions(mcp_client, identity_path(roomless))
+
+    def test_tool_descriptions_carry_no_room_or_member_data(self, mcp_client, shared_room):
+        """Only instructions are identity-scoped; the tool schema stays static."""
+        tools = _rpc(mcp_client, identity_path(shared_room), "tools/list")["tools"]
+        blob = json.dumps(tools)
+        assert shared_room["room_id"] not in blob
+        assert "MCP Room" not in blob
+        assert "Alice" not in blob
+        assert "Bob" not in blob
+
+    def test_a_composition_failure_falls_back_to_the_static_instructions(
+        self, mcp_client, shared_room, monkeypatch
+    ):
+        """A DB hiccup must degrade the description, not the connection."""
+
+        async def boom(actor):
+            raise RuntimeError("db is on fire")
+
+        monkeypatch.setattr(mcp_server, "compose_instructions", boom)
+        assert _instructions(mcp_client, identity_path(shared_room)) == (
+            mcp_server.BASE_INSTRUCTIONS
+        )
+
+
+class TestInstructionComposition:
+    """compose_instructions reads memberships only."""
+
+    def test_it_never_enumerates_the_namespace(self):
+        """No namespace-wide listing call appears in the composer."""
+        import inspect
+
+        source = inspect.getsource(mcp_server.compose_instructions)
+        assert "list_my_rooms" in source
+        assert "list_room_members" in source
+        assert "list_identities" not in source
+        assert "list_rooms(" not in source

@@ -14,6 +14,10 @@ an identity, not a config change.
 The tool handlers call the room route functions in :mod:`deadrop.api`
 directly, so membership checks, message dedup, and SSE fanout behave exactly
 as they do for an HTTP caller.
+
+The ``initialize`` result's ``instructions`` are composed per identity from that
+identity's own room memberships, so a client knows who it is connected as and
+which room_id reaches which peer before it calls a tool.
 """
 
 from __future__ import annotations
@@ -45,13 +49,29 @@ REDACTED_SEGMENT = "<redacted>"
 MAX_READ_LIMIT = 200
 DEFAULT_READ_LIMIT = 20
 
+# Ceiling on how many rooms the handshake instructions enumerate. The string is
+# prepended to a model's context for the whole session, so it is bounded the
+# same way read_room's reply is; list_rooms returns the full set on demand.
+MAX_INSTRUCTION_ROOMS = 25
+
+BASE_INSTRUCTIONS = (
+    "Read and post messages in deaddrop rooms. Resolve a room name to a "
+    "room_id with list_rooms before calling read_room or send_message."
+)
+
 
 @dataclass(frozen=True)
 class Actor:
-    """The identity a request's tool calls act as."""
+    """The identity a request's tool calls act as.
+
+    ``identity_id`` is what the auth gate resolved the secret to, carried here so
+    the handshake composer can name the caller and pick its peers out of a member
+    list without re-verifying the credential.
+    """
 
     ns: str
     secret: str
+    identity_id: str
 
 
 # Set by IdentityAuthASGI for the duration of one request. anyio copies the
@@ -231,6 +251,97 @@ def _require_str(args: dict[str, Any], key: str) -> str:
     return value
 
 
+# --- Handshake instructions --------------------------------------------
+
+
+def _display_name(metadata: dict[str, Any] | None, fallback: str) -> str:
+    name = (metadata or {}).get("display_name")
+    return name if isinstance(name, str) and name else fallback
+
+
+async def _own_display_name(actor: Actor) -> str:
+    from . import api, db
+
+    identity = await api._run_read(db.get_identity, actor.ns, actor.identity_id)
+    return _display_name(identity.get("metadata") if identity else None, actor.identity_id)
+
+
+async def compose_instructions(actor: Actor) -> str:
+    """Build the ``initialize`` instructions for one identity.
+
+    Every room named here comes from ``list_my_rooms``, which is a
+    ``room_members`` JOIN, and every member list comes from ``list_room_members``,
+    which rejects a non-member before reading one. A room the identity is not in
+    therefore cannot reach the returned string. The secret is never read here:
+    only ``actor.identity_id``, which the caller already knows, and display names.
+    """
+    from . import api
+
+    rooms = await api.list_my_rooms(actor.ns, x_inbox_secret=actor.secret)
+    me = await _own_display_name(actor)
+
+    blocks = [
+        BASE_INSTRUCTIONS,
+        f"You are connected to the deaddrop namespace `{actor.ns}` as `{me}`.",
+    ]
+
+    if not rooms:
+        blocks.append(
+            "You are not a member of any deaddrop room, so there is nothing to read "
+            "or post to yet. Ask whoever administers this namespace to add you to a "
+            "room, then call list_rooms again."
+        )
+        return "\n\n".join(blocks)
+
+    lines = []
+    # First room a peer is reachable in wins, so one peer yields one hint even
+    # when several rooms are shared.
+    peer_rooms: dict[str, str] = {}
+    any_group_room = False
+    for room in rooms[:MAX_INSTRUCTION_ROOMS]:
+        members = await api.list_room_members(actor.ns, room.room_id, x_inbox_secret=actor.secret)
+        peers = [
+            _display_name(m.metadata, m.identity_id)
+            for m in members
+            if m.identity_id != actor.identity_id
+        ]
+        name = room.display_name or "(unnamed room)"
+        with_whom = f"with {', '.join(peers)}" if peers else "no other members yet"
+        lines.append(f"- {name} — room_id `{room.room_id}` — {with_whom}")
+        any_group_room = any_group_room or len(peers) > 1
+        for peer in peers:
+            peer_rooms.setdefault(peer, room.room_id)
+
+    hidden = len(rooms) - len(lines)
+    if hidden > 0:
+        lines.append(f"- …and {hidden} more; call list_rooms for the full set.")
+
+    blocks.append(
+        "You are a member of these rooms, and only these — they are the only "
+        "rooms you can read or post to:\n" + "\n".join(lines)
+    )
+
+    if peer_rooms:
+        hints = "\n".join(
+            f"- to message {peer}: send_message with room_id=`{room_id}`"
+            for peer, room_id in peer_rooms.items()
+        )
+        hint_block = "To message a peer, use the room you share with them:\n" + hints
+        if any_group_room:
+            hint_block += (
+                "\nA room with more than one other member is a group room: every "
+                "member sees what you post there."
+            )
+        blocks.append(hint_block)
+    else:
+        blocks.append(
+            "To message someone, call send_message with the room_id of the room you "
+            "share with them."
+        )
+
+    return "\n\n".join(blocks)
+
+
 # --- Protocol handlers -------------------------------------------------
 
 
@@ -243,6 +354,26 @@ def build_server() -> Server:
 
     async def on_list_tools(ctx, params) -> types.ListToolsResult:
         return types.ListToolsResult(tools=_tools())
+
+    async def on_initialize_instructions(ctx, call_next):
+        """Replace the static ``instructions`` with the caller's own roster.
+
+        ``Server.middleware`` is the only seam the SDK offers here:
+        ``add_request_handler("initialize", ...)`` raises, and
+        ``create_initialization_options()`` is synchronous, so the constructor
+        attribute cannot await the DB. For ``initialize`` the rest of the chain
+        has already produced the wire dict, so the field is set on the result.
+        A composition failure degrades to the static string: the connection
+        still works, it is just less well described.
+        """
+        result = await call_next(ctx)
+        if ctx.method != "initialize" or not isinstance(result, dict):
+            return result
+        try:
+            result["instructions"] = await compose_instructions(_actor.get())
+        except Exception:
+            logger.exception("composing MCP handshake instructions failed")
+        return result
 
     async def on_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
         from fastapi import HTTPException
@@ -283,16 +414,15 @@ def build_server() -> Server:
             structured_content=payload,
         )
 
-    return Server(
+    server = Server(
         SERVER_NAME,
         title="deaddrop",
-        instructions=(
-            "Read and post messages in deaddrop rooms. Resolve a room name to a "
-            "room_id with list_rooms before calling read_room or send_message."
-        ),
+        instructions=BASE_INSTRUCTIONS,
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
     )
+    server.middleware.append(on_initialize_instructions)
+    return server
 
 
 def _error(message: str) -> types.CallToolResult:
@@ -352,12 +482,12 @@ class IdentityAuthASGI:
             return
 
         try:
-            await api._require_inbox_secret_any(ns, secret)
+            identity_id = await api._require_inbox_secret_any(ns, secret)
         except HTTPException:
             await _send_unauthorized(send)
             return
 
-        token = _actor.set(Actor(ns=ns, secret=secret))
+        token = _actor.set(Actor(ns=ns, secret=secret, identity_id=identity_id))
         try:
             await self._app(scope, receive, send)
         finally:
