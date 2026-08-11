@@ -49,7 +49,7 @@ DEDUP_WINDOW_SECONDS = 60
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -1324,6 +1324,110 @@ def _migrate_008_add_push_prefs(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_009_add_oauth(conn: sqlite3.Connection) -> None:
+    """Migration 009: Tables for the MCP OAuth authorization server.
+
+    ``oauth_clients`` holds Dynamic Client Registration results. claude.ai
+    registers a fresh client on every connection attempt, so rows accumulate
+    and nothing here assumes one row per client program.
+
+    ``oauth_grants`` is the identity binding: one row per consent, naming the
+    ``(ns, identity_id)`` an issued token acts as. ``inbox_secret_enc`` is that
+    identity's inbox secret sealed with AES-256-GCM under
+    ``DEADROP_MCP_OAUTH_KEY``, with the grant id as additional authenticated
+    data, so a row cannot be replayed under a different grant.
+
+    ``oauth_tokens`` carries only a SHA-256 hash of the credential, keyed on
+    that hash — the shape ``identities.secret_hash`` already uses. Access and
+    refresh tokens of one lineage share a ``grant_id``, which is what lets a
+    replayed refresh token revoke the whole lineage instead of only itself.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_secret_hash TEXT,
+            client_name TEXT,
+            redirect_uris TEXT NOT NULL,
+            grant_types TEXT NOT NULL,
+            response_types TEXT NOT NULL,
+            token_endpoint_auth_method TEXT NOT NULL,
+            scope TEXT,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+        name="migrate.009.create_oauth_clients",
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+            code_hash TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            code_challenge_method TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            ns TEXT NOT NULL,
+            identity_id TEXT NOT NULL,
+            inbox_secret_enc TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            consumed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+        name="migrate.009.create_oauth_auth_codes",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_auth_codes_expires ON oauth_auth_codes(expires_at)",
+        name="migrate.009.idx_codes",
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oauth_grants (
+            grant_id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            ns TEXT NOT NULL,
+            identity_id TEXT NOT NULL,
+            inbox_secret_enc TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            revoked_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (ns, identity_id) REFERENCES identities(ns, id) ON DELETE CASCADE
+        )
+    """,
+        name="migrate.009.create_oauth_grants",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_grants_identity ON oauth_grants(ns, identity_id)",
+        name="migrate.009.idx_grants_identity",
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            grant_id TEXT NOT NULL REFERENCES oauth_grants(grant_id) ON DELETE CASCADE,
+            expires_at TIMESTAMP,
+            revoked_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+        name="migrate.009.create_oauth_tokens",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_tokens_grant ON oauth_tokens(grant_id)",
+        name="migrate.009.idx_tokens_grant",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expires ON oauth_tokens(kind, expires_at)",
+        name="migrate.009.idx_tokens_expires",
+    )
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
@@ -1334,6 +1438,11 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (6, "Add attachments table for binary content on messages", _migrate_006_add_attachments),
     (7, "Add push_subscriptions table for Web Push", _migrate_007_add_push_subscriptions),
     (8, "Add push_prefs table for per-identity push on/off", _migrate_008_add_push_prefs),
+    (
+        9,
+        "Add oauth_clients/grants/auth_codes/tokens for the MCP OAuth server",
+        _migrate_009_add_oauth,
+    ),
 ]
 
 
@@ -1493,6 +1602,10 @@ def reset_db(conn: sqlite3.Connection | None = None):
     """Reset database (for testing)."""
     conn = _get_conn(conn)
     conn.executescript("""
+        DROP TABLE IF EXISTS oauth_tokens;
+        DROP TABLE IF EXISTS oauth_grants;
+        DROP TABLE IF EXISTS oauth_auth_codes;
+        DROP TABLE IF EXISTS oauth_clients;
         DROP TABLE IF EXISTS push_prefs;
         DROP TABLE IF EXISTS push_subscriptions;
         DROP TABLE IF EXISTS attachments;
@@ -4213,3 +4326,264 @@ def count_unread_for_identity(
         name="count_unread_for_identity",
     )
     return cursor.fetchone()[0]
+
+
+# --- MCP OAuth Authorization Server ---
+#
+# Timestamps in these tables are ISO-8601 UTC strings written by Python, and
+# every freshness comparison happens in Python after the fetch. SQLite's
+# CURRENT_TIMESTAMP and libsql's differ in format, and an expiry check that
+# silently compares a naive string to an ISO one fails open.
+
+
+def create_oauth_client(
+    client_id: str,
+    redirect_uris: list[str],
+    grant_types: list[str],
+    response_types: list[str],
+    token_endpoint_auth_method: str,
+    client_name: str | None = None,
+    client_secret_hash: str | None = None,
+    scope: str | None = None,
+    metadata: dict | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """Record a dynamically registered OAuth client."""
+    conn = _get_conn(conn)
+    conn.execute(
+        """INSERT INTO oauth_clients
+               (client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                response_types, token_endpoint_auth_method, scope, metadata, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            client_id,
+            client_secret_hash,
+            client_name,
+            json.dumps(redirect_uris),
+            json.dumps(grant_types),
+            json.dumps(response_types),
+            token_endpoint_auth_method,
+            scope,
+            json.dumps(metadata or {}),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+        name="create_oauth_client",
+    )
+    conn.commit()
+    client = get_oauth_client(client_id, conn=conn)
+    return client or {}
+
+
+@timed_query("get_oauth_client")
+def get_oauth_client(client_id: str, conn: sqlite3.Connection | None = None) -> dict | None:
+    """Fetch a registered client, with JSON columns already decoded."""
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                  response_types, token_endpoint_auth_method, scope, metadata, created_at
+           FROM oauth_clients WHERE client_id = ?""",
+        (client_id,),
+        name="get_oauth_client",
+    )
+    row = _row_to_dict(cursor.description, cursor.fetchone())
+    if row is None:
+        return None
+    for field in ("redirect_uris", "grant_types", "response_types", "metadata"):
+        row[field] = json.loads(row[field]) if row[field] else []
+    return row
+
+
+def create_oauth_auth_code(
+    code_hash: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: str,
+    resource: str,
+    ns: str,
+    identity_id: str,
+    inbox_secret_enc: str,
+    expires_at: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Store a pending authorization code. Only its hash is written."""
+    conn = _get_conn(conn)
+    conn.execute(
+        """INSERT INTO oauth_auth_codes
+               (code_hash, client_id, redirect_uri, code_challenge, code_challenge_method,
+                scope, resource, ns, identity_id, inbox_secret_enc, expires_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            code_hash,
+            client_id,
+            redirect_uri,
+            code_challenge,
+            code_challenge_method,
+            scope,
+            resource,
+            ns,
+            identity_id,
+            inbox_secret_enc,
+            expires_at,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+        name="create_oauth_auth_code",
+    )
+    conn.commit()
+
+
+@timed_query("claim_oauth_auth_code")
+def claim_oauth_auth_code(code_hash: str, conn: sqlite3.Connection | None = None) -> dict | None:
+    """Mark an authorization code consumed and return it, or None.
+
+    The UPDATE carries the ``consumed_at IS NULL`` guard, so a second caller
+    presenting the same code gets ``None`` even when the two requests race.
+    Single-use is enforced here rather than by a read-then-write in the caller.
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        "UPDATE oauth_auth_codes SET consumed_at = ? WHERE code_hash = ? AND consumed_at IS NULL",
+        (datetime.now(timezone.utc).isoformat(), code_hash),
+        name="claim_oauth_auth_code.claim",
+    )
+    conn.commit()
+    if cursor.rowcount != 1:
+        return None
+    cursor = conn.execute(
+        """SELECT code_hash, client_id, redirect_uri, code_challenge, code_challenge_method,
+                  scope, resource, ns, identity_id, inbox_secret_enc, expires_at, created_at
+           FROM oauth_auth_codes WHERE code_hash = ?""",
+        (code_hash,),
+        name="claim_oauth_auth_code.select",
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+def create_oauth_grant(
+    grant_id: str,
+    client_id: str,
+    ns: str,
+    identity_id: str,
+    inbox_secret_enc: str,
+    scope: str,
+    resource: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Record a consented grant — the identity every token in it acts as."""
+    conn = _get_conn(conn)
+    conn.execute(
+        """INSERT INTO oauth_grants
+               (grant_id, client_id, ns, identity_id, inbox_secret_enc, scope, resource, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            grant_id,
+            client_id,
+            ns,
+            identity_id,
+            inbox_secret_enc,
+            scope,
+            resource,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+        name="create_oauth_grant",
+    )
+    conn.commit()
+
+
+@timed_query("revoke_oauth_grant")
+def revoke_oauth_grant(grant_id: str, conn: sqlite3.Connection | None = None) -> None:
+    """Revoke a grant, which invalidates every token issued under it."""
+    conn = _get_conn(conn)
+    conn.execute(
+        "UPDATE oauth_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+        (datetime.now(timezone.utc).isoformat(), grant_id),
+        name="revoke_oauth_grant",
+    )
+    conn.commit()
+
+
+def create_oauth_token(
+    token_hash: str,
+    kind: str,
+    grant_id: str,
+    expires_at: str | None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Store an issued token's hash. ``kind`` is ``access`` or ``refresh``."""
+    conn = _get_conn(conn)
+    conn.execute(
+        """INSERT INTO oauth_tokens (token_hash, kind, grant_id, expires_at, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (token_hash, kind, grant_id, expires_at, datetime.now(timezone.utc).isoformat()),
+        name="create_oauth_token",
+    )
+    conn.commit()
+
+
+@timed_query("get_oauth_token")
+def get_oauth_token(
+    token_hash: str, kind: str, conn: sqlite3.Connection | None = None
+) -> dict | None:
+    """Look up a token by hash, joined to the grant that owns it.
+
+    Returns the row whatever its state — expired, revoked, or with a revoked
+    grant — because a caller distinguishing "unknown token" from "known but
+    dead token" needs both, and reuse detection needs the grant id of a token
+    that has already been revoked.
+    """
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT t.token_hash, t.kind, t.grant_id, t.expires_at, t.revoked_at, t.created_at,
+                  g.client_id, g.ns, g.identity_id, g.inbox_secret_enc, g.scope, g.resource,
+                  g.revoked_at AS grant_revoked_at
+           FROM oauth_tokens t JOIN oauth_grants g ON g.grant_id = t.grant_id
+           WHERE t.token_hash = ? AND t.kind = ?""",
+        (token_hash, kind),
+        name="get_oauth_token",
+    )
+    return _row_to_dict(cursor.description, cursor.fetchone())
+
+
+@timed_query("revoke_oauth_token")
+def revoke_oauth_token(token_hash: str, conn: sqlite3.Connection | None = None) -> None:
+    """Revoke a single token by hash."""
+    conn = _get_conn(conn)
+    conn.execute(
+        "UPDATE oauth_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+        (datetime.now(timezone.utc).isoformat(), token_hash),
+        name="revoke_oauth_token",
+    )
+    conn.commit()
+
+
+def purge_expired_oauth_records(conn: sqlite3.Connection | None = None) -> dict[str, int]:
+    """Delete consumed or expired codes and dead tokens.
+
+    Run once at startup rather than on a request path: claude.ai registers a
+    fresh client per connection attempt, so the tables grow slowly and
+    unboundedly, and a delete inside the token endpoint would spend part of a
+    10-second client budget on housekeeping.
+    """
+    conn = _get_conn(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    codes = conn.execute(
+        "DELETE FROM oauth_auth_codes WHERE expires_at < ? OR consumed_at IS NOT NULL",
+        (now,),
+        name="purge_expired_oauth_records.codes",
+    )
+    code_count = codes.rowcount
+    tokens = conn.execute(
+        "DELETE FROM oauth_tokens WHERE (expires_at IS NOT NULL AND expires_at < ?) "
+        "OR revoked_at IS NOT NULL",
+        (now,),
+        name="purge_expired_oauth_records.tokens",
+    )
+    token_count = tokens.rowcount
+    grants = conn.execute(
+        "DELETE FROM oauth_grants WHERE revoked_at IS NOT NULL",
+        name="purge_expired_oauth_records.grants",
+    )
+    grant_count = grants.rowcount
+    conn.commit()
+    return {"codes": code_count, "tokens": token_count, "grants": grant_count}

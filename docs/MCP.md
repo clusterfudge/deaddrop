@@ -4,29 +4,35 @@ deaddrop can expose its rooms as [Model Context Protocol](https://modelcontextpr
 tools, so an MCP client — Claude's remote custom connectors, the MCP
 Inspector, anything speaking Streamable HTTP — can read and post messages.
 
-The endpoint is `POST /mcp`, with `POST /mcp/{ns}/{secret}` as a second
-entrance for clients that cannot set a request header. Both are **off unless
-configured**.
+Two entrances, both **always mounted** and both authenticating a deaddrop
+identity:
+
+| Route | Credential | Identity |
+|---|---|---|
+| `POST /mcp` | `Authorization: Bearer <token>` from the built-in OAuth server | chosen at consent time |
+| `POST /mcp/{ns}/{secret}` | an inbox secret in the URL | the one the secret derives to |
+
+There is no server-wide credential and no configured identity: a connection is
+an identity, not a config change. `POST /mcp` answers `401` until the OAuth
+variables below are set, which is the honest answer for a route whose only
+credential is a token nothing can yet issue.
 
 ## Configuration
 
-| Variable | Meaning |
-|---|---|
-| `DEADROP_MCP_TOKEN` | Bearer token the client must present in `Authorization`. |
-| `DEADROP_MCP_NS` | Namespace the tools operate in. |
-| `DEADROP_MCP_SECRET` | Inbox secret of the identity the tools act as. |
+| Variable | Required for | Meaning |
+|---|---|---|
+| `DEADROP_MCP_PUBLIC_URL` | OAuth | Origin the server is reachable at, e.g. `https://deaddrop.example`. No trailing slash. |
+| `DEADROP_MCP_OAUTH_KEY` | OAuth | base64url of 32 random bytes. Seals inbox secrets at rest. |
 
-All three are required; with any of them missing neither route is
-registered — including the URL identity route, which needs no config of its own
-but stays behind the same "off unless configured" switch. Give the connector its **own identity** rather than reusing a
-human's or an agent's — every message it sends is attributed to that identity,
-and it can only see rooms that identity is a member of.
+Neither is needed for `POST /mcp/{ns}/{secret}`.
+
+Give a connector its **own identity** rather than reusing a human's or an
+agent's — every message it sends is attributed to that identity, and it can
+only see rooms that identity is a member of.
 
 ```bash
 deadrop identity create {ns} --name "claude.ai"     # note the secret it prints
-# add it to the rooms it should reach, then:
-dokku config:set deaddrop \
-  DEADROP_MCP_TOKEN=… DEADROP_MCP_NS=… DEADROP_MCP_SECRET=…
+# then add it to the rooms it should reach
 ```
 
 ## Transport
@@ -52,22 +58,12 @@ Attachments, reactions, room creation, and membership changes are not exposed.
 
 ## Authentication
 
-A fixed bearer token, compared against the full `Authorization` value. A
-mismatch returns `401` with `WWW-Authenticate: Bearer realm="deaddrop-mcp"`.
-
-For Claude this is the `static_headers` auth type: enter the header value
-**including the scheme** — `Bearer your-token` — because Claude sends the value
-verbatim. Note that request-header auth is a gradual-rollout beta; an account
-without it can use the URL identity route below instead.
-
 ### URL identity
 
 `POST /mcp/{ns}/{secret}` authenticates with an ordinary inbox secret in the
 URL. The pair is verified against the `identities` table the same hashed way an
 `X-Inbox-Secret` header is, and the session then acts as **that** identity —
-its namespace, its rooms, its display name — rather than the one in
-`DEADROP_MCP_SECRET`. A new connection is therefore a new identity, not a
-config change:
+its namespace, its rooms, its display name:
 
 ```bash
 deadrop identity create {ns} --name "claude.ai (sean)"   # note the secret
@@ -88,8 +84,51 @@ TLS-terminating proxy's access log, browser history, a pasted screenshot, a
 shared bookmark — sees the secret in full, and an inbox secret is a full
 credential for that identity everywhere else in the API too. So give a
 URL-identity connector its own identity, add it only to the rooms it needs,
-rotate it by deleting the identity, and prefer header auth or OAuth where the
-client supports them.
+rotate it by deleting the identity, and prefer OAuth where the client supports
+it.
+
+### OAuth 2.1 (`oauth_dcr`)
+
+Set the two variables above and the app becomes its own authorization server.
+Generate the key on the host and never echo it:
+
+```bash
+python -c "import base64,secrets;print(base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b'=').decode())"
+```
+
+`DEADROP_MCP_PUBLIC_URL` is explicit rather than derived from request headers
+because the Procfile runs uvicorn without `--proxy-headers`; behind a TLS proxy
+a derived scheme would be `http` and every exact-match check would fail.
+
+Endpoints, mounted only when both variables are set:
+
+| Path | Spec |
+|---|---|
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728, path-inserted |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 |
+| `POST /oauth/register` | RFC 7591, `application/json` |
+| `GET`/`POST /oauth/authorize` | consent, PKCE S256 required |
+| `POST /oauth/token` | `application/x-www-form-urlencoded` |
+
+They sit at `/oauth/*` rather than `/mcp/oauth/*` so `POST /mcp/{ns}/{secret}`
+cannot shadow them as a namespace called `oauth`.
+
+**A token is scoped to one identity.** The consent page asks for a namespace and
+the inbox secret of the identity the connector should act as; possession of that
+secret is both the authentication and the selection, verified with the same
+`verify_identity_secret` the room routes use. Every tool call made with a token
+from that grant is attributed to that identity.
+
+Access tokens live one hour; refresh tokens thirty days and rotate on every
+use. Presenting a rotated-away refresh token revokes the whole grant. Nothing
+is stored in the clear: codes and tokens as SHA-256 hashes, the inbox secret
+sealed with AES-256-GCM under `DEADROP_MCP_OAUTH_KEY` and bound to its grant id
+as additional authenticated data.
+
+Adding the connector in Claude: enter `https://your-host/mcp`, leave the OAuth
+client fields blank, and approve on the consent page. Claude registers a client
+on every fresh connection, which is expected; stale rows are purged at startup.
 
 ## Verifying a deployment
 
@@ -100,8 +139,8 @@ curl -si -X POST https://your-host/mcp \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -1
 
-# expect the three tools
-npx @modelcontextprotocol/inspector   # or any MCP client, with the bearer token
+# expect the discovery pointer in the challenge
+curl -si -X POST https://your-host/mcp -d '{}' | grep -i www-authenticate
 
 # expect 401 (unknown identity), then 200 for a real ns/secret pair
 curl -si -X POST https://your-host/mcp/{ns}/0000000000000000 \

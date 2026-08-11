@@ -274,6 +274,8 @@ async def add_timing_middleware(request: Request, call_next):
         endpoint = "admin"
     elif path in ("/health", "/metrics"):
         endpoint = path[1:]
+    elif path.startswith("/oauth/") or path.startswith("/.well-known/oauth-"):
+        endpoint = f"mcp.oauth.{method}"
     elif path == "/mcp" or path.startswith("/mcp/"):
         endpoint = f"mcp.{method}"
     else:
@@ -2977,8 +2979,12 @@ def get_debug_db(
     return db.get_db_debug_state()
 
 
-# Mount the MCP endpoint last so no route pattern shadows /mcp. Registration
-# is a no-op unless DEADROP_MCP_TOKEN/NS/SECRET are all set.
+# Mount the MCP endpoint last so no route pattern shadows /mcp.
+#
+# The authorization server registers first: mcp_server reads its config to
+# decide whether a 401 from /mcp should advertise OAuth discovery.
+from .mcp_oauth import register as _register_mcp_oauth  # noqa: E402
 from .mcp_server import register as _register_mcp  # noqa: E402
 
+_register_mcp_oauth(app)
 _register_mcp(app)

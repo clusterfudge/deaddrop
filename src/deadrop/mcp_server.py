@@ -1,26 +1,24 @@
 """MCP server exposing deaddrop rooms as tools over Streamable HTTP.
 
-Mounted at ``POST /mcp`` by :mod:`deadrop.api` when configured, with
-``POST /mcp/{ns}/{secret}`` as a second entrance for clients that cannot set an
-``Authorization`` header. The transport is the reference
-``StreamableHTTPSessionManager`` in stateless JSON mode: one request in, one
-JSON-RPC response out, no server-side session state.
+Mounted at ``POST /mcp`` by :mod:`deadrop.api`, with ``POST /mcp/{ns}/{secret}``
+as a second entrance for clients that cannot set an ``Authorization`` header.
+The transport is the reference ``StreamableHTTPSessionManager`` in stateless
+JSON mode: one request in, one JSON-RPC response out, no server-side session
+state.
 
-Configuration is entirely environment-driven and the server stays unmounted
-unless all three variables are present:
+Both entrances authenticate a **deaddrop identity**, and there is no
+server-wide credential and no configured identity to fall back on:
 
-``DEADROP_MCP_TOKEN``
-    The bearer token a client must present in ``Authorization``.
-``DEADROP_MCP_NS``
-    Namespace the tools operate in.
-``DEADROP_MCP_SECRET``
-    Inbox secret of the identity the tools act as. Every room read and every
-    message sent is attributed to this identity.
+``POST /mcp``
+    ``Authorization: Bearer <token>``, where the token was issued by this app's
+    own OAuth authorization server (:mod:`deadrop.mcp_oauth`). The identity is
+    the one chosen at consent time.
+``POST /mcp/{ns}/{secret}``
+    An ordinary inbox secret in the URL, verified against the ``identities``
+    table exactly as an ``X-Inbox-Secret`` header would be.
 
-On ``/mcp/{ns}/{secret}`` the credential is an ordinary inbox secret, verified
-against the ``identities`` table exactly as an ``X-Inbox-Secret`` header would
-be, and the tools act as *that* identity rather than the configured one. Adding
-a connection is therefore an identity, not a config change.
+Either way the acting identity is per-request and travels in a ``ContextVar``,
+so adding a connection is an identity, not a config change.
 
 The tool handlers call the room route functions in :mod:`deadrop.api`
 directly, so membership checks, message dedup, and SSE fanout behave exactly
@@ -29,10 +27,8 @@ as they do for an HTTP caller.
 
 from __future__ import annotations
 
-import hmac
 import json
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -44,7 +40,7 @@ from mcp.server.lowlevel.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.routing import Route
 
-from . import instrument
+from . import instrument, mcp_oauth
 
 logger = logging.getLogger(__name__)
 
@@ -67,33 +63,10 @@ class Actor:
     secret: str
 
 
-# Set by IdentityAuthASGI for the duration of one request. anyio copies the
-# calling context when the session manager starts its per-request task, so the
-# tool handlers see the value set here.
+# Set by whichever auth wrapper accepted the request, for the duration of that
+# request. anyio copies the calling context when the session manager starts its
+# per-request task, so the tool handlers see the value set here.
 _actor: ContextVar[Actor | None] = ContextVar("mcp_actor", default=None)
-
-
-@dataclass(frozen=True)
-class McpConfig:
-    """Resolved environment configuration for the MCP server."""
-
-    token: str
-    ns: str
-    secret: str
-
-    @property
-    def actor(self) -> Actor:
-        return Actor(ns=self.ns, secret=self.secret)
-
-
-def load_config() -> McpConfig | None:
-    """Read config from the environment, or None when not fully configured."""
-    token = os.environ.get("DEADROP_MCP_TOKEN", "").strip()
-    ns = os.environ.get("DEADROP_MCP_NS", "").strip()
-    secret = os.environ.get("DEADROP_MCP_SECRET", "").strip()
-    if not (token and ns and secret):
-        return None
-    return McpConfig(token=token, ns=ns, secret=secret)
 
 
 # --- Tool definitions ---------------------------------------------------
@@ -268,12 +241,12 @@ def _require_str(args: dict[str, Any], key: str) -> str:
 # --- Protocol handlers -------------------------------------------------
 
 
-def build_server(cfg: McpConfig) -> Server:
-    """Build the low-level MCP server for a resolved config.
+def build_server() -> Server:
+    """Build the low-level MCP server.
 
-    ``cfg`` supplies the identity for requests that authenticated with the
-    static bearer token; a request that authenticated with an inbox secret in
-    its URL sets ``_actor`` and the tools act as that identity instead.
+    One instance serves every connection. It holds no identity of its own: the
+    auth wrapper that accepted the request has already put the acting identity
+    in ``_actor``, and the tool handlers read it there.
     """
 
     async def on_list_tools(ctx, params) -> types.ListToolsResult:
@@ -283,7 +256,9 @@ def build_server(cfg: McpConfig) -> Server:
         from fastapi import HTTPException
 
         args = params.arguments or {}
-        actor = _actor.get() or cfg.actor
+        actor = _actor.get()
+        if actor is None:  # pragma: no cover — the auth wrappers always set it
+            return _error("no authenticated identity for this request")
         started = time.perf_counter()
         outcome = "ok"
         try:
@@ -353,18 +328,32 @@ async def _send_unauthorized(send, www_authenticate: bytes | None = None) -> Non
     await send({"type": "http.response.body", "body": body})
 
 
-class BearerAuthASGI:
-    """Gate an ASGI app on a fixed bearer token.
+class OAuthAuthASGI:
+    """Gate an ASGI app on an access token from this app's authorization server.
 
-    ``static_headers`` is the auth type this implements: the client sends a
-    single pre-shared credential in ``Authorization`` on every request. The
-    ``401`` carries ``WWW-Authenticate: Bearer`` with no ``resource_metadata``
-    parameter, because there is no OAuth authorization server to discover.
+    The token names its own identity: the grant it belongs to recorded the
+    ``(ns, identity_id)`` chosen at consent time, so a verified token yields the
+    :class:`Actor` for that identity rather than unlocking a configured one.
+
+    A rejection is the same opaque ``401`` the URL route sends, plus a
+    ``WWW-Authenticate: Bearer`` challenge carrying the RFC 9728
+    ``resource_metadata`` pointer and the scopes to ask for — the handshake a
+    remote MCP client uses to discover where to authorize. The challenge names
+    an authorization server only when one is configured; advertising discovery
+    for a server that is not running turns a clean rejection into a failed
+    handshake.
     """
 
-    def __init__(self, app, token: str) -> None:
+    def __init__(self, app, oauth: mcp_oauth.OAuthConfig | None) -> None:
         self._app = app
-        self._token = f"Bearer {token}"
+        self._oauth = oauth
+
+    def _challenge(self) -> bytes:
+        params = ['realm="deaddrop-mcp"']
+        if self._oauth is not None:
+            params.append(f'resource_metadata="{self._oauth.resource_metadata_url}"')
+            params.append(f'scope="{" ".join(mcp_oauth.SCOPES_SUPPORTED)}"')
+        return b"Bearer " + ", ".join(params).encode("latin-1")
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
@@ -377,11 +366,18 @@ class BearerAuthASGI:
                 presented = value.decode("latin-1")
                 break
 
-        if not hmac.compare_digest(presented, self._token):
-            await _send_unauthorized(send, b'Bearer realm="deaddrop-mcp"')
+        granted = None
+        if self._oauth is not None and presented.startswith("Bearer "):
+            granted = mcp_oauth.verify_access_token(presented[len("Bearer ") :], self._oauth)
+        if granted is None:
+            await _send_unauthorized(send, self._challenge())
             return
 
-        await self._app(scope, receive, send)
+        token = _actor.set(Actor(ns=granted.ns, secret=granted.inbox_secret))
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            _actor.reset(token)
 
 
 class IdentityAuthASGI:
@@ -450,13 +446,32 @@ def redact_path(path: str) -> str:
 
 
 class _StreamableHTTPASGI:
-    """Adapt ``StreamableHTTPSessionManager`` to a bare ASGI callable."""
+    """Adapt ``StreamableHTTPSessionManager`` to a bare ASGI callable.
 
-    def __init__(self, manager: StreamableHTTPSessionManager) -> None:
-        self._manager = manager
+    The manager is looked up on ``app.state`` per request rather than captured
+    at construction. A manager's ``run()`` may be entered only once, so the
+    instance belongs to one pass through the app's lifespan — and an app whose
+    lifespan is entered twice (a test suite opening two clients against the
+    same app object) needs a second instance, not the first one again.
+    """
 
     async def __call__(self, scope, receive, send) -> None:
-        await self._manager.handle_request(scope, receive, send)
+        manager = getattr(scope["app"].state, STATE_ATTR, None)
+        if manager is None:
+            body = json.dumps({"error": "mcp transport not started"}).encode()
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await manager.handle_request(scope, receive, send)
 
 
 STATE_ATTR = "mcp_session_manager"
@@ -465,29 +480,23 @@ STATE_ATTR = "mcp_session_manager"
 def register(app) -> bool:
     """Mount the MCP endpoint on ``app``. Returns whether it was mounted.
 
-    The session manager is stored on ``app.state`` rather than in a module
-    global: a manager's ``run()`` may only be entered once, so it has to be
-    owned by the app whose lifespan enters it.
+    Unconditional: every credential either route accepts is a deaddrop
+    identity or a token issued against one, so there is nothing to configure
+    before the endpoint can safely exist. ``POST /mcp`` answers ``401`` until
+    :mod:`deadrop.mcp_oauth` is configured, which is the correct answer for a
+    route whose only credential is an OAuth token.
+
+    Only the routes are registered here. The transport instance is created by
+    :func:`session_lifespan`, because it is bound to one entry of the app's
+    lifespan.
     """
-    cfg = load_config()
-    if cfg is None:
-        logger.info("MCP server not mounted (DEADROP_MCP_TOKEN/NS/SECRET not all set)")
-        return False
-
-    manager = StreamableHTTPSessionManager(
-        app=build_server(cfg),
-        json_response=True,
-        stateless=True,
-    )
-    setattr(app.state, STATE_ATTR, manager)
-
     # A Route, not a Mount: Starlette's Mount regex only matches paths *below*
     # the mount point, so a request to the bare /mcp gets a 307 to /mcp/. The
     # connector URL an operator types has no trailing slash, and a redirect on
     # POST is not something to rely on a client honouring.
-    transport = _StreamableHTTPASGI(manager)
+    transport = _StreamableHTTPASGI()
     app.router.routes.append(
-        Route(MCP_PATH, endpoint=BearerAuthASGI(transport, cfg.token), name="mcp")
+        Route(MCP_PATH, endpoint=OAuthAuthASGI(transport, mcp_oauth.get_config(app)), name="mcp")
     )
     app.router.routes.append(
         Route(MCP_IDENTITY_PATH, endpoint=IdentityAuthASGI(transport), name="mcp_identity")
@@ -497,16 +506,29 @@ def register(app) -> bool:
 
 @asynccontextmanager
 async def session_lifespan(app):
-    """Run the session manager's task group for the life of ``app``.
+    """Own the session manager for one pass through ``app``'s lifespan.
 
-    A no-op when the endpoint was never mounted on this app.
+    The manager is created here rather than in :func:`register` because its
+    ``run()`` may be entered only once and it owns an anyio task group, which
+    has to be entered on the running loop.
     """
-    manager = getattr(app.state, STATE_ATTR, None)
-    if manager is None:
-        yield
-        return
+    manager = StreamableHTTPSessionManager(
+        app=build_server(),
+        json_response=True,
+        stateless=True,
+    )
+    setattr(app.state, STATE_ATTR, manager)
     # Logged here rather than in register(): registration happens at import,
     # before configure_logging() runs in the lifespan.
     logger.info("MCP endpoint active at %s and %s", MCP_PATH, MCP_IDENTITY_PATH)
-    async with manager.run():
-        yield
+    if mcp_oauth.get_config(app) is not None:
+        from . import db
+
+        logger.info(
+            "MCP OAuth authorization server active; purged %s", db.purge_expired_oauth_records()
+        )
+    try:
+        async with manager.run():
+            yield
+    finally:
+        setattr(app.state, STATE_ATTR, None)
