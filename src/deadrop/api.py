@@ -279,6 +279,13 @@ async def add_timing_middleware(request: Request, call_next):
     else:
         endpoint = "other"
 
+    # /mcp/{ns}/{secret} carries the credential in the URL, so the path is only
+    # safe to log with that segment replaced. The endpoint label above is
+    # already per-route rather than per-path.
+    from .mcp_server import redact_path
+
+    log_path = redact_path(path)
+
     metrics.record_request(endpoint, duration_ms, status=response.status_code)
 
     # Also emit to pluggable sink via instrument module
@@ -322,7 +329,7 @@ async def add_timing_middleware(request: Request, call_next):
         log_method(
             "request",
             method=request.method,
-            path=path,
+            path=log_path,
             status=response.status_code,
             duration_ms=round(duration_ms, 1),
             client=client_ip,
@@ -340,7 +347,7 @@ async def add_timing_middleware(request: Request, call_next):
                 duration_ms=round(duration_ms, 1),
                 endpoint=endpoint,
                 method=method,
-                path=path,
+                path=log_path,
                 status=response.status_code,
                 db_queries=query_buffer,
                 db_total_ms=round(db_total, 1),
@@ -2970,8 +2977,7 @@ def get_debug_db(
     return db.get_db_debug_state()
 
 
-# Mount the MCP endpoint last so no route pattern shadows /mcp. Registration
-# is a no-op unless DEADROP_MCP_TOKEN/NS/SECRET are all set.
+# Mount the MCP endpoint last so no route pattern shadows /mcp/{ns}/{secret}.
 from .mcp_server import register as _register_mcp  # noqa: E402
 
 _register_mcp(app)
