@@ -4,30 +4,24 @@ deaddrop can expose its rooms as [Model Context Protocol](https://modelcontextpr
 tools, so an MCP client — Claude's remote custom connectors, the MCP
 Inspector, anything speaking Streamable HTTP — can read and post messages.
 
-The endpoint is `POST /mcp`, with `POST /mcp/{ns}/{secret}` as a second
-entrance for clients that cannot set a request header. Both are **off unless
-configured**.
+The endpoint is `POST /mcp/{ns}/{secret}`. It is always mounted: there is no
+server-side configuration, and the URL an operator pastes into a client is the
+whole credential.
 
-## Configuration
+## Connecting
 
-| Variable | Meaning |
-|---|---|
-| `DEADROP_MCP_TOKEN` | Bearer token the client must present in `Authorization`. |
-| `DEADROP_MCP_NS` | Namespace the tools operate in. |
-| `DEADROP_MCP_SECRET` | Inbox secret of the identity the tools act as. |
-
-All three are required; with any of them missing neither route is
-registered — including the URL identity route, which needs no config of its own
-but stays behind the same "off unless configured" switch. Give the connector its **own identity** rather than reusing a
-human's or an agent's — every message it sends is attributed to that identity,
-and it can only see rooms that identity is a member of.
+Give the connector its **own identity** rather than reusing a human's or an
+agent's — every message it sends is attributed to that identity, and it can
+only see rooms that identity is a member of.
 
 ```bash
-deadrop identity create {ns} --name "claude.ai"     # note the secret it prints
-# add it to the rooms it should reach, then:
-dokku config:set deaddrop \
-  DEADROP_MCP_TOKEN=… DEADROP_MCP_NS=… DEADROP_MCP_SECRET=…
+deadrop identity create {ns} --name "claude.ai (sean)"   # note the secret
+# add it to the rooms it should reach, then paste this as the connector URL:
+#   https://your-host/mcp/{ns}/{secret}
 ```
+
+Revoke a connector by deleting its identity. A new connection is a new
+identity, not a config change and not a server restart.
 
 ## Transport
 
@@ -52,28 +46,12 @@ Attachments, reactions, room creation, and membership changes are not exposed.
 
 ## Authentication
 
-A fixed bearer token, compared against the full `Authorization` value. A
-mismatch returns `401` with `WWW-Authenticate: Bearer realm="deaddrop-mcp"`.
-
-For Claude this is the `static_headers` auth type: enter the header value
-**including the scheme** — `Bearer your-token` — because Claude sends the value
-verbatim. Note that request-header auth is a gradual-rollout beta; an account
-without it can use the URL identity route below instead.
-
-### URL identity
-
-`POST /mcp/{ns}/{secret}` authenticates with an ordinary inbox secret in the
-URL. The pair is verified against the `identities` table the same hashed way an
-`X-Inbox-Secret` header is, and the session then acts as **that** identity —
-its namespace, its rooms, its display name — rather than the one in
-`DEADROP_MCP_SECRET`. A new connection is therefore a new identity, not a
-config change:
-
-```bash
-deadrop identity create {ns} --name "claude.ai (sean)"   # note the secret
-# add it to the rooms it should reach, then paste this as the connector URL:
-#   https://your-host/mcp/{ns}/{secret}
-```
+The `{secret}` segment is an ordinary inbox secret. The `{ns}`/`{secret}` pair
+is verified against the `identities` table the same hashed way an
+`X-Inbox-Secret` header is, and the session acts as **that** identity — its
+namespace, its rooms, its display name. There is no other way in: no bearer
+token, no `static_headers`, no configured fallback identity, and no route at
+the bare `/mcp` (a request there is a `404`).
 
 Every rejection is the same `401` with the body `{"error": "unauthorized"}` and
 no `WWW-Authenticate` challenge: an unknown namespace, a secret from a
@@ -87,33 +65,35 @@ travels. deaddrop's own access log redacts the secret segment
 TLS-terminating proxy's access log, browser history, a pasted screenshot, a
 shared bookmark — sees the secret in full, and an inbox secret is a full
 credential for that identity everywhere else in the API too. So give a
-URL-identity connector its own identity, add it only to the rooms it needs,
-rotate it by deleting the identity, and prefer header auth or OAuth where the
-client supports them.
+connector its own identity, add it only to the rooms it needs, and rotate it by
+deleting the identity.
 
 ## Verifying a deployment
 
 ```bash
-# expect 401
+# expect 404 — the bare path is not an endpoint
 curl -si -X POST https://your-host/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -1
 
-# expect the three tools
-npx @modelcontextprotocol/inspector   # or any MCP client, with the bearer token
-
-# expect 401 (unknown identity), then 200 for a real ns/secret pair
+# expect 401 (unknown identity)
 curl -si -X POST https://your-host/mcp/{ns}/0000000000000000 \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -1
+
+# expect the three tools for a real ns/secret pair
+curl -s -X POST https://your-host/mcp/{ns}/{secret} \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
 ## Metrics
 
 `mcp.tool.calls` and `mcp.tool.duration_ms`, tagged `tool` and `outcome`
 (`ok`, `bad_argument`, `http_<status>`, `unknown_tool`, `exception`), plus
-`mcp.auth.rejected` for a failed credential check on either route. Request
-timings land under the `mcp.POST` endpoint label — static per route, so a URL
-secret never becomes a metric label.
+`mcp.auth.rejected` for a failed credential check. Request timings land under
+the `mcp.POST` endpoint label — static per route, so a URL secret never becomes
+a metric label.

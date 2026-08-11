@@ -1,4 +1,4 @@
-"""Tests for the MCP server mounted at /mcp."""
+"""Tests for the MCP server mounted at /mcp/{ns}/{secret}."""
 
 import json
 from contextlib import asynccontextmanager
@@ -11,14 +11,11 @@ from fastapi.testclient import TestClient
 from deadrop import mcp_server
 from deadrop.api import app as deaddrop_app
 
-TOKEN = "test-mcp-token"
+# The credential rides in the path, so no request carries an auth header.
 MCP_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
-    "Authorization": f"Bearer {TOKEN}",
 }
-# The identity route carries the credential in the path, so no auth header.
-NO_AUTH_HEADERS = {k: v for k, v in MCP_HEADERS.items() if k != "Authorization"}
 
 
 def identity_path(identity) -> str:
@@ -55,11 +52,8 @@ def room(admin_headers):
 
 
 @pytest.fixture
-def mcp_client(room, monkeypatch):
+def mcp_client():
     """A TestClient for a bare app with only the MCP endpoint mounted."""
-    monkeypatch.setenv("DEADROP_MCP_TOKEN", TOKEN)
-    monkeypatch.setenv("DEADROP_MCP_NS", room["ns"])
-    monkeypatch.setenv("DEADROP_MCP_SECRET", room["secret"])
 
     @asynccontextmanager
     async def lifespan(host_app):
@@ -67,10 +61,16 @@ def mcp_client(room, monkeypatch):
             yield
 
     host = FastAPI(lifespan=lifespan)
-    assert mcp_server.register(host) is True
+    mcp_server.register(host)
 
     with TestClient(host) as client:
         yield client
+
+
+@pytest.fixture
+def mcp_path(room) -> str:
+    """The connector URL for the room fixture's identity."""
+    return identity_path(room)
 
 
 @pytest.fixture
@@ -102,111 +102,67 @@ def other_ns(admin_headers):
         return client.post("/admin/namespaces", headers=admin_headers).json()["ns"]
 
 
-def _post_rpc(client, path, method="tools/list"):
+def _post_rpc(client, path, method="tools/list", headers=None):
     return client.post(
         path,
-        headers=NO_AUTH_HEADERS,
+        headers=headers or MCP_HEADERS,
         json={"jsonrpc": "2.0", "id": 1, "method": method},
         follow_redirects=False,
     )
 
 
-def _rpc_at(client, path, method, params=None):
+def _rpc(client, path, method, params=None):
     body = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         body["params"] = params
-    response = client.post(path, headers=NO_AUTH_HEADERS, json=body, follow_redirects=False)
+    response = client.post(path, headers=MCP_HEADERS, json=body, follow_redirects=False)
     assert response.status_code == 200, response.text
     return response.json()["result"]
 
 
 def _call_tool_raw(client, path, name, arguments=None):
-    result = _rpc_at(client, path, "tools/call", {"name": name, "arguments": arguments or {}})
+    result = _rpc(client, path, "tools/call", {"name": name, "arguments": arguments or {}})
     payload = None
     if not result.get("isError"):
         payload = json.loads(result["content"][0]["text"])
     return result, payload
 
 
-def _call_tool_at(client, path, name, arguments=None):
+def _call_tool(client, path, name, arguments=None):
     result, payload = _call_tool_raw(client, path, name, arguments)
     assert not result.get("isError"), result["content"][0]["text"]
     return payload
 
 
-def _rpc(client, method, params=None, request_id=1):
-    body = {"jsonrpc": "2.0", "id": request_id, "method": method}
-    if params is not None:
-        body["params"] = params
-    response = client.post("/mcp", headers=MCP_HEADERS, json=body)
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-def _call_tool(client, name, arguments=None):
-    result = _rpc(client, "tools/call", {"name": name, "arguments": arguments or {}})["result"]
-    payload = None
-    if not result.get("isError"):
-        payload = json.loads(result["content"][0]["text"])
-    return result, payload
-
-
-class TestConfig:
-    def test_unconfigured_returns_none(self, monkeypatch):
-        for var in ("DEADROP_MCP_TOKEN", "DEADROP_MCP_NS", "DEADROP_MCP_SECRET"):
-            monkeypatch.delenv(var, raising=False)
-        assert mcp_server.load_config() is None
-
-    def test_partial_config_returns_none(self, monkeypatch):
-        monkeypatch.setenv("DEADROP_MCP_TOKEN", TOKEN)
-        monkeypatch.setenv("DEADROP_MCP_NS", "abc123")
-        monkeypatch.delenv("DEADROP_MCP_SECRET", raising=False)
-        assert mcp_server.load_config() is None
-
-    def test_full_config(self, monkeypatch):
-        monkeypatch.setenv("DEADROP_MCP_TOKEN", TOKEN)
-        monkeypatch.setenv("DEADROP_MCP_NS", "abc123")
-        monkeypatch.setenv("DEADROP_MCP_SECRET", "s3cret")
-        cfg = mcp_server.load_config()
-        assert cfg is not None
-        assert (cfg.token, cfg.ns, cfg.secret) == (TOKEN, "abc123", "s3cret")
-
-    def test_register_is_noop_when_unconfigured(self, monkeypatch):
-        for var in ("DEADROP_MCP_TOKEN", "DEADROP_MCP_NS", "DEADROP_MCP_SECRET"):
-            monkeypatch.delenv(var, raising=False)
-        host = FastAPI()
-        assert mcp_server.register(host) is False
-        assert not any(getattr(r, "path", "").startswith("/mcp") for r in host.routes)
-
-
 class TestRouting:
-    def test_bare_mcp_path_does_not_redirect(self, mcp_client):
+    def test_mounts_without_any_configuration(self):
+        """No env vars gate the endpoint: registering mounts it."""
+        host = FastAPI()
+        mcp_server.register(host)
+        paths = [getattr(r, "path", "") for r in host.routes]
+        assert mcp_server.MCP_IDENTITY_PATH in paths
+
+    def test_identity_path_does_not_redirect(self, mcp_client, mcp_path):
         """The connector URL has no trailing slash; a 307 on POST is not ok."""
-        response = mcp_client.post(
-            "/mcp",
-            headers=MCP_HEADERS,
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-            follow_redirects=False,
-        )
+        response = _post_rpc(mcp_client, mcp_path)
         assert response.status_code == 200
 
-    def test_unauthenticated_bare_path_is_401_not_a_redirect(self, mcp_client):
+    def test_bare_mcp_path_has_no_route(self, mcp_client):
+        """/mcp is not an endpoint — the credential is the whole path."""
+        assert _post_rpc(mcp_client, "/mcp").status_code == 404
+
+    def test_partial_path_is_not_a_bypass(self, mcp_client, room):
+        """/mcp/{ns} matches no route."""
+        assert _post_rpc(mcp_client, f"/mcp/{room['ns']}").status_code == 404
+
+
+class TestAuth:
+    """POST /mcp/{ns}/{secret} is the only way in."""
+
+    def test_correct_secret_completes_the_initialize_handshake(self, mcp_client, mcp_path):
         response = mcp_client.post(
-            "/mcp",
-            headers={k: v for k, v in MCP_HEADERS.items() if k != "Authorization"},
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-            follow_redirects=False,
-        )
-        assert response.status_code == 401
-
-
-class TestIdentityUrlRoute:
-    """POST /mcp/{ns}/{secret} — for clients that cannot set a request header."""
-
-    def test_correct_secret_completes_the_initialize_handshake(self, mcp_client, room):
-        response = mcp_client.post(
-            identity_path(room),
-            headers=NO_AUTH_HEADERS,
+            mcp_path,
+            headers=MCP_HEADERS,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -221,49 +177,6 @@ class TestIdentityUrlRoute:
         )
         assert response.status_code == 200, response.text
         assert response.json()["result"]["serverInfo"]["name"] == "deaddrop"
-
-    def test_tools_are_listed_through_the_identity_route(self, mcp_client, room):
-        result = _rpc_at(mcp_client, identity_path(room), "tools/list")
-        assert {t["name"] for t in result["tools"]} == {
-            "list_rooms",
-            "read_room",
-            "send_message",
-        }
-
-    def test_session_acts_as_the_url_identity_not_the_configured_one(
-        self, mcp_client, room, second_identity
-    ):
-        """Bob's URL sees Bob's rooms, not the config-pinned identity's."""
-        _, config_rooms = _call_tool(mcp_client, "list_rooms")
-        assert [r["room_id"] for r in config_rooms["rooms"]] == [room["room_id"]]
-
-        payload = _call_tool_at(mcp_client, identity_path(second_identity), "list_rooms")
-        assert [r["room_id"] for r in payload["rooms"]] == [second_identity["room_id"]]
-        assert payload["rooms"][0]["display_name"] == "Bob Room"
-
-    def test_messages_are_attributed_to_the_url_identity(self, mcp_client, room, second_identity):
-        path = identity_path(second_identity)
-        sent = _call_tool_at(
-            mcp_client,
-            path,
-            "send_message",
-            {"room_id": second_identity["room_id"], "body": "bob was here"},
-        )
-        assert sent["mid"]
-
-        read = _call_tool_at(mcp_client, path, "read_room", {"room_id": second_identity["room_id"]})
-        assert [m["body"] for m in read["messages"]] == ["bob was here"]
-        assert read["messages"][0]["from_id"] == second_identity["identity_id"]
-        assert read["messages"][0]["from_id"] != room["identity_id"]
-
-    def test_url_identity_cannot_reach_a_room_it_is_not_in(self, mcp_client, room, second_identity):
-        result, _ = _call_tool_raw(
-            mcp_client,
-            identity_path(second_identity),
-            "read_room",
-            {"room_id": room["room_id"]},
-        )
-        assert result["isError"] is True
 
     def test_wrong_secret_is_401_and_reflects_nothing(self, mcp_client, room):
         wrong = "0" * 64
@@ -282,36 +195,26 @@ class TestIdentityUrlRoute:
         assert response.status_code == 401
         assert room["secret"] not in response.text
 
-    def test_the_static_bearer_token_is_not_a_valid_url_secret(self, mcp_client, room):
-        """The URL route verifies identities; the config token is not one."""
-        response = _post_rpc(mcp_client, f"/mcp/{room['ns']}/{TOKEN}")
-        assert response.status_code == 401
+    def test_no_challenge_header_is_offered(self, mcp_client, room):
+        """There is no header credential to challenge for."""
+        response = _post_rpc(mcp_client, f"/mcp/{room['ns']}/{'0' * 64}")
+        assert "www-authenticate" not in response.headers
 
-    def test_partial_path_is_not_a_bypass(self, mcp_client, room):
-        """/mcp/{ns} matches neither route."""
-        response = _post_rpc(mcp_client, f"/mcp/{room['ns']}")
-        assert response.status_code != 200
-
-    def test_header_auth_still_works_on_the_bare_path(self, mcp_client):
-        """The identity route is additive; /mcp keeps its own auth."""
-        response = mcp_client.post(
-            "/mcp",
-            headers=MCP_HEADERS,
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-            follow_redirects=False,
+    def test_an_authorization_header_authenticates_nothing(self, mcp_client, room):
+        """No bearer path exists: a header credential opens no route."""
+        headers = dict(MCP_HEADERS, Authorization=f"Bearer {room['secret']}")
+        assert _post_rpc(mcp_client, "/mcp", headers=headers).status_code == 404
+        assert (
+            _post_rpc(mcp_client, f"/mcp/{room['ns']}/{'0' * 64}", headers=headers).status_code
+            == 401
         )
-        assert response.status_code == 200
 
-    def test_an_inbox_secret_does_not_authenticate_the_bare_path(self, mcp_client, room):
-        response = mcp_client.post(
-            "/mcp",
-            headers=dict(MCP_HEADERS, Authorization=f"Bearer {room['secret']}"),
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-            follow_redirects=False,
-        )
-        assert response.status_code == 401
+    def test_there_is_no_fallback_identity(self):
+        """The actor is per-request only — nothing supplies a default one."""
+        with pytest.raises(LookupError):
+            mcp_server._actor.get()
 
-    def test_rejected_url_secret_is_counted(self, mcp_client, room, monkeypatch):
+    def test_rejected_secret_is_counted(self, mcp_client, room, monkeypatch):
         from tests.test_instrument import RecordingSink
 
         recorder = RecordingSink()
@@ -319,11 +222,47 @@ class TestIdentityUrlRoute:
         _post_rpc(mcp_client, f"/mcp/{room['ns']}/{'0' * 64}")
         assert any(c[1] == "mcp.auth.rejected" for c in recorder.of_type("counter"))
 
+
+class TestIdentityScope:
+    """Each connection acts as the identity in its own URL, and only that one."""
+
+    def test_each_url_sees_only_its_own_rooms(self, mcp_client, room, second_identity):
+        alice = _call_tool(mcp_client, identity_path(room), "list_rooms")
+        assert [r["room_id"] for r in alice["rooms"]] == [room["room_id"]]
+
+        bob = _call_tool(mcp_client, identity_path(second_identity), "list_rooms")
+        assert [r["room_id"] for r in bob["rooms"]] == [second_identity["room_id"]]
+        assert bob["rooms"][0]["display_name"] == "Bob Room"
+
     def test_the_actor_does_not_leak_between_requests(self, mcp_client, room, second_identity):
-        """A URL-authenticated request must not re-point the bearer route."""
-        _call_tool_at(mcp_client, identity_path(second_identity), "list_rooms")
-        _, config_rooms = _call_tool(mcp_client, "list_rooms")
-        assert [r["room_id"] for r in config_rooms["rooms"]] == [room["room_id"]]
+        """One request's identity must not carry into the next one's."""
+        _call_tool(mcp_client, identity_path(second_identity), "list_rooms")
+        alice = _call_tool(mcp_client, identity_path(room), "list_rooms")
+        assert [r["room_id"] for r in alice["rooms"]] == [room["room_id"]]
+
+    def test_messages_are_attributed_to_the_url_identity(self, mcp_client, room, second_identity):
+        path = identity_path(second_identity)
+        sent = _call_tool(
+            mcp_client,
+            path,
+            "send_message",
+            {"room_id": second_identity["room_id"], "body": "bob was here"},
+        )
+        assert sent["mid"]
+
+        read = _call_tool(mcp_client, path, "read_room", {"room_id": second_identity["room_id"]})
+        assert [m["body"] for m in read["messages"]] == ["bob was here"]
+        assert read["messages"][0]["from_id"] == second_identity["identity_id"]
+        assert read["messages"][0]["from_id"] != room["identity_id"]
+
+    def test_url_identity_cannot_reach_a_room_it_is_not_in(self, mcp_client, room, second_identity):
+        result, _ = _call_tool_raw(
+            mcp_client,
+            identity_path(second_identity),
+            "read_room",
+            {"room_id": room["room_id"]},
+        )
+        assert result["isError"] is True
 
 
 class TestPathRedaction:
@@ -347,54 +286,26 @@ class TestPathRedaction:
     def test_access_log_never_carries_the_secret(self, room, capsys):
         """The access-log middleware redacts whether or not the route matched."""
         with TestClient(deaddrop_app) as client:
-            client.post(
-                identity_path(room), headers=NO_AUTH_HEADERS, json={}, follow_redirects=False
-            )
+            client.post(identity_path(room), headers=MCP_HEADERS, json={}, follow_redirects=False)
         logged = capsys.readouterr().out
         assert f"/mcp/{room['ns']}/<redacted>" in logged
         assert room["secret"] not in logged
 
 
-class TestAuth:
-    def test_missing_token_is_401(self, mcp_client):
-        response = mcp_client.post(
-            "/mcp",
-            headers={k: v for k, v in MCP_HEADERS.items() if k != "Authorization"},
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-        )
-        assert response.status_code == 401
-        assert "Bearer" in response.headers["www-authenticate"]
-
-    def test_wrong_token_is_401(self, mcp_client):
-        headers = dict(MCP_HEADERS, Authorization="Bearer nope")
-        response = mcp_client.post(
-            "/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-        )
-        assert response.status_code == 401
-
-    def test_bare_token_without_scheme_is_401(self, mcp_client):
-        """Claude sends the header value verbatim; 'Bearer ' is part of it."""
-        headers = dict(MCP_HEADERS, Authorization=TOKEN)
-        response = mcp_client.post(
-            "/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-        )
-        assert response.status_code == 401
-
-
 class TestToolListing:
-    def test_lists_three_tools(self, mcp_client):
-        tools = _rpc(mcp_client, "tools/list")["result"]["tools"]
+    def test_lists_three_tools(self, mcp_client, mcp_path):
+        tools = _rpc(mcp_client, mcp_path, "tools/list")["tools"]
         assert {t["name"] for t in tools} == {"list_rooms", "read_room", "send_message"}
 
-    def test_every_tool_declares_both_required_hints(self, mcp_client):
+    def test_every_tool_declares_both_required_hints(self, mcp_client, mcp_path):
         """claude.ai requires readOnlyHint and destructiveHint on every tool."""
-        for tool in _rpc(mcp_client, "tools/list")["result"]["tools"]:
+        for tool in _rpc(mcp_client, mcp_path, "tools/list")["tools"]:
             annotations = tool["annotations"]
             assert "readOnlyHint" in annotations
             assert "destructiveHint" in annotations
 
-    def test_read_tools_are_read_only_and_send_is_not(self, mcp_client):
-        by_name = {t["name"]: t for t in _rpc(mcp_client, "tools/list")["result"]["tools"]}
+    def test_read_tools_are_read_only_and_send_is_not(self, mcp_client, mcp_path):
+        by_name = {t["name"]: t for t in _rpc(mcp_client, mcp_path, "tools/list")["tools"]}
         assert by_name["list_rooms"]["annotations"]["readOnlyHint"] is True
         assert by_name["read_room"]["annotations"]["readOnlyHint"] is True
         assert by_name["send_message"]["annotations"]["readOnlyHint"] is False
@@ -402,65 +313,75 @@ class TestToolListing:
 
 
 class TestTools:
-    def test_list_rooms(self, mcp_client, room):
-        _, payload = _call_tool(mcp_client, "list_rooms")
+    def test_list_rooms(self, mcp_client, mcp_path, room):
+        payload = _call_tool(mcp_client, mcp_path, "list_rooms")
         assert [r["room_id"] for r in payload["rooms"]] == [room["room_id"]]
         assert payload["rooms"][0]["display_name"] == "MCP Room"
 
-    def test_send_then_read(self, mcp_client, room):
-        _, sent = _call_tool(
-            mcp_client, "send_message", {"room_id": room["room_id"], "body": "hello from claude"}
+    def test_send_then_read(self, mcp_client, mcp_path, room):
+        sent = _call_tool(
+            mcp_client, mcp_path, "send_message", {"room_id": room["room_id"], "body": "hello"}
         )
         assert sent["mid"]
         assert sent["deduplicated"] is False
 
-        _, read = _call_tool(mcp_client, "read_room", {"room_id": room["room_id"]})
+        read = _call_tool(mcp_client, mcp_path, "read_room", {"room_id": room["room_id"]})
         assert read["room_id"] == room["room_id"]
-        assert [m["body"] for m in read["messages"]] == ["hello from claude"]
+        assert [m["body"] for m in read["messages"]] == ["hello"]
         assert read["messages"][0]["from_id"] == room["identity_id"]
         assert read["messages"][0]["content_type"] == "text/markdown"
 
-    def test_read_room_after_cursor(self, mcp_client, room):
-        _, first = _call_tool(
-            mcp_client, "send_message", {"room_id": room["room_id"], "body": "first"}
+    def test_read_room_after_cursor(self, mcp_client, mcp_path, room):
+        first = _call_tool(
+            mcp_client, mcp_path, "send_message", {"room_id": room["room_id"], "body": "first"}
         )
-        _call_tool(mcp_client, "send_message", {"room_id": room["room_id"], "body": "second"})
+        _call_tool(
+            mcp_client, mcp_path, "send_message", {"room_id": room["room_id"], "body": "second"}
+        )
 
-        _, read = _call_tool(
-            mcp_client, "read_room", {"room_id": room["room_id"], "after": first["mid"]}
+        read = _call_tool(
+            mcp_client, mcp_path, "read_room", {"room_id": room["room_id"], "after": first["mid"]}
         )
         assert [m["body"] for m in read["messages"]] == ["second"]
 
-    def test_read_room_rejects_non_v7_cursor(self, mcp_client, room):
+    def test_read_room_rejects_non_v7_cursor(self, mcp_client, mcp_path, room):
         """A v4 cursor must not silently degrade to 'latest messages'."""
-        _call_tool(mcp_client, "send_message", {"room_id": room["room_id"], "body": "only"})
-        result, _ = _call_tool(
+        _call_tool(
+            mcp_client, mcp_path, "send_message", {"room_id": room["room_id"], "body": "only"}
+        )
+        result, _ = _call_tool_raw(
             mcp_client,
+            mcp_path,
             "read_room",
             {"room_id": room["room_id"], "after": "1e141d46-0000-4000-8000-000000000000"},
         )
         assert result["isError"] is True
         assert "UUID v7" in result["content"][0]["text"]
 
-    def test_read_room_limit_is_capped(self, mcp_client, room):
-        _, read = _call_tool(mcp_client, "read_room", {"room_id": room["room_id"], "limit": 99999})
+    def test_read_room_limit_is_capped(self, mcp_client, mcp_path, room):
+        read = _call_tool(
+            mcp_client, mcp_path, "read_room", {"room_id": room["room_id"], "limit": 99999}
+        )
         assert read["messages"] == []
 
-    def test_send_to_foreign_room_is_tool_error(self, mcp_client):
-        result, _ = _call_tool(
+    def test_send_to_foreign_room_is_tool_error(self, mcp_client, mcp_path):
+        result, _ = _call_tool_raw(
             mcp_client,
+            mcp_path,
             "send_message",
             {"room_id": "0198e39d-5b8b-76f4-8000-87645fce0630", "body": "nope"},
         )
         assert result["isError"] is True
 
-    def test_missing_required_argument_is_tool_error(self, mcp_client, room):
-        result, _ = _call_tool(mcp_client, "send_message", {"room_id": room["room_id"]})
+    def test_missing_required_argument_is_tool_error(self, mcp_client, mcp_path, room):
+        result, _ = _call_tool_raw(
+            mcp_client, mcp_path, "send_message", {"room_id": room["room_id"]}
+        )
         assert result["isError"] is True
         assert "body" in result["content"][0]["text"]
 
-    def test_unknown_tool_is_error(self, mcp_client):
-        result, _ = _call_tool(mcp_client, "delete_everything")
+    def test_unknown_tool_is_error(self, mcp_client, mcp_path):
+        result, _ = _call_tool_raw(mcp_client, mcp_path, "delete_everything")
         assert result["isError"] is True
 
 
@@ -475,27 +396,28 @@ class TestInstrumentation:
         monkeypatch.setattr(mcp_server.instrument, "sink", recorder)
         return recorder
 
-    def test_successful_call_emits_timing_and_counter(self, mcp_client, sink):
-        _call_tool(mcp_client, "list_rooms")
+    def test_successful_call_emits_timing_and_counter(self, mcp_client, mcp_path, sink):
+        _call_tool(mcp_client, mcp_path, "list_rooms")
         assert ("mcp.tool.calls", {"tool": "list_rooms", "outcome": "ok"}) in [
             (c[1], c[3]) for c in sink.of_type("counter")
         ]
         timings = [c for c in sink.of_type("timing") if c[1] == "mcp.tool.duration_ms"]
         assert timings and timings[0][3] == {"tool": "list_rooms", "outcome": "ok"}
 
-    def test_failed_call_records_the_outcome(self, mcp_client, room):
+    def test_failed_call_records_the_outcome(self, mcp_client, mcp_path, room):
         from tests.test_instrument import RecordingSink
 
         recorder = RecordingSink()
         original = mcp_server.instrument.sink
         mcp_server.instrument.sink = recorder
         try:
-            _call_tool(
+            _call_tool_raw(
                 mcp_client,
+                mcp_path,
                 "read_room",
                 {"room_id": room["room_id"], "after": "1e141d46-0000-4000-8000-000000000000"},
             )
-            _call_tool(mcp_client, "send_message", {"room_id": "nope", "body": "x"})
+            _call_tool_raw(mcp_client, mcp_path, "send_message", {"room_id": "nope", "body": "x"})
         finally:
             mcp_server.instrument.sink = original
 
@@ -504,11 +426,3 @@ class TestInstrumentation:
         }
         assert "bad_argument" in outcomes
         assert any(o.startswith("http_") for o in outcomes)
-
-    def test_rejected_auth_is_counted(self, mcp_client, sink):
-        mcp_client.post(
-            "/mcp",
-            headers=dict(MCP_HEADERS, Authorization="Bearer wrong"),
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-        )
-        assert any(c[1] == "mcp.auth.rejected" for c in sink.of_type("counter"))

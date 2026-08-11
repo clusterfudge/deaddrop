@@ -2977,8 +2977,7 @@ def get_debug_db(
     return db.get_db_debug_state()
 
 
-# Mount the MCP endpoint last so no route pattern shadows /mcp. Registration
-# is a no-op unless DEADROP_MCP_TOKEN/NS/SECRET are all set.
+# Mount the MCP endpoint last so no route pattern shadows /mcp/{ns}/{secret}.
 from .mcp_server import register as _register_mcp  # noqa: E402
 
 _register_mcp(app)
