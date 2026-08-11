@@ -15,6 +15,7 @@ dependencies = [
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
     "structlog>=25.5.0",
+    "mcp>=2.0",
 ]
 
 [project.optional-dependencies]

@@ -149,7 +149,12 @@ async def lifespan(app: FastAPI):
             "— Web Push will stay off"
         )
 
-    yield
+    # The MCP session manager owns a task group, so it has to be entered on
+    # the running loop rather than at import time.
+    from .mcp_server import session_lifespan
+
+    async with session_lifespan(app):
+        yield
 
     # Cancel any armed notification timers before the loop goes away
     from .notifier import shutdown_watcher
@@ -269,6 +274,8 @@ async def add_timing_middleware(request: Request, call_next):
         endpoint = "admin"
     elif path in ("/health", "/metrics"):
         endpoint = path[1:]
+    elif path == "/mcp" or path.startswith("/mcp/"):
+        endpoint = f"mcp.{method}"
     else:
         endpoint = "other"
 
@@ -2961,3 +2968,10 @@ def get_debug_db(
     from . import db
 
     return db.get_db_debug_state()
+
+
+# Mount the MCP endpoint last so no route pattern shadows /mcp. Registration
+# is a no-op unless DEADROP_MCP_TOKEN/NS/SECRET are all set.
+from .mcp_server import register as _register_mcp  # noqa: E402
+
+_register_mcp(app)
