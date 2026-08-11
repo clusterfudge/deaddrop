@@ -4,7 +4,9 @@ deaddrop can expose its rooms as [Model Context Protocol](https://modelcontextpr
 tools, so an MCP client — Claude's remote custom connectors, the MCP
 Inspector, anything speaking Streamable HTTP — can read and post messages.
 
-The endpoint is `POST /mcp`. It is **off unless configured**.
+The endpoint is `POST /mcp`, with `POST /mcp/{ns}/{secret}` as a second
+entrance for clients that cannot set a request header. Both are **off unless
+configured**.
 
 ## Configuration
 
@@ -14,8 +16,9 @@ The endpoint is `POST /mcp`. It is **off unless configured**.
 | `DEADROP_MCP_NS` | Namespace the tools operate in. |
 | `DEADROP_MCP_SECRET` | Inbox secret of the identity the tools act as. |
 
-All three are required; with any of them missing the route is never
-registered. Give the connector its **own identity** rather than reusing a
+All three are required; with any of them missing neither route is
+registered — including the URL identity route, which needs no config of its own
+but stays behind the same "off unless configured" switch. Give the connector its **own identity** rather than reusing a
 human's or an agent's — every message it sends is attributed to that identity,
 and it can only see rooms that identity is a member of.
 
@@ -55,7 +58,38 @@ mismatch returns `401` with `WWW-Authenticate: Bearer realm="deaddrop-mcp"`.
 For Claude this is the `static_headers` auth type: enter the header value
 **including the scheme** — `Bearer your-token` — because Claude sends the value
 verbatim. Note that request-header auth is a gradual-rollout beta; an account
-without it needs an OAuth-based server instead.
+without it can use the URL identity route below instead.
+
+### URL identity
+
+`POST /mcp/{ns}/{secret}` authenticates with an ordinary inbox secret in the
+URL. The pair is verified against the `identities` table the same hashed way an
+`X-Inbox-Secret` header is, and the session then acts as **that** identity —
+its namespace, its rooms, its display name — rather than the one in
+`DEADROP_MCP_SECRET`. A new connection is therefore a new identity, not a
+config change:
+
+```bash
+deadrop identity create {ns} --name "claude.ai (sean)"   # note the secret
+# add it to the rooms it should reach, then paste this as the connector URL:
+#   https://your-host/mcp/{ns}/{secret}
+```
+
+Every rejection is the same `401` with the body `{"error": "unauthorized"}` and
+no `WWW-Authenticate` challenge: an unknown namespace, a secret from a
+different namespace, and a malformed secret are indistinguishable to the
+caller, and none of them are echoed back.
+
+The tradeoff is exposure: a credential in a URL travels wherever the URL
+travels. deaddrop's own access log redacts the secret segment
+(`path=/mcp/{ns}/<redacted>`) and its request metrics are labelled per-route
+(`mcp.POST`) rather than per-path, but anything else on the wire — a
+TLS-terminating proxy's access log, browser history, a pasted screenshot, a
+shared bookmark — sees the secret in full, and an inbox secret is a full
+credential for that identity everywhere else in the API too. So give a
+URL-identity connector its own identity, add it only to the rooms it needs,
+rotate it by deleting the identity, and prefer header auth or OAuth where the
+client supports them.
 
 ## Verifying a deployment
 
@@ -68,11 +102,18 @@ curl -si -X POST https://your-host/mcp \
 
 # expect the three tools
 npx @modelcontextprotocol/inspector   # or any MCP client, with the bearer token
+
+# expect 401 (unknown identity), then 200 for a real ns/secret pair
+curl -si -X POST https://your-host/mcp/{ns}/0000000000000000 \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -1
 ```
 
 ## Metrics
 
 `mcp.tool.calls` and `mcp.tool.duration_ms`, tagged `tool` and `outcome`
 (`ok`, `bad_argument`, `http_<status>`, `unknown_tool`, `exception`), plus
-`mcp.auth.rejected` for a failed bearer check. Request timings land under the
-`mcp.POST` endpoint label.
+`mcp.auth.rejected` for a failed credential check on either route. Request
+timings land under the `mcp.POST` endpoint label — static per route, so a URL
+secret never becomes a metric label.

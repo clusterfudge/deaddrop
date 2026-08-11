@@ -3,6 +3,7 @@
 import json
 from contextlib import asynccontextmanager
 
+import mcp.types as types
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -16,6 +17,12 @@ MCP_HEADERS = {
     "Accept": "application/json, text/event-stream",
     "Authorization": f"Bearer {TOKEN}",
 }
+# The identity route carries the credential in the path, so no auth header.
+NO_AUTH_HEADERS = {k: v for k, v in MCP_HEADERS.items() if k != "Authorization"}
+
+
+def identity_path(identity) -> str:
+    return f"/mcp/{identity['ns']}/{identity['secret']}"
 
 
 @pytest.fixture
@@ -40,6 +47,7 @@ def room(admin_headers):
         ).json()
     return {
         "ns": ns["ns"],
+        "ns_secret": ns["secret"],
         "secret": alice["secret"],
         "identity_id": alice["id"],
         "room_id": created["room_id"],
@@ -63,6 +71,67 @@ def mcp_client(room, monkeypatch):
 
     with TestClient(host) as client:
         yield client
+
+
+@pytest.fixture
+def second_identity(room, admin_headers):
+    """A second identity in the same namespace, with a room of its own."""
+    with TestClient(deaddrop_app) as client:
+        bob = client.post(
+            f"/{room['ns']}/identities",
+            headers={"X-Namespace-Secret": room["ns_secret"]},
+            json={"metadata": {"display_name": "Bob"}},
+        ).json()
+        created = client.post(
+            f"/{room['ns']}/rooms",
+            headers={"X-Inbox-Secret": bob["secret"]},
+            json={"display_name": "Bob Room"},
+        ).json()
+    return {
+        "ns": room["ns"],
+        "secret": bob["secret"],
+        "identity_id": bob["id"],
+        "room_id": created["room_id"],
+    }
+
+
+@pytest.fixture
+def other_ns(admin_headers):
+    """A second namespace, which the first namespace's secrets must not open."""
+    with TestClient(deaddrop_app) as client:
+        return client.post("/admin/namespaces", headers=admin_headers).json()["ns"]
+
+
+def _post_rpc(client, path, method="tools/list"):
+    return client.post(
+        path,
+        headers=NO_AUTH_HEADERS,
+        json={"jsonrpc": "2.0", "id": 1, "method": method},
+        follow_redirects=False,
+    )
+
+
+def _rpc_at(client, path, method, params=None):
+    body = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params is not None:
+        body["params"] = params
+    response = client.post(path, headers=NO_AUTH_HEADERS, json=body, follow_redirects=False)
+    assert response.status_code == 200, response.text
+    return response.json()["result"]
+
+
+def _call_tool_raw(client, path, name, arguments=None):
+    result = _rpc_at(client, path, "tools/call", {"name": name, "arguments": arguments or {}})
+    payload = None
+    if not result.get("isError"):
+        payload = json.loads(result["content"][0]["text"])
+    return result, payload
+
+
+def _call_tool_at(client, path, name, arguments=None):
+    result, payload = _call_tool_raw(client, path, name, arguments)
+    assert not result.get("isError"), result["content"][0]["text"]
+    return payload
 
 
 def _rpc(client, method, params=None, request_id=1):
@@ -107,7 +176,7 @@ class TestConfig:
             monkeypatch.delenv(var, raising=False)
         host = FastAPI()
         assert mcp_server.register(host) is False
-        assert not any(getattr(r, "path", None) == "/mcp" for r in host.routes)
+        assert not any(getattr(r, "path", "").startswith("/mcp") for r in host.routes)
 
 
 class TestRouting:
@@ -129,6 +198,161 @@ class TestRouting:
             follow_redirects=False,
         )
         assert response.status_code == 401
+
+
+class TestIdentityUrlRoute:
+    """POST /mcp/{ns}/{secret} — for clients that cannot set a request header."""
+
+    def test_correct_secret_completes_the_initialize_handshake(self, mcp_client, room):
+        response = mcp_client.post(
+            identity_path(room),
+            headers=NO_AUTH_HEADERS,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": types.LATEST_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "url-secret-client", "version": "1.0"},
+                },
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["result"]["serverInfo"]["name"] == "deaddrop"
+
+    def test_tools_are_listed_through_the_identity_route(self, mcp_client, room):
+        result = _rpc_at(mcp_client, identity_path(room), "tools/list")
+        assert {t["name"] for t in result["tools"]} == {
+            "list_rooms",
+            "read_room",
+            "send_message",
+        }
+
+    def test_session_acts_as_the_url_identity_not_the_configured_one(
+        self, mcp_client, room, second_identity
+    ):
+        """Bob's URL sees Bob's rooms, not the config-pinned identity's."""
+        _, config_rooms = _call_tool(mcp_client, "list_rooms")
+        assert [r["room_id"] for r in config_rooms["rooms"]] == [room["room_id"]]
+
+        payload = _call_tool_at(mcp_client, identity_path(second_identity), "list_rooms")
+        assert [r["room_id"] for r in payload["rooms"]] == [second_identity["room_id"]]
+        assert payload["rooms"][0]["display_name"] == "Bob Room"
+
+    def test_messages_are_attributed_to_the_url_identity(self, mcp_client, room, second_identity):
+        path = identity_path(second_identity)
+        sent = _call_tool_at(
+            mcp_client,
+            path,
+            "send_message",
+            {"room_id": second_identity["room_id"], "body": "bob was here"},
+        )
+        assert sent["mid"]
+
+        read = _call_tool_at(mcp_client, path, "read_room", {"room_id": second_identity["room_id"]})
+        assert [m["body"] for m in read["messages"]] == ["bob was here"]
+        assert read["messages"][0]["from_id"] == second_identity["identity_id"]
+        assert read["messages"][0]["from_id"] != room["identity_id"]
+
+    def test_url_identity_cannot_reach_a_room_it_is_not_in(self, mcp_client, room, second_identity):
+        result, _ = _call_tool_raw(
+            mcp_client,
+            identity_path(second_identity),
+            "read_room",
+            {"room_id": room["room_id"]},
+        )
+        assert result["isError"] is True
+
+    def test_wrong_secret_is_401_and_reflects_nothing(self, mcp_client, room):
+        wrong = "0" * 64
+        response = _post_rpc(mcp_client, f"/mcp/{room['ns']}/{wrong}")
+        assert response.status_code == 401
+        assert response.json() == {"error": "unauthorized"}
+        assert wrong not in response.text
+
+    def test_real_secret_in_the_wrong_namespace_is_401(self, mcp_client, room, other_ns):
+        response = _post_rpc(mcp_client, f"/mcp/{other_ns}/{room['secret']}")
+        assert response.status_code == 401
+        assert room["secret"] not in response.text
+
+    def test_unknown_namespace_is_401(self, mcp_client, room):
+        response = _post_rpc(mcp_client, f"/mcp/deadbeefdeadbeef/{room['secret']}")
+        assert response.status_code == 401
+        assert room["secret"] not in response.text
+
+    def test_the_static_bearer_token_is_not_a_valid_url_secret(self, mcp_client, room):
+        """The URL route verifies identities; the config token is not one."""
+        response = _post_rpc(mcp_client, f"/mcp/{room['ns']}/{TOKEN}")
+        assert response.status_code == 401
+
+    def test_partial_path_is_not_a_bypass(self, mcp_client, room):
+        """/mcp/{ns} matches neither route."""
+        response = _post_rpc(mcp_client, f"/mcp/{room['ns']}")
+        assert response.status_code != 200
+
+    def test_header_auth_still_works_on_the_bare_path(self, mcp_client):
+        """The identity route is additive; /mcp keeps its own auth."""
+        response = mcp_client.post(
+            "/mcp",
+            headers=MCP_HEADERS,
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 200
+
+    def test_an_inbox_secret_does_not_authenticate_the_bare_path(self, mcp_client, room):
+        response = mcp_client.post(
+            "/mcp",
+            headers=dict(MCP_HEADERS, Authorization=f"Bearer {room['secret']}"),
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 401
+
+    def test_rejected_url_secret_is_counted(self, mcp_client, room, monkeypatch):
+        from tests.test_instrument import RecordingSink
+
+        recorder = RecordingSink()
+        monkeypatch.setattr(mcp_server.instrument, "sink", recorder)
+        _post_rpc(mcp_client, f"/mcp/{room['ns']}/{'0' * 64}")
+        assert any(c[1] == "mcp.auth.rejected" for c in recorder.of_type("counter"))
+
+    def test_the_actor_does_not_leak_between_requests(self, mcp_client, room, second_identity):
+        """A URL-authenticated request must not re-point the bearer route."""
+        _call_tool_at(mcp_client, identity_path(second_identity), "list_rooms")
+        _, config_rooms = _call_tool(mcp_client, "list_rooms")
+        assert [r["room_id"] for r in config_rooms["rooms"]] == [room["room_id"]]
+
+
+class TestPathRedaction:
+    """The secret must not survive into a log line."""
+
+    def test_secret_segment_is_redacted_and_the_ns_survives(self):
+        assert mcp_server.redact_path("/mcp/abc123/s3cret") == "/mcp/abc123/<redacted>"
+
+    def test_trailing_segments_are_redacted_too(self):
+        assert mcp_server.redact_path("/mcp/abc123/s3cret/extra") == "/mcp/abc123/<redacted>"
+
+    def test_a_path_with_no_ns_segment_is_redacted_whole(self):
+        assert mcp_server.redact_path("/mcp/s3cret") == "/mcp/<redacted>"
+
+    def test_bare_mcp_path_is_unchanged(self):
+        assert mcp_server.redact_path("/mcp") == "/mcp"
+
+    def test_other_paths_are_unchanged(self):
+        assert mcp_server.redact_path("/abc123/rooms") == "/abc123/rooms"
+
+    def test_access_log_never_carries_the_secret(self, room, capsys):
+        """The access-log middleware redacts whether or not the route matched."""
+        with TestClient(deaddrop_app) as client:
+            client.post(
+                identity_path(room), headers=NO_AUTH_HEADERS, json={}, follow_redirects=False
+            )
+        logged = capsys.readouterr().out
+        assert f"/mcp/{room['ns']}/<redacted>" in logged
+        assert room["secret"] not in logged
 
 
 class TestAuth:

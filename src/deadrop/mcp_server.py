@@ -1,8 +1,10 @@
 """MCP server exposing deaddrop rooms as tools over Streamable HTTP.
 
-Mounted at ``POST /mcp`` by :mod:`deadrop.api` when configured. The transport
-is the reference ``StreamableHTTPSessionManager`` in stateless JSON mode: one
-request in, one JSON-RPC response out, no server-side session state.
+Mounted at ``POST /mcp`` by :mod:`deadrop.api` when configured, with
+``POST /mcp/{ns}/{secret}`` as a second entrance for clients that cannot set an
+``Authorization`` header. The transport is the reference
+``StreamableHTTPSessionManager`` in stateless JSON mode: one request in, one
+JSON-RPC response out, no server-side session state.
 
 Configuration is entirely environment-driven and the server stays unmounted
 unless all three variables are present:
@@ -14,6 +16,11 @@ unless all three variables are present:
 ``DEADROP_MCP_SECRET``
     Inbox secret of the identity the tools act as. Every room read and every
     message sent is attributed to this identity.
+
+On ``/mcp/{ns}/{secret}`` the credential is an ordinary inbox secret, verified
+against the ``identities`` table exactly as an ``X-Inbox-Secret`` header would
+be, and the tools act as *that* identity rather than the configured one. Adding
+a connection is therefore an identity, not a config change.
 
 The tool handlers call the room route functions in :mod:`deadrop.api`
 directly, so membership checks, message dedup, and SSE fanout behave exactly
@@ -28,6 +35,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,11 +50,27 @@ logger = logging.getLogger(__name__)
 
 SERVER_NAME = "deaddrop"
 MCP_PATH = "/mcp"
+MCP_IDENTITY_PATH = f"{MCP_PATH}/{{ns}}/{{secret}}"
+REDACTED_SEGMENT = "<redacted>"
 
 # Ceiling on read_room's limit. The underlying route allows 1000; a connector
 # reply is fed to a model, so cap it well below that.
 MAX_READ_LIMIT = 200
 DEFAULT_READ_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class Actor:
+    """The identity a request's tool calls act as."""
+
+    ns: str
+    secret: str
+
+
+# Set by IdentityAuthASGI for the duration of one request. anyio copies the
+# calling context when the session manager starts its per-request task, so the
+# tool handlers see the value set here.
+_actor: ContextVar[Actor | None] = ContextVar("mcp_actor", default=None)
 
 
 @dataclass(frozen=True)
@@ -56,6 +80,10 @@ class McpConfig:
     token: str
     ns: str
     secret: str
+
+    @property
+    def actor(self) -> Actor:
+        return Actor(ns=self.ns, secret=self.secret)
 
 
 def load_config() -> McpConfig | None:
@@ -148,10 +176,10 @@ def _tools() -> list[types.Tool]:
 # --- Tool implementations ----------------------------------------------
 
 
-async def _list_rooms(cfg: McpConfig) -> dict[str, Any]:
+async def _list_rooms(actor: Actor) -> dict[str, Any]:
     from . import api
 
-    rooms = await api.list_my_rooms(cfg.ns, x_inbox_secret=cfg.secret)
+    rooms = await api.list_my_rooms(actor.ns, x_inbox_secret=actor.secret)
     return {
         "rooms": [
             {
@@ -165,7 +193,7 @@ async def _list_rooms(cfg: McpConfig) -> dict[str, Any]:
     }
 
 
-async def _read_room(cfg: McpConfig, args: dict[str, Any]) -> dict[str, Any]:
+async def _read_room(actor: Actor, args: dict[str, Any]) -> dict[str, Any]:
     from . import api
 
     limit = int(args.get("limit") or DEFAULT_READ_LIMIT)
@@ -185,13 +213,13 @@ async def _read_room(cfg: McpConfig, args: dict[str, Any]) -> dict[str, Any]:
         )
 
     result = await api.get_room_messages(
-        cfg.ns,
+        actor.ns,
         _require_str(args, "room_id"),
         after=after,
         before=None,
         limit=limit,
         exclude_reactions=True,
-        x_inbox_secret=cfg.secret,
+        x_inbox_secret=actor.secret,
     )
     return {
         "room_id": result["room_id"],
@@ -208,17 +236,17 @@ async def _read_room(cfg: McpConfig, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _send_message(cfg: McpConfig, args: dict[str, Any]) -> dict[str, Any]:
+async def _send_message(actor: Actor, args: dict[str, Any]) -> dict[str, Any]:
     from . import api
 
     response = await api.send_room_message(
-        cfg.ns,
+        actor.ns,
         _require_str(args, "room_id"),
         api.SendRoomMessageRequest(
             body=_require_str(args, "body"),
             content_type=args.get("content_type") or "text/markdown",
         ),
-        x_inbox_secret=cfg.secret,
+        x_inbox_secret=actor.secret,
     )
     # send_room_message returns a JSONResponse so it can set Dedup-Status.
     sent = json.loads(bytes(response.body))
@@ -241,7 +269,12 @@ def _require_str(args: dict[str, Any], key: str) -> str:
 
 
 def build_server(cfg: McpConfig) -> Server:
-    """Build the low-level MCP server for a resolved config."""
+    """Build the low-level MCP server for a resolved config.
+
+    ``cfg`` supplies the identity for requests that authenticated with the
+    static bearer token; a request that authenticated with an inbox secret in
+    its URL sets ``_actor`` and the tools act as that identity instead.
+    """
 
     async def on_list_tools(ctx, params) -> types.ListToolsResult:
         return types.ListToolsResult(tools=_tools())
@@ -250,15 +283,16 @@ def build_server(cfg: McpConfig) -> Server:
         from fastapi import HTTPException
 
         args = params.arguments or {}
+        actor = _actor.get() or cfg.actor
         started = time.perf_counter()
         outcome = "ok"
         try:
             if params.name == "list_rooms":
-                payload = await _list_rooms(cfg)
+                payload = await _list_rooms(actor)
             elif params.name == "read_room":
-                payload = await _read_room(cfg, args)
+                payload = await _read_room(actor, args)
             elif params.name == "send_message":
-                payload = await _send_message(cfg, args)
+                payload = await _send_message(actor, args)
             else:
                 outcome = "unknown_tool"
                 return _error(f"Unknown tool: {params.name}")
@@ -305,6 +339,20 @@ def _error(message: str) -> types.CallToolResult:
 # --- ASGI plumbing -----------------------------------------------------
 
 
+async def _send_unauthorized(send, www_authenticate: bytes | None = None) -> None:
+    """Send a fixed 401 body that reflects nothing the caller presented."""
+    instrument.sink.counter("mcp.auth.rejected")
+    body = json.dumps({"error": "unauthorized"}).encode()
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode()),
+    ]
+    if www_authenticate is not None:
+        headers.append((b"www-authenticate", www_authenticate))
+    await send({"type": "http.response.start", "status": 401, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
 class BearerAuthASGI:
     """Gate an ASGI app on a fixed bearer token.
 
@@ -330,23 +378,75 @@ class BearerAuthASGI:
                 break
 
         if not hmac.compare_digest(presented, self._token):
-            instrument.sink.counter("mcp.auth.rejected")
-            body = json.dumps({"error": "unauthorized"}).encode()
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"www-authenticate", b'Bearer realm="deaddrop-mcp"'),
-                        (b"content-length", str(len(body)).encode()),
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
+            await _send_unauthorized(send, b'Bearer realm="deaddrop-mcp"')
             return
 
         await self._app(scope, receive, send)
+
+
+class IdentityAuthASGI:
+    """Gate an ASGI app on an inbox secret carried in the URL path.
+
+    ``{ns}`` and ``{secret}`` are the pair the identity table can verify — the
+    same pair an ``X-Inbox-Secret`` request carries, one in the path and one in
+    a header — so verification goes through :func:`api._require_inbox_secret_any`
+    and inherits its hashed comparison and its identity-hash cache. Requests
+    that get through act as the verified identity.
+
+    Every rejection is the same opaque ``401``: an unknown namespace, a secret
+    that belongs to another namespace, and a malformed secret are
+    indistinguishable to the caller, and none of them are echoed back. No
+    ``WWW-Authenticate``, because there is no header credential to challenge
+    for.
+    """
+
+    def __init__(self, app) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        from fastapi import HTTPException
+
+        from . import api
+
+        params = scope.get("path_params", {})
+        ns = params.get("ns", "")
+        secret = params.get("secret", "")
+        if not isinstance(ns, str) or not isinstance(secret, str):
+            await _send_unauthorized(send)
+            return
+
+        try:
+            await api._require_inbox_secret_any(ns, secret)
+        except HTTPException:
+            await _send_unauthorized(send)
+            return
+
+        token = _actor.set(Actor(ns=ns, secret=secret))
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            _actor.reset(token)
+
+
+def redact_path(path: str) -> str:
+    """Replace the secret segment of a ``/mcp/{ns}/{secret}`` path.
+
+    The namespace survives — it is public and appears in every other logged
+    path — and everything after it becomes a placeholder. A ``/mcp/`` path with
+    no namespace segment is redacted whole, since a client that mangles the URL
+    can put the secret anywhere in it. Any other path is returned unchanged.
+    Call this before a path reaches a log line or a metric label.
+    """
+    if not path.startswith(f"{MCP_PATH}/"):
+        return path
+    segments = path.split("/")
+    if len(segments) < 4:
+        return f"{MCP_PATH}/{REDACTED_SEGMENT}"
+    return "/".join([*segments[:3], REDACTED_SEGMENT])
 
 
 class _StreamableHTTPASGI:
@@ -385,8 +485,13 @@ def register(app) -> bool:
     # the mount point, so a request to the bare /mcp gets a 307 to /mcp/. The
     # connector URL an operator types has no trailing slash, and a redirect on
     # POST is not something to rely on a client honouring.
-    endpoint = BearerAuthASGI(_StreamableHTTPASGI(manager), cfg.token)
-    app.router.routes.append(Route(MCP_PATH, endpoint=endpoint, name="mcp"))
+    transport = _StreamableHTTPASGI(manager)
+    app.router.routes.append(
+        Route(MCP_PATH, endpoint=BearerAuthASGI(transport, cfg.token), name="mcp")
+    )
+    app.router.routes.append(
+        Route(MCP_IDENTITY_PATH, endpoint=IdentityAuthASGI(transport), name="mcp_identity")
+    )
     return True
 
 
@@ -402,6 +507,6 @@ async def session_lifespan(app):
         return
     # Logged here rather than in register(): registration happens at import,
     # before configure_logging() runs in the lifespan.
-    logger.info("MCP endpoint active at %s", MCP_PATH)
+    logger.info("MCP endpoint active at %s and %s", MCP_PATH, MCP_IDENTITY_PATH)
     async with manager.run():
         yield
