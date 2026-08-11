@@ -7,10 +7,16 @@ annotated-types==0.7.0
 anyio==4.12.1
     # via
     #   httpx
+    #   httpx2
+    #   mcp
+    #   sse-starlette
     #   starlette
     #   watchfiles
 attrs==25.4.0
-    # via cyclopts
+    # via
+    #   cyclopts
+    #   jsonschema
+    #   referencing
 certifi==2026.1.4
     # via
     #   httpcore
@@ -20,7 +26,9 @@ cffi==2.0.0
 click==8.3.1
     # via uvicorn
 cryptography==46.0.3
-    # via deaddrop (pyproject.toml)
+    # via
+    #   deaddrop (pyproject.toml)
+    #   pyjwt
 cyclopts==4.5.1
     # via deaddrop (pyproject.toml)
 docstring-parser==0.17.0
@@ -32,67 +40,116 @@ fastapi==0.128.0
 h11==0.16.0
     # via
     #   httpcore
+    #   httpcore2
     #   uvicorn
 httpcore==1.0.9
     # via httpx
+httpcore2==2.10.0
+    # via httpx2
 httptools==0.7.1
     # via uvicorn
 httpx==0.28.1
     # via deaddrop (pyproject.toml)
-idna==3.11
+httpx2==2.10.0
+    # via mcp
+idna==3.18
     # via
     #   anyio
     #   httpx
+    #   httpx2
 jinja2==3.1.6
     # via deaddrop (pyproject.toml)
+jsonschema==4.26.0
+    # via mcp
+jsonschema-specifications==2025.9.1
+    # via jsonschema
 libsql==0.1.11
     # via deaddrop (pyproject.toml)
 markdown-it-py==4.0.0
     # via rich
 markupsafe==3.0.3
     # via jinja2
+mcp==2.0.0
+    # via deaddrop (pyproject.toml)
+mcp-types==2.0.0
+    # via mcp
 mdurl==0.1.2
     # via markdown-it-py
+opentelemetry-api==1.44.0
+    # via mcp
 pycparser==3.0
     # via cffi
 pydantic==2.12.5
-    # via fastapi
+    # via
+    #   fastapi
+    #   mcp
+    #   mcp-types
 pydantic-core==2.41.5
     # via pydantic
 pygments==2.19.2
     # via rich
+pyjwt==2.13.0
+    # via mcp
 python-dotenv==1.2.1
     # via uvicorn
 python-multipart==0.0.22
-    # via deaddrop (pyproject.toml)
+    # via
+    #   deaddrop (pyproject.toml)
+    #   mcp
 pyyaml==6.0.3
     # via
     #   deaddrop (pyproject.toml)
     #   uvicorn
+referencing==0.37.0
+    # via
+    #   jsonschema
+    #   jsonschema-specifications
 rich==14.3.1
     # via
     #   cyclopts
     #   rich-rst
 rich-rst==1.3.2
     # via cyclopts
+rpds-py==2026.6.3
+    # via
+    #   jsonschema
+    #   referencing
+sse-starlette==3.4.8
+    # via mcp
 starlette==0.50.0
-    # via fastapi
+    # via
+    #   fastapi
+    #   mcp
+    #   sse-starlette
 structlog==25.5.0
     # via deaddrop (pyproject.toml)
+truststore==0.10.4
+    # via
+    #   httpcore2
+    #   httpx2
 typing-extensions==4.15.0
     # via
     #   anyio
     #   fastapi
+    #   httpx2
+    #   mcp
+    #   mcp-types
+    #   opentelemetry-api
     #   pydantic
     #   pydantic-core
+    #   referencing
     #   starlette
     #   typing-inspection
 typing-inspection==0.4.2
-    # via pydantic
+    # via
+    #   mcp
+    #   pydantic
 uuid7==0.1.0
     # via deaddrop (pyproject.toml)
 uvicorn==0.40.0
-    # via deaddrop (pyproject.toml)
+    # via
+    #   deaddrop (pyproject.toml)
+    #   mcp
 uvloop==0.22.1
     # via uvicorn
 watchfiles==1.1.1
