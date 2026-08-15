@@ -427,6 +427,7 @@ textarea.form-input {
 /* Compose area */
 .compose-area {
     display: flex;
+    align-items: flex-end;
     gap: 12px;
     padding: 16px 20px;
     background: var(--card-bg);
@@ -441,8 +442,12 @@ textarea.form-input {
     border: 1px solid var(--border-color);
     border-radius: 24px;
     font-size: 1rem;
+    line-height: 1.4;
     resize: none;
-    max-height: 120px;
+    /* 4 lines + vertical padding + borders. JS keeps the height in step with
+       content; this is the ceiling if the script never runs. */
+    max-height: calc(4 * 1.4em + 26px);
+    overflow-y: hidden;
     background: var(--input-bg);
     color: var(--text-color);
 }
