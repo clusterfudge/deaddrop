@@ -1124,6 +1124,37 @@
         list.scrollTop = list.scrollHeight;
     }
     
+    // Composer height tracks content up to MAX_COMPOSER_LINES; past that the
+    // textarea scrolls internally.
+    const MAX_COMPOSER_LINES = 4;
+
+    function autoGrowComposer(el) {
+        if (!el) return;
+
+        // Empty composer: hand the height back to CSS (rows=1). scrollHeight
+        // measures the placeholder, which wraps to two lines on a narrow screen.
+        if (!el.value) {
+            el.style.height = '';
+            el.style.overflowY = 'hidden';
+            return;
+        }
+
+        const cs = getComputedStyle(el);
+        const lineHeight = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.4;
+        const padding = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+        const borders = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+        // Ceil the line box: scrollHeight is an integer, so a fractional
+        // line-height (1.4 * 16px = 22.4px) would otherwise read as overflow at
+        // exactly MAX_COMPOSER_LINES.
+        const maxHeight = Math.ceil(lineHeight * MAX_COMPOSER_LINES) + padding + borders;
+
+        // scrollHeight is content + padding under border-box, so add borders back.
+        el.style.height = 'auto';
+        const contentHeight = el.scrollHeight + borders;
+        el.style.height = Math.min(contentHeight, maxHeight) + 'px';
+        el.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+    }
+
     async function sendMessage() {
         const input = document.getElementById('message-input');
         const body = input.value.trim();
@@ -1132,6 +1163,7 @@
         try {
             await DeadropAPI.sendMessage(credentials, currentPeerId, body);
             input.value = '';
+            autoGrowComposer(input);
             
             const result = await DeadropAPI.getInbox(credentials, { markRead: false });
             messages = result.messages;
@@ -1551,6 +1583,7 @@
         
         // Immediately clear input and disable button
         input.value = '';
+        autoGrowComposer(input);
         pendingAttachments = [];
         renderAttachmentPreview();
         sendBtn.disabled = true;
@@ -1607,6 +1640,7 @@
                 alert('Failed to send: ' + e.message);
                 // Restore the message body and attachments so the user doesn't lose work
                 input.value = body;
+                autoGrowComposer(input);
                 pendingAttachments = savedAttachments;
                 renderAttachmentPreview();
             }
@@ -1877,6 +1911,9 @@
             sendMessage();
         }
     });
+    document.getElementById('message-input').addEventListener('input', (e) => {
+        autoGrowComposer(e.target);
+    });
     
     // Scroll-up to load older messages + scroll-to-bottom to mark as read.
     // Debounced: IntersectionObserver on the sentinel would be ideal, but a
@@ -1924,6 +1961,9 @@
             e.preventDefault();
             sendRoomMessage();
         }
+    });
+    document.getElementById('room-message-input').addEventListener('input', (e) => {
+        autoGrowComposer(e.target);
     });
 
     // Attach button
