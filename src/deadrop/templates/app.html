@@ -817,14 +817,7 @@
         credentials = creds;
 
         if (roomMatch) {
-            openNamespace(slug)
-                .then(() => openRoom(roomMatch[2], true))
-                .then((opened) => {
-                    if (!opened) {
-                        currentRoomId = null;
-                        openNamespace(slug);
-                    }
-                });
+            openNamespace(slug).then(() => openRoom(roomMatch[2], true));
         } else if (peerMatch && peerMatch[2] !== 'archived' && peerMatch[2] !== 'settings') {
             openNamespace(slug).then(() => openConversation(peerMatch[2]));
         } else {
@@ -1198,10 +1191,16 @@
     
     // ==================== ROOMS ====================
     
+    /**
+     * Open a room, publishing its URL only once the room is known to resolve.
+     * The view switches immediately so the load feels instant, but the history
+     * entry is written after validation: a reload before that point resolves to
+     * the previous route rather than a room that 404s. A room that fails
+     * validation drops back to the namespace inbox and returns false.
+     */
     async function openRoom(roomId, silent = false) {
         currentRoomId = roomId;
-        navigate(`/app/${currentSlug}/room/${roomId}`);
-        
+
         // Show room view immediately with loading state
         showView('roomChat');
         document.getElementById('room-message-list').innerHTML =
@@ -1214,7 +1213,9 @@
                 DeadropAPI.listRoomMembers(credentials, roomId),
                 loadRoomMessages(),  // runs concurrently — populates roomMessages
             ]);
-            
+
+            navigate(`/app/${currentSlug}/room/${roomId}`);
+
             document.getElementById('room-chat-title').textContent = roomDetails.display_name || 'Room';
             
             // Build member map for name lookups
@@ -1232,6 +1233,8 @@
             return true;
             
         } catch (e) {
+            currentRoomId = null;
+            if (currentSlug) await openNamespace(currentSlug);
             if (!silent) alert('Failed to open room: ' + e.message);
             return false;
         }
