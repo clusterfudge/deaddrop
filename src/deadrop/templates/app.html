@@ -111,6 +111,7 @@
         
         <div id="room-message-list" class="message-list"></div>
         
+        <div id="room-reply-preview" class="reply-preview hidden"></div>
         <div id="room-attachment-preview" class="attachment-preview hidden"></div>
         <div class="compose-area">
             <button id="room-attach-btn" class="btn btn-icon" title="Attach image">📎</button>
@@ -1444,7 +1445,96 @@
                 >${emoji}<span class="reaction-count">${senders.size > 1 ? ' ' + senders.size : ''}</span></button>`;
         }).join('') : '';
         
-        return `<div class="reaction-badges">${badges}<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button></div>`;
+        return `<div class="reaction-badges">${badges}<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button><button class="reaction-badge reply-action" onclick="startReply('${mid}')" title="Reply" aria-label="Reply to this message">↩</button></div>`;
+    }
+
+    // ==================== REPLY ====================
+
+    // mid of the message the composer is replying to, or null.
+    let replyTarget = null;
+
+    const REPLY_SNIPPET_MAX = 80;
+
+    /**
+     * One-line preview of a message, for a quote block or the compose banner.
+     * Inline markdown markers are stripped rather than rendered: a quote is
+     * chrome, so it needs one line of plain text, not a markdown subtree —
+     * but it must not show `**bold**` as literal asterisks either.
+     */
+    function replySnippet(msg) {
+        const text = (msg.body || '')
+            .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')   // links → link text
+            .replace(/[*_`~#>]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (text) {
+            return text.length > REPLY_SNIPPET_MAX
+                ? text.slice(0, REPLY_SNIPPET_MAX - 1) + '…'
+                : text;
+        }
+        return msg.attachments && msg.attachments.length ? '📎 Attachment' : '…';
+    }
+
+    function findRoomMessage(mid) {
+        return roomMessages.find(m => m.mid === mid) || null;
+    }
+
+    /**
+     * Quote block shown above a reply's body. Rendered from a lookup of
+     * reference_mid in the loaded page, so a reply whose target is not loaded
+     * degrades to a plain message rather than an empty quote.
+     */
+    function renderReplyQuote(msg) {
+        if (!msg.reference_mid || msg.content_type === 'reaction') return '';
+        const target = findRoomMessage(msg.reference_mid);
+        if (!target) return '';
+        return `<button class="reply-quote" onclick="scrollToMessage('${target.mid}')"
+                        title="Go to the replied-to message">
+                    <span class="reply-quote-author">${escapeHtml(getMemberName(target.from_id))}</span>
+                    <span class="reply-quote-body">${escapeHtml(replySnippet(target))}</span>
+                </button>`;
+    }
+
+    function startReply(mid) {
+        if (!findRoomMessage(mid)) return;
+        replyTarget = mid;
+        renderReplyPreview();
+        const input = document.getElementById('room-message-input');
+        if (input) input.focus();
+    }
+
+    function cancelReply() {
+        replyTarget = null;
+        renderReplyPreview();
+    }
+
+    function renderReplyPreview() {
+        const preview = document.getElementById('room-reply-preview');
+        if (!preview) return;
+        const target = replyTarget ? findRoomMessage(replyTarget) : null;
+        if (!target) {
+            preview.classList.add('hidden');
+            preview.innerHTML = '';
+            return;
+        }
+        preview.classList.remove('hidden');
+        preview.innerHTML = `
+            <div class="reply-preview-quote">
+                <span class="reply-quote-author">Replying to ${escapeHtml(getMemberName(target.from_id))}</span>
+                <span class="reply-quote-body">${escapeHtml(replySnippet(target))}</span>
+            </div>
+            <button class="reply-preview-cancel" onclick="cancelReply()" title="Cancel reply" aria-label="Cancel reply">✕</button>`;
+    }
+
+    function scrollToMessage(mid) {
+        const el = document.querySelector(`.room-message[data-mid="${mid}"]`);
+        if (!el) return;
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.remove('reply-target-flash');
+        // Reflow between remove and add so a repeat tap restarts the animation.
+        void el.offsetWidth;
+        el.classList.add('reply-target-flash');
+        setTimeout(() => el.classList.remove('reply-target-flash'), 1600);
     }
     
     /**
@@ -1459,6 +1549,7 @@
         el.dataset.mid = msg.mid;
         el.innerHTML = `
             <div class="sender-name">${getMemberName(msg.from_id)}</div>
+            ${renderReplyQuote(msg)}
             <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
             ${renderAttachments(msg)}
             ${renderReactionBadges(msg.mid, reactionMap)}
@@ -1580,12 +1671,14 @@
 
         // Snapshot attachments before clearing so we can restore them on send failure
         const savedAttachments = pendingAttachments.map(a => ({ ...a }));
+        const replyTo = replyTarget;
         
         // Immediately clear input and disable button
         input.value = '';
         autoGrowComposer(input);
         pendingAttachments = [];
         renderAttachmentPreview();
+        cancelReply();
         sendBtn.disabled = true;
         sendBtn.textContent = 'Sending...';
         
@@ -1595,6 +1688,7 @@
             mid: _generateUUID7(),
             from_id: credentials.id,
             body: body || (hasAttachments ? '📎' : ''),
+            reference_mid: replyTo,
             created_at: new Date().toISOString(),
             pending: true
         };
@@ -1606,7 +1700,7 @@
         try {
             const result = await DeadropAPI.sendRoomMessage(
                 credentials, currentRoomId, body || '📎',
-                'text/markdown', null, attachmentsToSend
+                'text/markdown', replyTo, attachmentsToSend
             );
             const elapsed = Math.round(performance.now() - startTime);
             console.log(`Room message sent in ${elapsed}ms`);
@@ -1643,6 +1737,8 @@
                 autoGrowComposer(input);
                 pendingAttachments = savedAttachments;
                 renderAttachmentPreview();
+                replyTarget = replyTo;
+                renderReplyPreview();
             }
         } finally {
             sendBtn.disabled = false;
