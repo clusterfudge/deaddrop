@@ -366,6 +366,62 @@ for msg in regular:
 - **Real-time** — reactions arrive via the same subscription channel as regular messages
 - The web client supports six emoji reactions: 👍 ❤️ 😂 🎉 👀 🙏
 
+## Replies
+
+A reply is an ordinary room message that carries `reference_mid` pointing at
+the message it answers. It keeps its own `content_type` (`text/markdown` from
+the web client), so a client that knows nothing about replies renders the body
+as it would any other message.
+
+```bash
+POST /{ns}/rooms/{room_id}/messages
+{
+  "body": "Agreed — shipping it Monday.",
+  "content_type": "text/markdown",
+  "reference_mid": "target_message_mid"
+}
+```
+
+### Message Format
+
+| Field | Value |
+|-------|-------|
+| `body` | The reply text, and nothing else — no quoted prefix |
+| `content_type` | Unchanged (`text/plain`, `text/markdown`, …) |
+| `reference_mid` | Message ID of the message being replied to |
+
+### Reading Replies
+
+```python
+messages = client.get_room_messages(ns["ns"], room["room_id"], secret)
+by_mid = {m["mid"]: m for m in messages}
+
+for msg in messages:
+    if msg["content_type"] == "reaction":
+        continue
+    target = by_mid.get(msg.get("reference_mid"))
+    if target:
+        print(f"  ┌ re: {target['from_id']}: {target['body'][:60]}")
+    print(f"{msg['from_id']}: {msg['body']}")
+```
+
+### Design Notes
+
+- **Flat, not threaded** — a reply references one message; there is no thread
+  id, no nesting, and no ordering change. Replies appear in the room in send
+  order.
+- **The quote is derived, never stored** — `body` holds only the reply text,
+  so a reader that ignores `reference_mid` still sees a sensible message and
+  the quote can never drift from the original.
+- **Unresolvable references degrade** — if the referenced message is not in
+  the page a client has loaded, it renders the reply as a plain message.
+- **No new content_type** — `reference_mid` on a non-reaction message is
+  itself the signal. Introducing `content_type: "reply"` would have made every
+  existing reader treat replies as an unknown type and lose markdown
+  rendering.
+- **Unread counts include replies** — only `content_type: "reaction"` is
+  excluded from unread accounting.
+
 ## Rooms vs 1:1 Messaging
 
 | Feature | 1:1 Messaging | Rooms |
