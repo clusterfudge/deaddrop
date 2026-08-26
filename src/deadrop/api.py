@@ -1616,6 +1616,7 @@ ALLOWED_ATTACHMENT_TYPES = frozenset(
         "image/jpeg",
         "image/gif",
         "image/webp",
+        "image/svg+xml",
         "application/pdf",
         "text/plain",
         "text/csv",
@@ -1641,6 +1642,12 @@ NON_RENDERABLE_ATTACHMENT_TYPES = frozenset(
     }
 )
 DOWNLOAD_SAFE_CONTENT_TYPE = "text/plain; charset=utf-8"
+
+# Applied to every raw attachment download. `sandbox` with no tokens denies
+# script execution, form submission and same-origin access; `default-src 'none'`
+# denies every subresource fetch. Together they make an image/svg+xml payload
+# inert even if a browser renders it as a document instead of downloading it.
+ATTACHMENT_CSP = "sandbox; default-src 'none'"
 
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10MB per attachment
 MAX_ATTACHMENTS_PER_MESSAGE = 10
@@ -2593,6 +2600,8 @@ def _safe_download_headers(filename: str | None, content_type: str) -> tuple[str
     Always forces Content-Disposition: attachment so browsers download rather
     than render. text/html (and any other non-renderable type) is downgraded to
     text/plain on the wire so a pasted .html with <script> cannot execute.
+    Every response carries ATTACHMENT_CSP, which neutralises script in types
+    that keep their real Content-Type (image/svg+xml).
     """
     wire_content_type = content_type
     if content_type in NON_RENDERABLE_ATTACHMENT_TYPES:
@@ -2601,6 +2610,7 @@ def _safe_download_headers(filename: str | None, content_type: str) -> tuple[str
     headers = {
         "Content-Disposition": f'attachment; filename="{safe_name}"',
         "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": ATTACHMENT_CSP,
     }
     return wire_content_type, headers
 

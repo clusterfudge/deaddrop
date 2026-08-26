@@ -88,6 +88,16 @@ def _make_jpeg_b64():
     return base64.b64encode(data).decode()
 
 
+_SVG_PLAIN = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>'
+
+_SVG_MALICIOUS = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">'
+    b"<script>alert(document.cookie)</script>"
+    b'<foreignObject><iframe src="https://evil.example/"></iframe></foreignObject>'
+    b"</svg>"
+)
+
+
 # ---------------------------------------------------------------------------
 # DB-level tests
 # ---------------------------------------------------------------------------
@@ -408,23 +418,26 @@ class TestAttachmentValidation:
         )
         assert resp.status_code == 200
 
-    def test_reject_svg_content_type(self, client, room_setup):
-        """SVG can contain scripts — must be rejected."""
+    def test_accept_svg_content_type(self, client, room_setup):
+        """image/svg+xml is accepted; the download path makes it inert."""
         s = room_setup
         import base64
 
-        svg_b64 = base64.b64encode(b"<svg onload='alert(1)'/>").decode()
+        svg_b64 = base64.b64encode(_SVG_PLAIN).decode()
         resp = client.post(
             f"/{s['ns']}/rooms/{s['room_id']}/messages",
             json={
-                "body": "SVG XSS",
+                "body": "Diagram",
                 "attachments": [
-                    {"filename": "evil.svg", "content_type": "image/svg+xml", "data": svg_b64},
+                    {"filename": "chart.svg", "content_type": "image/svg+xml", "data": svg_b64},
                 ],
             },
             headers={"X-Inbox-Secret": s["alice_secret"]},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 200, resp.text
+        att = resp.json()["attachments"][0]
+        assert att["filename"] == "chart.svg"
+        assert att["content_type"] == "image/svg+xml"
 
     def test_reject_javascript_content_type(self, client, room_setup):
         s = room_setup
@@ -766,3 +779,36 @@ class TestSafeAttachmentDownload:
         assert resp.status_code == 200
         cd = resp.headers["content-disposition"]
         assert "\r" not in cd and "\n" not in cd
+
+    def test_malicious_svg_download_is_inert(self, client, room_setup):
+        """A scripted SVG keeps its real Content-Type but is served with a
+        sandbox CSP, forced download, and nosniff, so nothing in it executes."""
+        s = room_setup
+        att_id = self._upload(client, s, "evil.svg", "image/svg+xml", _SVG_MALICIOUS)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/svg+xml")
+        assert resp.headers["content-security-policy"] == "sandbox; default-src 'none'"
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.content == _SVG_MALICIOUS
+
+    def test_png_download_headers_unchanged(self, client, room_setup):
+        """Regression: PNG keeps its Content-Type and download semantics."""
+        s = room_setup
+        png = base64.b64decode(_make_png_b64())
+        att_id = self._upload(client, s, "shot.png", "image/png", png)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/png")
+        assert resp.headers["content-disposition"] == 'attachment; filename="shot.png"'
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.content == png
