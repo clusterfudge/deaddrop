@@ -1191,6 +1191,12 @@ button:disabled {
     padding: 16px;
     max-width: 800px;
     margin: 0 auto;
+    /* The scroll region inside .view (height: 100vh; overflow: hidden).
+       flex-basis 0 plus min-height 0 keeps the used height at the space the
+       header and tabs leave, instead of the content height. */
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
 }
 
 .panel-status {
