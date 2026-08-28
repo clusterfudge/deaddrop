@@ -122,13 +122,13 @@ class StaticHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def start_static_server():
-    server = http.server.HTTPServer(("127.0.0.1", TEST_HTTP_PORT), StaticHandler)
+def start_static_server(port: int = TEST_HTTP_PORT):
+    server = http.server.HTTPServer(("127.0.0.1", port), StaticHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     for _ in range(50):
         try:
-            s = socket.create_connection(("127.0.0.1", TEST_HTTP_PORT), timeout=0.2)
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
             s.close()
             break
         except (ConnectionRefusedError, OSError):
