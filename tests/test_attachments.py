@@ -812,3 +812,148 @@ class TestSafeAttachmentDownload:
         assert resp.headers["content-disposition"] == 'attachment; filename="shot.png"'
         assert resp.headers["x-content-type-options"] == "nosniff"
         assert resp.content == png
+
+
+class TestAttachmentTypePolicy:
+    """Default-deny policy: any text or media type in, archives/binaries out."""
+
+    def _send(self, client, s, filename, content_type, payload=b"payload"):
+        return client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "attach",
+                "attachments": [
+                    {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "data": base64.b64encode(payload).decode(),
+                    },
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type"),
+        [
+            ("script.py", "text/x-python"),
+            ("run.sh", "text/x-shellscript"),
+            ("style.css", "text/css"),
+            ("subs.vtt", "text/vtt"),
+            ("feed.xml", "text/xml"),
+            ("photo.heic", "image/heic"),
+            ("photo.avif", "image/avif"),
+            ("clip.mp4", "video/mp4"),
+            ("clip.mov", "video/quicktime"),
+            ("voice.m4a", "audio/mp4"),
+            ("voice.mp3", "audio/mpeg"),
+            ("conf.yml", "application/x-yaml"),
+        ],
+    )
+    def test_newly_accepted_types(self, client, room_setup, filename, content_type):
+        resp = self._send(client, room_setup, filename, content_type)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["attachments"][0]["content_type"] == content_type
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type"),
+        [
+            ("bundle.zip", "application/zip"),
+            ("logs.gz", "application/gzip"),
+            ("src.tar", "application/x-tar"),
+            ("src.7z", "application/x-7z-compressed"),
+            ("src.rar", "application/vnd.rar"),
+            ("blob.bin", "application/octet-stream"),
+            ("setup.exe", "application/vnd.microsoft.portable-executable"),
+            ("app.dmg", "application/x-apple-diskimage"),
+            ("evil.js", "application/javascript"),
+            ("evil.js", "text/javascript"),
+            ("macro.doc", "application/msword"),
+        ],
+    )
+    def test_rejected_types(self, client, room_setup, filename, content_type):
+        resp = self._send(client, room_setup, filename, content_type)
+        assert resp.status_code == 400, resp.text
+        assert "Unsupported attachment type" in resp.json()["detail"]
+
+    def test_content_type_parameters_tolerated(self, client, room_setup):
+        """A charset parameter must not turn an accepted type into a rejection."""
+        resp = self._send(client, room_setup, "note.txt", "text/plain; charset=utf-8")
+        assert resp.status_code == 200, resp.text
+
+    def test_empty_subtype_rejected(self, client, room_setup):
+        """A bare prefix is not a MIME type and must not pass the prefix check."""
+        resp = self._send(client, room_setup, "weird", "text/")
+        assert resp.status_code == 400, resp.text
+
+
+class TestExpandedTypeDownloadSafety:
+    """Newly accepted types must inherit the forced-download guarantees."""
+
+    def _upload(self, client, s, filename, content_type, payload):
+        resp = client.post(
+            f"/{s['ns']}/rooms/{s['room_id']}/messages",
+            json={
+                "body": "attach",
+                "attachments": [
+                    {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "data": base64.b64encode(payload).decode(),
+                    },
+                ],
+            },
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["attachments"][0]["id"]
+
+    def test_html_with_charset_still_downgraded(self, client, room_setup):
+        """The downgrade compares normalized types, so a charset parameter
+        cannot smuggle renderable HTML past it."""
+        s = room_setup
+        script = b"<html><script>alert('xss')</script></html>"
+        att_id = self._upload(client, s, "evil.html", "text/html; charset=utf-8", script)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert "text/html" not in resp.headers["content-type"]
+        assert resp.headers["content-type"].startswith("text/plain")
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.content == script
+
+    def test_source_code_download_is_text_and_forced(self, client, room_setup):
+        s = room_setup
+        payload = b"import os\nprint(os.getcwd())\n"
+        att_id = self._upload(client, s, "script.py", "text/x-python", payload)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.content == payload
+
+    def test_video_keeps_real_content_type(self, client, room_setup):
+        """Media is not script-capable, so it keeps its real type — but still
+        downloads with nosniff and the sandbox CSP."""
+        s = room_setup
+        payload = b"\x00\x00\x00\x18ftypmp42"
+        att_id = self._upload(client, s, "clip.mp4", "video/mp4", payload)
+
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("video/mp4")
+        assert resp.headers["content-disposition"] == 'attachment; filename="clip.mp4"'
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["content-security-policy"] == "sandbox; default-src 'none'"
+        assert resp.content == payload

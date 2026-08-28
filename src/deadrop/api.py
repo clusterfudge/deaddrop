@@ -1609,25 +1609,53 @@ class RoomMemberInfo(BaseModel):
     metadata: dict[str, Any]
 
 
-# Allowed MIME types for attachments
+# Attachment content-type policy: default-deny with a wide accept surface.
+#
+# Any text payload and any image/audio/video payload is accepted. Types outside
+# those families are accepted only by exact match, which keeps archives
+# (application/zip, gzip, tar), opaque binaries (application/octet-stream) and
+# executables out without needing a blocklist to enumerate them.
+ALLOWED_ATTACHMENT_TYPE_PREFIXES = ("text/", "image/", "audio/", "video/")
+
 ALLOWED_ATTACHMENT_TYPES = frozenset(
     {
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/webp",
-        "image/svg+xml",
-        "application/pdf",
-        "text/plain",
-        "text/csv",
-        "text/tab-separated-values",
-        "text/markdown",
-        "text/html",
         "application/json",
         "application/yaml",
+        "application/x-yaml",
         "application/xml",
+        "application/pdf",
     }
 )
+
+# Script MIME types under an allowed prefix. A download served with one of
+# these Content-Types is loadable by <script src>, so they are denied even
+# though text/* is otherwise accepted.
+DENIED_ATTACHMENT_TYPES = frozenset(
+    {
+        "text/javascript",
+        "text/ecmascript",
+        "text/vbscript",
+    }
+)
+
+
+def normalize_content_type(content_type: str) -> str:
+    """Lowercase a MIME type and drop any parameters (e.g. "; charset=utf-8")."""
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def is_allowed_attachment_type(content_type: str) -> bool:
+    """Whether an attachment may be stored, per the policy above."""
+    ct = normalize_content_type(content_type)
+    if ct in DENIED_ATTACHMENT_TYPES:
+        return False
+    if ct in ALLOWED_ATTACHMENT_TYPES:
+        return True
+    return any(
+        ct.startswith(prefix) and len(ct) > len(prefix)
+        for prefix in ALLOWED_ATTACHMENT_TYPE_PREFIXES
+    )
+
 
 # Content types that must never be served with a renderable Content-Type on the
 # wire. text/html attachments (e.g. from a large paste) could contain <script>
@@ -2201,11 +2229,13 @@ async def send_room_message(
         total_size = 0
         for att in request.attachments:
             # Content-type allowlist
-            if att.content_type not in ALLOWED_ATTACHMENT_TYPES:
+            if not is_allowed_attachment_type(att.content_type):
                 raise HTTPException(
                     400,
-                    f"Unsupported attachment type: {att.content_type!r}. "
-                    f"Allowed: {', '.join(sorted(ALLOWED_ATTACHMENT_TYPES))}",
+                    f"Unsupported attachment type: {att.content_type!r}. Allowed: any "
+                    f"{', '.join(p + '*' for p in ALLOWED_ATTACHMENT_TYPE_PREFIXES)} type "
+                    f"(except {', '.join(sorted(DENIED_ATTACHMENT_TYPES))}), plus "
+                    f"{', '.join(sorted(ALLOWED_ATTACHMENT_TYPES))}",
                 )
             try:
                 raw = base64.b64decode(att.data, validate=True)
@@ -2735,7 +2765,7 @@ def _safe_download_headers(filename: str | None, content_type: str) -> tuple[str
     that keep their real Content-Type (image/svg+xml).
     """
     wire_content_type = content_type
-    if content_type in NON_RENDERABLE_ATTACHMENT_TYPES:
+    if normalize_content_type(content_type) in NON_RENDERABLE_ATTACHMENT_TYPES:
         wire_content_type = DOWNLOAD_SAFE_CONTENT_TYPE
     safe_name = (filename or "attachment").replace("\r", "").replace("\n", "").replace('"', "")
     headers = {
