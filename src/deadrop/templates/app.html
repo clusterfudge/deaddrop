@@ -223,6 +223,44 @@
         cursor: default;
     " onclick="event.stopPropagation()" />
 </div>
+
+<!-- Command palette (desktop pointer only; see static/js/palette.js) -->
+<div id="command-palette" class="palette-overlay hidden" aria-hidden="true">
+    <div class="palette-panel" role="dialog" aria-modal="true" aria-label="Command palette">
+        <input id="palette-input" class="palette-input" type="text" autocomplete="off"
+               spellcheck="false" placeholder="Search rooms, people, commands…"
+               role="combobox" aria-expanded="true" aria-controls="palette-results">
+        <ul id="palette-results" class="palette-results" role="listbox" aria-label="Actions"></ul>
+        <div class="palette-footer">
+            <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+            <span><kbd>↵</kbd> open</span>
+            <span><kbd>esc</kbd> close</span>
+            <span><kbd>?</kbd> shortcuts</span>
+        </div>
+    </div>
+</div>
+
+<!-- Keyboard shortcuts help -->
+<div id="shortcuts-help" class="palette-overlay hidden" aria-hidden="true">
+    <div class="palette-panel" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+        <div class="shortcuts-header">
+            <span>⌨️ Keyboard shortcuts</span>
+            <button id="shortcuts-close" class="btn btn-icon" aria-label="Close">✕</button>
+        </div>
+        <dl class="shortcuts-list">
+            <dt><kbd>⌘</kbd><kbd>K</kbd> / <kbd>ctrl</kbd><kbd>K</kbd></dt><dd>Command palette</dd>
+            <dt><kbd>?</kbd></dt><dd>This help</dd>
+            <dt><kbd>esc</kbd></dt><dd>Close overlay / leave the composer</dd>
+            <dt><kbd>j</kbd> <kbd>↓</kbd></dt><dd>Next item in a list</dd>
+            <dt><kbd>k</kbd> <kbd>↑</kbd></dt><dd>Previous item in a list</dd>
+            <dt><kbd>↵</kbd></dt><dd>Open the selected item</dd>
+            <dt><kbd>c</kbd></dt><dd>Compose a new message</dd>
+            <dt><kbd>g</kbd> <kbd>i</kbd></dt><dd>Go to inbox</dd>
+            <dt><kbd>g</kbd> <kbd>h</kbd></dt><dd>Go to namespace list</dd>
+        </dl>
+        <div class="palette-footer"><span>Shortcuts are inactive on touch devices and while typing.</span></div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -2358,4 +2396,5 @@
     
     init();
 </script>
+<script src="/static/js/palette.js"></script>
 {% endblock %}
