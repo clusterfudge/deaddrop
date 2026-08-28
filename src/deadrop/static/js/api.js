@@ -174,6 +174,40 @@ const DeadropAPI = {
     },
 
     /**
+     * List a room's attachment metadata, newest first.
+     *
+     * The cursor is the compound (beforeMid, beforeId) pair returned as
+     * next_before_mid / next_before_id; both must be passed together.
+     */
+    async listRoomAttachments(credentials, roomId, { beforeMid = null, beforeId = null, limit = null } = {}) {
+        let path = `/${credentials.ns}/rooms/${roomId}/attachments`;
+        const params = new URLSearchParams();
+        if (beforeMid && beforeId) {
+            params.set('before_mid', beforeMid);
+            params.set('before_id', beforeId);
+        }
+        if (limit) params.set('limit', limit.toString());
+        if (params.toString()) path += '?' + params.toString();
+
+        return this.request('GET', path, { credentials });
+    },
+
+    /**
+     * Substring-search a room's message bodies, newest match first.
+     */
+    async searchRoomMessages(credentials, roomId, query, { beforeMid = null, limit = null } = {}) {
+        const params = new URLSearchParams({ q: query });
+        if (beforeMid) params.set('before_mid', beforeMid);
+        if (limit) params.set('limit', limit.toString());
+
+        return this.request(
+            'GET',
+            `/${credentials.ns}/rooms/${roomId}/search?${params.toString()}`,
+            { credentials },
+        );
+    },
+
+    /**
      * Fetch a single attachment with its base64 data.
      */
     async getAttachment(credentials, attachmentId) {

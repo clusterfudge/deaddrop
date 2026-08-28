@@ -81,7 +81,8 @@
         <div class="header">
             <a href="#" class="back-link" id="conversation-back">←</a>
             <h1 id="conversation-title">Peer</h1>
-            <div style="margin-left: auto;">
+            <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
+                <button id="conversation-panel-btn" class="btn btn-icon" title="Attachments and search" aria-label="Attachments and search">🗂</button>
                 <button class="theme-toggle" id="theme-toggle-btn-conversation" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
             </div>
         </div>
@@ -104,6 +105,7 @@
                 <div class="subtitle" id="room-chat-members"></div>
             </div>
             <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
+                <button id="room-panel-btn" class="btn btn-icon" title="Attachments and search" aria-label="Attachments and search">🗂</button>
                 <button class="theme-toggle" id="theme-toggle-btn-room-chat" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
                 <button id="room-refresh-btn" class="btn btn-icon" title="Refresh messages">🔄</button>
             </div>
@@ -122,6 +124,54 @@
         </div>
     </div>
     
+    <!-- Thread Panel (attachments + search) for rooms and 1:1 conversations -->
+    <div id="view-thread-panel" class="view hidden">
+        <div class="header">
+            <a href="#" class="back-link" id="thread-panel-back">←</a>
+            <div>
+                <h1 id="thread-panel-title">Thread</h1>
+                <div class="subtitle" id="thread-panel-subtitle">Attachments and search</div>
+            </div>
+            <div style="margin-left: auto;">
+                <button class="theme-toggle" id="theme-toggle-btn-thread-panel" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
+            </div>
+        </div>
+
+        <div class="panel-tabs" role="tablist">
+            <button class="panel-tab active" id="panel-tab-attachments" role="tab"
+                    aria-selected="true" aria-controls="panel-body-attachments">📎 Attachments</button>
+            <button class="panel-tab" id="panel-tab-search" role="tab"
+                    aria-selected="false" aria-controls="panel-body-search">🔍 Search</button>
+        </div>
+
+        <div id="panel-body-attachments" class="panel-body" role="tabpanel">
+            <div id="attachment-grid" class="attachment-grid"></div>
+            <div id="attachment-files" class="attachment-files"></div>
+            <div id="attachments-status" class="panel-status hidden"></div>
+            <div id="attachments-empty" class="empty-state hidden">
+                <div class="empty-state-icon">📎</div>
+                <div class="empty-state-title">No attachments</div>
+                <p id="attachments-empty-hint">Images and files shared in this thread show up here.</p>
+            </div>
+            <div class="panel-actions">
+                <button id="attachments-more" class="btn btn-secondary hidden">Load more</button>
+            </div>
+        </div>
+
+        <div id="panel-body-search" class="panel-body hidden" role="tabpanel">
+            <div class="panel-search-bar">
+                <input type="search" id="panel-search-input" class="form-input"
+                       placeholder="Search messages…" autocomplete="off"
+                       enterkeyhint="search" aria-label="Search messages">
+            </div>
+            <div id="search-results" class="search-results"></div>
+            <div id="search-status" class="panel-status">Type to search this thread.</div>
+            <div class="panel-actions">
+                <button id="search-more" class="btn btn-secondary hidden">Load more</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Compose Modal -->
     <div id="compose-modal" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
         <div class="card" style="width: 100%; max-width: 480px; margin: 20px;">
@@ -296,6 +346,7 @@
         inbox: document.getElementById('view-inbox'),
         conversation: document.getElementById('view-conversation'),
         roomChat: document.getElementById('view-room-chat'),
+        threadPanel: document.getElementById('view-thread-panel'),
         archived: document.getElementById('view-archived'),
     };
     
@@ -1074,6 +1125,7 @@
         document.getElementById('conversation-title').textContent = getPeerName(peerId);
         showView('conversation');
         renderConversation();
+        consumePendingJump();
         markConversationRead(peerId);
         // Focus the input so the user can start typing immediately
         document.getElementById('message-input').focus();
@@ -1107,7 +1159,7 @@
             const expiry = formatExpiry(msg.expires_at, credentials.ttlHours);
             
             return `
-                <div class="message ${isSent ? 'message-sent' : 'message-received'}">
+                <div class="message ${isSent ? 'message-sent' : 'message-received'}" data-mid="${msg.mid}">
                     <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
                     <div class="message-meta">
                         <span title="${formatAbsolute(msg.created_at)}">${formatTime(msg.created_at)}</span>
@@ -1230,6 +1282,7 @@
             // Re-render now that we have member names
             renderRoomMessages();
             document.getElementById('room-message-input').focus();
+            consumePendingJump();
             return true;
             
         } catch (e) {
@@ -1321,8 +1374,12 @@
      * Because existing DOM nodes are preserved, `overflow-anchor: auto`
      * keeps the currently-visible message anchored without any manual
      * scrollTop arithmetic.
+     *
+     * `limit` overrides the interactive page size. A jump to an old message
+     * backfills with a larger page so the hunt costs a couple of round trips
+     * instead of one per screenful.
      */
-    async function loadOlderRoomMessages() {
+    async function loadOlderRoomMessages({ limit = ROOM_PAGE_SIZE } = {}) {
         if (roomLoadingOlder || !roomHasOlderMessages || roomMessages.length === 0) return;
         roomLoadingOlder = true;
 
@@ -1333,7 +1390,7 @@
             const oldestMid = roomMessages[0].mid;
 
             const result = await DeadropAPI.getRoomMessages(
-                credentials, currentRoomId, { beforeMid: oldestMid, limit: ROOM_PAGE_SIZE, excludeReactions: true });
+                credentials, currentRoomId, { beforeMid: oldestMid, limit, excludeReactions: true });
             const olderPage = result?.messages || [];
 
             if (olderPage.length === 0) {
@@ -1344,7 +1401,7 @@
                 return;
             }
 
-            roomHasOlderMessages = olderPage.length >= ROOM_PAGE_SIZE;
+            roomHasOlderMessages = olderPage.length >= limit;
 
             roomMessages = [...olderPage, ...roomMessages];
 
@@ -1526,15 +1583,21 @@
             <button class="reply-preview-cancel" onclick="cancelReply()" title="Cancel reply" aria-label="Cancel reply">✕</button>`;
     }
 
+    /**
+     * Scroll a message into view and flash it. Searches the visible view, so
+     * the same call works for the room list and the 1:1 list.
+     * Returns false when the mid is not in the DOM.
+     */
     function scrollToMessage(mid) {
-        const el = document.querySelector(`.room-message[data-mid="${mid}"]`);
-        if (!el) return;
+        const el = document.querySelector(`.view:not(.hidden) [data-mid="${mid}"]`);
+        if (!el) return false;
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         el.classList.remove('reply-target-flash');
         // Reflow between remove and add so a repeat tap restarts the animation.
         void el.offsetWidth;
         el.classList.add('reply-target-flash');
         setTimeout(() => el.classList.remove('reply-target-flash'), 1600);
+        return true;
     }
     
     /**
@@ -1815,6 +1878,420 @@
     
     // pollRoomMessages removed — subscriptions handle real-time updates
     
+    // ==================== THREAD PANEL (ATTACHMENTS + SEARCH) ====================
+
+    // Which thread the panel is showing: {type: 'room'|'conversation', id}.
+    let panelContext = null;
+    let panelOpen = false;
+    // Compound keyset cursor for the attachments listing: [beforeMid, beforeId].
+    let panelAttachmentCursor = null;
+    let panelAttachmentsLoading = false;
+    let panelSearchCursor = null;
+    let panelSearchTerm = '';
+    let panelSearchLoading = false;
+    let panelSearchTimer = null;
+    let panelThumbObserver = null;
+    // mid to reveal once the chat view is back on screen.
+    let pendingJumpMid = null;
+
+    const PANEL_ATTACHMENT_PAGE = 60;
+    const PANEL_SEARCH_PAGE = 50;
+    const PANEL_SEARCH_DEBOUNCE_MS = 250;
+    // Backfill page size while hunting for a jump target. Larger than the
+    // interactive page so a deep jump costs a few round trips, not forty.
+    const JUMP_BACKFILL_PAGE = 250;
+    const JUMP_MAX_BACKFILL_PAGES = 20;
+    const SEARCH_SNIPPET_RADIUS = 90;
+
+    /**
+     * Open the panel over whichever thread is on screen. The context comes
+     * from the visible view rather than currentRoomId/currentPeerId, which
+     * both survive navigation between a room and a conversation.
+     */
+    function openThreadPanel() {
+        const inRoom = !views.roomChat.classList.contains('hidden');
+        if (inRoom && currentRoomId) {
+            panelContext = { type: 'room', id: currentRoomId };
+            document.getElementById('thread-panel-title').textContent =
+                document.getElementById('room-chat-title').textContent || 'Room';
+        } else if (currentPeerId) {
+            panelContext = { type: 'conversation', id: currentPeerId };
+            document.getElementById('thread-panel-title').textContent = getPeerName(currentPeerId);
+        } else {
+            return;
+        }
+
+        // A duplicate history entry for the current URL: a back gesture pops
+        // it, the popstate handler restores the chat view, and the path never
+        // changes — so the panel can't trap a mobile user.
+        panelOpen = true;
+        history.pushState({}, '', window.location.href);
+
+        showView('threadPanel');
+        showPanelTab('attachments');
+        resetPanelSearch();
+        resetPanelAttachments();
+        loadPanelAttachments();
+    }
+
+    function closeThreadPanel() {
+        if (panelOpen) history.back();
+    }
+
+    /**
+     * Restore the view the panel was opened from. Called by the popstate
+     * handler: the chat DOM was only hidden, so nothing needs re-fetching.
+     */
+    function restoreViewBehindPanel() {
+        panelOpen = false;
+        if (panelThumbObserver) {
+            panelThumbObserver.disconnect();
+            panelThumbObserver = null;
+        }
+        showView(panelContext && panelContext.type === 'conversation' ? 'conversation' : 'roomChat');
+    }
+
+    function showPanelTab(name) {
+        const isSearch = name === 'search';
+        document.getElementById('panel-body-attachments').classList.toggle('hidden', isSearch);
+        document.getElementById('panel-body-search').classList.toggle('hidden', !isSearch);
+
+        const attTab = document.getElementById('panel-tab-attachments');
+        const searchTab = document.getElementById('panel-tab-search');
+        attTab.classList.toggle('active', !isSearch);
+        searchTab.classList.toggle('active', isSearch);
+        attTab.setAttribute('aria-selected', String(!isSearch));
+        searchTab.setAttribute('aria-selected', String(isSearch));
+
+        if (isSearch) document.getElementById('panel-search-input').focus();
+    }
+
+    // ---- Attachments tab ----
+
+    function resetPanelAttachments() {
+        panelAttachmentCursor = null;
+        document.getElementById('attachment-grid').innerHTML = '';
+        document.getElementById('attachment-files').innerHTML = '';
+        document.getElementById('attachments-more').classList.add('hidden');
+        document.getElementById('attachments-empty').classList.add('hidden');
+        document.getElementById('attachments-status').classList.add('hidden');
+    }
+
+    async function loadPanelAttachments() {
+        if (panelAttachmentsLoading || !panelContext) return;
+
+        const empty = document.getElementById('attachments-empty');
+        const hint = document.getElementById('attachments-empty-hint');
+        const more = document.getElementById('attachments-more');
+        const status = document.getElementById('attachments-status');
+
+        if (panelContext.type !== 'room') {
+            // Attachments reference room_messages; direct messages have no
+            // attachment rows to list.
+            hint.textContent = 'Direct messages don\u2019t carry attachments yet \u2014 only rooms do.';
+            empty.classList.remove('hidden');
+            more.classList.add('hidden');
+            return;
+        }
+
+        panelAttachmentsLoading = true;
+        status.textContent = 'Loading\u2026';
+        status.classList.remove('hidden');
+
+        try {
+            const opts = { limit: PANEL_ATTACHMENT_PAGE };
+            if (panelAttachmentCursor) {
+                opts.beforeMid = panelAttachmentCursor[0];
+                opts.beforeId = panelAttachmentCursor[1];
+            }
+            const result = await DeadropAPI.listRoomAttachments(credentials, panelContext.id, opts);
+            appendPanelAttachments(result?.attachments || []);
+
+            panelAttachmentCursor = result?.has_more
+                ? [result.next_before_mid, result.next_before_id]
+                : null;
+            more.classList.toggle('hidden', !panelAttachmentCursor);
+            status.classList.add('hidden');
+
+            const total = document.getElementById('attachment-grid').children.length
+                + document.getElementById('attachment-files').children.length;
+            hint.textContent = 'Images and files shared in this thread show up here.';
+            empty.classList.toggle('hidden', total > 0);
+        } catch (e) {
+            status.textContent = e.message;
+            status.classList.remove('hidden');
+        } finally {
+            panelAttachmentsLoading = false;
+        }
+    }
+
+    function appendPanelAttachments(items) {
+        const grid = document.getElementById('attachment-grid');
+        const files = document.getElementById('attachment-files');
+
+        for (const att of items) {
+            if (att.content_type && att.content_type.startsWith('image/')) {
+                grid.appendChild(buildAttachmentTile(att));
+            } else {
+                files.appendChild(buildAttachmentRow(att));
+            }
+        }
+        observePanelThumbs();
+    }
+
+    function attachmentByline(att) {
+        return `${getMemberName(att.from_id)} \u00b7 ${formatTime(att.message_created_at)}`;
+    }
+
+    function buildAttachmentTile(att) {
+        const tile = document.createElement('div');
+        tile.className = 'attachment-tile';
+        tile.innerHTML = `
+            <button class="attachment-thumb" data-attachment-id="${att.id}"
+                    title="${escapeHtml(att.filename || 'image')}"
+                    aria-label="Open ${escapeHtml(att.filename || 'image')}">\u{1F5BC}\uFE0F</button>
+            <div class="attachment-tile-meta">
+                <span class="attachment-tile-by" title="${formatAbsolute(att.message_created_at)}">${escapeHtml(attachmentByline(att))}</span>
+                <button class="attachment-jump" title="Go to this message in the conversation">\u21A9 Jump</button>
+            </div>`;
+        tile.querySelector('.attachment-thumb').dataset.filename = att.filename || '';
+        tile.querySelector('.attachment-jump').onclick = () => jumpToMessage(att.message_mid);
+        return tile;
+    }
+
+    function buildAttachmentRow(att) {
+        const row = document.createElement('div');
+        row.className = 'attachment-row';
+        row.innerHTML = `
+            <span class="attachment-row-icon">\u{1F4C4}</span>
+            <div class="attachment-row-main">
+                <span class="attachment-row-name">${escapeHtml(att.filename || 'file')}</span>
+                <span class="attachment-row-sub">${escapeHtml(att.content_type)} \u00b7 ${formatFileSize(att.size)} \u00b7 ${escapeHtml(attachmentByline(att))}</span>
+            </div>
+            <div class="attachment-row-actions">
+                <button class="btn btn-small btn-secondary attachment-row-download" title="Download">\u2913</button>
+                <button class="btn btn-small btn-secondary attachment-jump" title="Go to this message in the conversation">\u21A9</button>
+            </div>`;
+        row.querySelector('.attachment-row-download').onclick = () => downloadFileAttachment(att.id);
+        row.querySelector('.attachment-jump').onclick = () => jumpToMessage(att.message_mid);
+        return row;
+    }
+
+    /**
+     * Thumbnails need the base64 body, which only the JSON endpoint serves
+     * (the raw download requires an auth header, so it can't be an img src).
+     * Fetch on first visibility and cache, so a long gallery costs one request
+     * per tile the user actually scrolls to.
+     */
+    function observePanelThumbs() {
+        if (!panelThumbObserver) {
+            panelThumbObserver = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    if (!entry.isIntersecting) continue;
+                    panelThumbObserver.unobserve(entry.target);
+                    loadPanelThumb(entry.target);
+                }
+            }, { rootMargin: '200px' });
+        }
+        document.querySelectorAll('.attachment-thumb:not([data-observed])').forEach(btn => {
+            btn.dataset.observed = 'true';
+            panelThumbObserver.observe(btn);
+        });
+    }
+
+    async function loadPanelThumb(btn) {
+        const attachmentId = btn.dataset.attachmentId;
+        if (!attachmentId || btn.dataset.loaded === 'true') return;
+        try {
+            let att = attachmentCache.get(attachmentId);
+            if (!att) {
+                const fetched = await DeadropAPI.getAttachment(credentials, attachmentId);
+                att = { content_type: fetched.content_type, data: fetched.data };
+                attachmentCache.set(attachmentId, att);
+            }
+            const img = document.createElement('img');
+            img.src = `data:${att.content_type};base64,${att.data}`;
+            img.alt = btn.dataset.filename || 'image';
+            img.loading = 'lazy';
+            btn.textContent = '';
+            btn.appendChild(img);
+            btn.dataset.loaded = 'true';
+            btn.onclick = () => openLightbox(img);
+        } catch (e) {
+            btn.textContent = '\u26A0\uFE0F';
+            console.error('Failed to load attachment thumbnail:', e);
+        }
+    }
+
+    // ---- Search tab ----
+
+    function resetPanelSearch() {
+        panelSearchCursor = null;
+        panelSearchTerm = '';
+        document.getElementById('panel-search-input').value = '';
+        document.getElementById('search-results').innerHTML = '';
+        document.getElementById('search-more').classList.add('hidden');
+        setSearchStatus('Type to search this thread.');
+    }
+
+    function setSearchStatus(text) {
+        const status = document.getElementById('search-status');
+        status.textContent = text || '';
+        status.classList.toggle('hidden', !text);
+    }
+
+    function onPanelSearchInput() {
+        if (panelSearchTimer) clearTimeout(panelSearchTimer);
+        panelSearchTimer = setTimeout(() => {
+            panelSearchTimer = null;
+            runPanelSearch({ reset: true });
+        }, PANEL_SEARCH_DEBOUNCE_MS);
+    }
+
+    async function runPanelSearch({ reset = false } = {}) {
+        if (panelSearchLoading || !panelContext) return;
+
+        const results = document.getElementById('search-results');
+        const more = document.getElementById('search-more');
+
+        if (reset) {
+            panelSearchTerm = document.getElementById('panel-search-input').value.trim();
+            panelSearchCursor = null;
+            results.innerHTML = '';
+            more.classList.add('hidden');
+        }
+        if (!panelSearchTerm) {
+            setSearchStatus('Type to search this thread.');
+            return;
+        }
+
+        if (panelContext.type === 'conversation') {
+            // The whole 1:1 thread is already in memory, so this is a filter,
+            // not a fetch.
+            const hits = searchLoadedConversation(panelSearchTerm);
+            hits.forEach(m => results.appendChild(buildSearchResult({
+                mid: m.mid,
+                from_id: m.from,
+                body: m.body,
+                created_at: m.created_at,
+            })));
+            setSearchStatus(hits.length ? '' : `No matches for \u201c${panelSearchTerm}\u201d.`);
+            return;
+        }
+
+        panelSearchLoading = true;
+        setSearchStatus('Searching\u2026');
+        try {
+            const result = await DeadropAPI.searchRoomMessages(
+                credentials, panelContext.id, panelSearchTerm,
+                { beforeMid: panelSearchCursor, limit: PANEL_SEARCH_PAGE });
+            const hits = result?.messages || [];
+            hits.forEach(m => results.appendChild(buildSearchResult(m)));
+
+            panelSearchCursor = result?.has_more ? result.next_before_mid : null;
+            more.classList.toggle('hidden', !panelSearchCursor);
+            setSearchStatus(results.children.length ? '' : `No matches for \u201c${panelSearchTerm}\u201d.`);
+        } catch (e) {
+            setSearchStatus(e.message);
+        } finally {
+            panelSearchLoading = false;
+        }
+    }
+
+    function searchLoadedConversation(term) {
+        const needle = term.toLowerCase();
+        return messages
+            .filter(m => m.from === panelContext.id || m.to === panelContext.id)
+            .filter(m => (m.body || '').toLowerCase().includes(needle))
+            .sort((a, b) => b.mid.localeCompare(a.mid));
+    }
+
+    function senderLabel(fromId) {
+        if (fromId === credentials.id) return 'You';
+        return panelContext && panelContext.type === 'conversation'
+            ? getPeerName(fromId) : getMemberName(fromId);
+    }
+
+    function buildSearchResult(msg) {
+        const el = document.createElement('button');
+        el.className = 'search-result';
+        el.innerHTML = `
+            <span class="search-result-head">
+                <span class="search-result-author">${escapeHtml(senderLabel(msg.from_id))}</span>
+                <span class="search-result-time" title="${formatAbsolute(msg.created_at)}">${formatTime(msg.created_at)}</span>
+            </span>
+            <span class="search-result-body">${searchSnippet(msg.body, panelSearchTerm)}</span>`;
+        el.onclick = () => jumpToMessage(msg.mid);
+        return el;
+    }
+
+    /**
+     * A window of the body centred on the first match, with the matched run
+     * wrapped in <mark>. Escaped before the marker is inserted, so the
+     * returned HTML carries no body-derived markup.
+     */
+    function searchSnippet(body, term) {
+        const text = (body || '').replace(/\s+/g, ' ').trim();
+        const at = text.toLowerCase().indexOf(term.toLowerCase());
+        if (at < 0) {
+            return escapeHtml(text.slice(0, SEARCH_SNIPPET_RADIUS * 2));
+        }
+        const start = Math.max(0, at - SEARCH_SNIPPET_RADIUS);
+        const end = Math.min(text.length, at + term.length + SEARCH_SNIPPET_RADIUS);
+        const lead = (start > 0 ? '\u2026' : '') + escapeHtml(text.slice(start, at));
+        const hit = escapeHtml(text.slice(at, at + term.length));
+        const tail = escapeHtml(text.slice(at + term.length, end)) + (end < text.length ? '\u2026' : '');
+        return `${lead}<mark>${hit}</mark>${tail}`;
+    }
+
+    // ---- Jump to a message ----
+
+    /**
+     * Leave the panel and reveal a message. The pop of the panel's history
+     * entry restores the chat view, and the reveal runs from there.
+     */
+    function jumpToMessage(mid) {
+        pendingJumpMid = mid;
+        if (panelOpen) {
+            history.back();
+        } else {
+            consumePendingJump();
+        }
+    }
+
+    function consumePendingJump() {
+        const mid = pendingJumpMid;
+        if (!mid) return;
+        pendingJumpMid = null;
+        // One frame so the freshly-unhidden list has laid out before we scroll.
+        requestAnimationFrame(() => {
+            if (scrollToMessage(mid)) return;
+            revealRoomMessage(mid);
+        });
+    }
+
+    /**
+     * Page room history backwards until the mid renders, then flash it.
+     * Mids are uuidv7, so once the oldest loaded message sorts at or before
+     * the target the message is gone (deleted or expired) and paging further
+     * cannot help.
+     */
+    async function revealRoomMessage(mid) {
+        if (!currentRoomId) return false;
+        const status = document.getElementById('room-load-more');
+        if (status) status.textContent = 'Finding that message\u2026';
+
+        for (let page = 0; page < JUMP_MAX_BACKFILL_PAGES; page++) {
+            if (!roomHasOlderMessages) break;
+            if (roomMessages.length && roomMessages[0].mid <= mid) break;
+            await loadOlderRoomMessages({ limit: JUMP_BACKFILL_PAGE });
+            if (scrollToMessage(mid)) return true;
+        }
+        if (scrollToMessage(mid)) return true;
+        console.warn('Jump target not found in room history:', mid);
+        return false;
+    }
+
     // ==================== UNIFIED SUBSCRIPTION ====================
     
     /**
@@ -1995,6 +2472,27 @@
         showView('inbox');
     });
     
+    // Thread panel: attachments + search, shared by rooms and 1:1 threads.
+    document.getElementById('room-panel-btn').addEventListener('click', openThreadPanel);
+    document.getElementById('conversation-panel-btn').addEventListener('click', openThreadPanel);
+    document.getElementById('thread-panel-back').addEventListener('click', (e) => {
+        e.preventDefault();
+        closeThreadPanel();
+    });
+    document.getElementById('panel-tab-attachments').addEventListener('click', () => showPanelTab('attachments'));
+    document.getElementById('panel-tab-search').addEventListener('click', () => showPanelTab('search'));
+    document.getElementById('attachments-more').addEventListener('click', loadPanelAttachments);
+    document.getElementById('search-more').addEventListener('click', () => runPanelSearch());
+    document.getElementById('panel-search-input').addEventListener('input', onPanelSearchInput);
+    document.getElementById('panel-search-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            if (panelSearchTimer) clearTimeout(panelSearchTimer);
+            panelSearchTimer = null;
+            runPanelSearch({ reset: true });
+        }
+    });
+
     document.getElementById('compose-btn').addEventListener('click', showCompose);
     document.getElementById('compose-cancel').addEventListener('click', hideCompose);
     document.getElementById('compose-close').addEventListener('click', hideCompose);
@@ -2253,7 +2751,15 @@
     window.addEventListener('popstate', () => {
         const path = window.location.pathname;
         rememberRoute(path);
-        
+
+        // The thread panel pushed a duplicate of the chat path, so popping it
+        // is purely a view switch — the chat DOM was hidden, not discarded.
+        if (panelOpen) {
+            restoreViewBehindPanel();
+            consumePendingJump();
+            return;
+        }
+
         if (path === '/app' || path === '/app/') {
             // Namespace list
             currentSlug = null;
