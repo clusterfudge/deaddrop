@@ -3933,6 +3933,134 @@ def get_batch_message_attachments(
     return results
 
 
+@timed_query("list_room_attachments")
+def list_room_attachments(
+    room_id: str,
+    before_mid: str | None = None,
+    before_id: str | None = None,
+    limit: int = 60,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """List a room's attachment metadata, newest first.
+
+    Ordering is ``(message_mid DESC, id DESC)``. Message mids are uuidv7, so
+    that is reverse-chronological; ``id`` breaks ties between attachments on
+    the same message deterministically.
+
+    Pagination is keyset on that same pair: pass the last returned row's
+    ``message_mid``/``id`` back as ``before_mid``/``before_id`` to get the next
+    page. Both must be supplied together — a lone ``before_mid`` would skip the
+    remaining attachments of that message.
+
+    Base64 data is never selected; each row carries the sender and message
+    timestamp needed to render a gallery entry and link back to the message.
+
+    Args:
+        room_id: Room ID.
+        before_mid: Keyset cursor — message mid of the last row of the prior page.
+        before_id: Keyset cursor — attachment id of the last row of the prior page.
+        limit: Maximum number of attachments to return.
+        conn: Optional database connection.
+
+    Returns:
+        List of attachment dicts, newest first.
+    """
+    conn = _get_conn(conn)
+
+    query = """
+        SELECT
+            a.id, a.message_mid, a.filename, a.content_type, a.size,
+            a.created_at, rm.from_id, rm.created_at AS message_created_at
+        FROM attachments a
+        JOIN room_messages rm ON rm.mid = a.message_mid
+        WHERE rm.room_id = ?
+    """
+    params: list[Any] = [room_id]
+
+    if before_mid and before_id:
+        query += " AND (a.message_mid < ? OR (a.message_mid = ? AND a.id < ?))"
+        params.extend([before_mid, before_mid, before_id])
+
+    query += " ORDER BY a.message_mid DESC, a.id DESC LIMIT ?"
+    params.append(limit)
+
+    cursor = conn.execute(query, tuple(params), name="list_room_attachments.select")
+    return [
+        {
+            "id": row[0],
+            "message_mid": row[1],
+            "filename": row[2],
+            "content_type": row[3],
+            "size": row[4],
+            "created_at": row[5],
+            "from": row[6],
+            "message_created_at": row[7],
+        }
+        for row in cursor.fetchall()
+    ]
+
+
+def escape_like(term: str) -> str:
+    r"""Escape LIKE wildcards in a user-supplied term for ``ESCAPE '\'``."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@timed_query("search_room_messages")
+def search_room_messages(
+    room_id: str,
+    query: str,
+    before_mid: str | None = None,
+    limit: int = 50,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """Substring-search a room's message bodies, newest match first.
+
+    Case-insensitive via ``LOWER()`` on both sides, which keeps the match
+    non-ASCII-aware but avoids depending on a collation or an FTS index.
+    Reactions are excluded — their body is an emoji, not prose.
+
+    Args:
+        room_id: Room ID.
+        query: Search term. Wildcards are escaped, so it matches literally.
+        before_mid: Keyset cursor — only match messages older than this mid.
+        limit: Maximum number of matches to return.
+        conn: Optional database connection.
+
+    Returns:
+        List of message dicts (no attachment data), newest first.
+    """
+    conn = _get_conn(conn)
+
+    sql = """
+        SELECT mid, room_id, from_id, body, content_type, created_at
+        FROM room_messages
+        WHERE room_id = ?
+          AND content_type != 'reaction'
+          AND LOWER(body) LIKE ? ESCAPE '\\'
+    """
+    params: list[Any] = [room_id, f"%{escape_like(query.lower())}%"]
+
+    if before_mid:
+        sql += " AND mid < ?"
+        params.append(before_mid)
+
+    sql += " ORDER BY mid DESC LIMIT ?"
+    params.append(limit)
+
+    cursor = conn.execute(sql, tuple(params), name="search_room_messages.select")
+    return [
+        {
+            "mid": row[0],
+            "room_id": row[1],
+            "from": row[2],
+            "body": row[3],
+            "content_type": row[4] or "text/plain",
+            "created_at": row[5],
+        }
+        for row in cursor.fetchall()
+    ]
+
+
 def get_topic_latest(
     topic_key: str,
     ns: str | None = None,

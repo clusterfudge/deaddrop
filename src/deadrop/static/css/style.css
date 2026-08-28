@@ -16,6 +16,7 @@
     --code-block-text: #24292f;      /* Dark slate for readable contrast */
     --table-header-bg: rgba(0, 0, 0, 0.04);
     --unread-bg: rgba(37, 99, 235, 0.05);
+    --mark-bg: rgba(245, 158, 11, 0.35);
 
     /* Accent / interactive */
     --primary-color: #2563eb;
@@ -46,6 +47,7 @@
     --code-block-text: #cdd6f4;
     --table-header-bg: rgba(255, 255, 255, 0.05);
     --unread-bg: rgba(77, 142, 240, 0.10); /* was 0.08 — slightly more visible */
+    --mark-bg: rgba(251, 191, 36, 0.30);
 
     --primary-color: #4d8ef0;
     --primary-hover: #3b7ee0;
@@ -965,7 +967,8 @@ textarea.form-input {
 }
 
 /* Tap-to-scroll landing flash on the replied-to message. */
-.room-message.reply-target-flash {
+.room-message.reply-target-flash,
+.message.reply-target-flash {
     animation: reply-target-flash 1.5s ease-out;
 }
 
@@ -1150,6 +1153,269 @@ button:disabled {
     border-radius: 6px;
     font-size: 13px;
     margin: 4px 0;
+}
+
+/* ==================== THREAD PANEL (ATTACHMENTS + SEARCH) ==================== */
+
+.panel-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 8px 12px 0;
+    background: var(--card-bg);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.panel-tab {
+    flex: 1;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: var(--radius) var(--radius) 0 0;
+    cursor: pointer;
+}
+
+.panel-tab:hover {
+    background: var(--hover-bg);
+}
+
+.panel-tab.active {
+    color: var(--primary-color);
+    border-bottom-color: var(--primary-color);
+}
+
+.panel-body {
+    padding: 16px;
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+.panel-status {
+    padding: 12px 0;
+    font-size: 13px;
+    color: var(--text-muted);
+    text-align: center;
+}
+
+.panel-actions {
+    display: flex;
+    justify-content: center;
+    padding: 12px 0 4px;
+}
+
+/* ---- Attachment grid ---- */
+
+.attachment-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+    gap: 10px;
+}
+
+.attachment-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+
+.attachment-thumb {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    padding: 0;
+    overflow: hidden;
+    font-size: 22px;
+    background: var(--surface);
+    color: var(--text-muted);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+
+.attachment-thumb:hover {
+    border-color: var(--primary-color);
+}
+
+.attachment-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.attachment-tile-meta {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+    min-width: 0;
+}
+
+.attachment-tile-by {
+    flex: 1;
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.attachment-jump {
+    flex-shrink: 0;
+    padding: 2px 6px;
+    font-size: 11px;
+    color: var(--primary-color);
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.attachment-jump:hover {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+/* ---- Non-image attachment rows ---- */
+
+.attachment-files {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.attachment-files:not(:empty) {
+    margin-top: 16px;
+}
+
+.attachment-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+}
+
+.attachment-row-icon {
+    flex-shrink: 0;
+    font-size: 18px;
+}
+
+.attachment-row-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+}
+
+.attachment-row-name {
+    font-size: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.attachment-row-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.attachment-row-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: 6px;
+}
+
+/* ---- Search ---- */
+
+.panel-search-bar {
+    margin-bottom: 12px;
+}
+
+.search-results {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.search-result {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+    padding: 10px 12px;
+    text-align: left;
+    font: inherit;
+    color: var(--text-color);
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+
+.search-result:hover {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+.search-result-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.search-result-author {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--primary-color);
+}
+
+.search-result-time {
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.search-result-body {
+    font-size: 13px;
+    line-height: 1.45;
+    word-break: break-word;
+}
+
+.search-result-body mark {
+    background: var(--mark-bg);
+    color: inherit;
+    border-radius: 3px;
+    padding: 0 1px;
+}
+
+@media (max-width: 640px) {
+    .panel-body {
+        padding: 12px;
+    }
+
+    .attachment-grid {
+        grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+        gap: 8px;
+    }
+
+    .panel-tab {
+        padding: 10px 6px;
+        font-size: 13px;
+    }
 }
 
 /* ==================== DARK MODE EXTRAS ==================== */

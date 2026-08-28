@@ -1682,6 +1682,17 @@ class AttachmentDataInfo(AttachmentInfo):
     data: str
 
 
+class RoomAttachmentInfo(AttachmentInfo):
+    """Attachment metadata plus the fields a gallery entry needs.
+
+    ``from_id`` and ``message_created_at`` come from the owning room message,
+    so a listing can show who sent it and when without a second fetch.
+    """
+
+    from_id: str
+    message_created_at: str
+
+
 class RoomMessageInfo(BaseModel):
     mid: str
     room_id: str
@@ -2028,6 +2039,126 @@ async def get_room_messages(
     return {
         "messages": enriched,
         "room_id": room_id,
+    }
+
+
+@app.get("/{ns}/rooms/{room_id}/attachments")
+async def list_room_attachments(
+    ns: str,
+    room_id: str,
+    before_mid: Annotated[str | None, Query()] = None,
+    before_id: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 60,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """List the room's attachment metadata, newest first.
+
+    Query parameters:
+    - before_mid / before_id: keyset cursor, both taken from the last row of
+      the previous page. Supplying only one is a 400 — a lone ``before_mid``
+      would skip the rest of that message's attachments.
+    - limit: maximum attachments per page (default 60, max 200)
+
+    Base64 data is not included; fetch it per attachment from
+    ``GET /{ns}/attachments/{id}``.
+    """
+    import functools
+
+    room, _identity_id = await _require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    if bool(before_mid) != bool(before_id):
+        raise HTTPException(400, "before_mid and before_id must be supplied together")
+
+    _require_uuid7(before_mid, "before_mid")
+
+    rows = await _run_read(
+        functools.partial(
+            db.list_room_attachments,
+            room_id,
+            before_mid=before_mid,
+            before_id=before_id,
+            limit=limit + 1,
+        )
+    )
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+
+    return {
+        "room_id": room_id,
+        "attachments": [
+            RoomAttachmentInfo(
+                id=r["id"],
+                message_mid=r["message_mid"],
+                filename=r.get("filename"),
+                content_type=r["content_type"],
+                size=r.get("size", 0),
+                created_at=r.get("created_at", ""),
+                from_id=r["from"],
+                message_created_at=r.get("message_created_at", ""),
+            ).model_dump()
+            for r in page
+        ],
+        "has_more": has_more,
+        "next_before_mid": page[-1]["message_mid"] if has_more and page else None,
+        "next_before_id": page[-1]["id"] if has_more and page else None,
+    }
+
+
+@app.get("/{ns}/rooms/{room_id}/search")
+async def search_room_messages(
+    ns: str,
+    room_id: str,
+    q: Annotated[str, Query(min_length=1, max_length=200)],
+    before_mid: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Substring-search the room's message bodies, newest match first.
+
+    Query parameters:
+    - q: search term, matched literally (LIKE wildcards are escaped)
+    - before_mid: keyset cursor — only matches older than this mid
+    - limit: maximum matches per page (default 50, max 100)
+
+    Reactions are excluded. Attachment metadata is not returned; use the
+    attachments listing for that.
+    """
+    import functools
+
+    room, _identity_id = await _require_room_member(room_id, x_inbox_secret)
+
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+
+    term = q.strip()
+    if not term:
+        raise HTTPException(400, "Search term must not be blank")
+
+    _require_uuid7(before_mid, "before_mid")
+
+    rows = await _run_read(
+        functools.partial(
+            db.search_room_messages,
+            room_id,
+            term,
+            before_mid=before_mid,
+            limit=limit + 1,
+        )
+    )
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+
+    return {
+        "room_id": room_id,
+        "query": term,
+        "messages": [RoomMessageInfo.from_db(r).model_dump() for r in page],
+        "has_more": has_more,
+        "next_before_mid": page[-1]["mid"] if has_more and page else None,
     }
 
 
