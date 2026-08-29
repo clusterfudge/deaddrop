@@ -117,7 +117,7 @@
         <div id="room-attachment-preview" class="attachment-preview hidden"></div>
         <div class="compose-area">
             <button id="room-attach-btn" class="btn btn-icon" title="Attach image">📎</button>
-            <input type="file" id="room-file-input" accept="image/*" multiple style="display:none">
+            <input type="file" id="room-file-input" accept="text/*,image/*,audio/*,video/*,application/json,application/xml,application/yaml,application/pdf,.md,.log,.yaml,.yml,.toml,.ini,.conf,.patch,.diff,.sql" multiple style="display:none">
             <textarea id="room-message-input" class="compose-input" 
                       placeholder="Type a message..." rows="1" enterkeyhint="send"></textarea>
             <button id="room-send-btn" class="btn btn-primary">Send ➤</button>
@@ -605,12 +605,31 @@
         }
     }
 
+    // Extensions the OS commonly has no MIME mapping for, where the file is
+    // text. Without this, File.type is empty, the data URL reads
+    // application/octet-stream, and the server's default-deny rejects it.
+    const TEXT_EXTENSIONS = new Set([
+        'log', 'py', 'sh', 'bash', 'zsh', 'rb', 'go', 'rs', 'java', 'kt', 'swift',
+        'c', 'h', 'cc', 'cpp', 'hpp', 'ts', 'tsx', 'jsx', 'sql', 'toml', 'ini',
+        'conf', 'cfg', 'env', 'patch', 'diff', 'lock', 'gitignore', 'dockerfile',
+    ]);
+
+    function resolveContentType(file, sniffedMime) {
+        if (sniffedMime && sniffedMime !== 'application/octet-stream') return sniffedMime;
+        const ext = (file.name.split('.').pop() || '').toLowerCase();
+        if (TEXT_EXTENSIONS.has(ext)) return 'text/plain';
+        if (ext === 'md' || ext === 'markdown') return 'text/markdown';
+        if (ext === 'yaml' || ext === 'yml') return 'application/yaml';
+        return sniffedMime;
+    }
+
     function addFileToPreview(file) {
         const reader = new FileReader();
         reader.onload = (e) => {
             const dataUrl = e.target.result;
             const base64 = dataUrl.split(',')[1];
-            const mime = dataUrl.split(':')[1].split(';')[0];
+            const sniffed = dataUrl.split(':')[1].split(';')[0];
+            const mime = resolveContentType(file, sniffed);
             const att = { filename: file.name, content_type: mime, data: base64, size: file.size };
             pendingAttachments.push(att);
             renderAttachmentPreview();
