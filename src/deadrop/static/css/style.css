@@ -16,6 +16,7 @@
     --code-block-text: #24292f;      /* Dark slate for readable contrast */
     --table-header-bg: rgba(0, 0, 0, 0.04);
     --unread-bg: rgba(37, 99, 235, 0.05);
+    --jump-highlight: rgba(37, 99, 235, 0.16);
     --mark-bg: rgba(245, 158, 11, 0.35);
 
     /* Accent / interactive */
@@ -47,6 +48,7 @@
     --code-block-text: #cdd6f4;
     --table-header-bg: rgba(255, 255, 255, 0.05);
     --unread-bg: rgba(77, 142, 240, 0.10); /* was 0.08 — slightly more visible */
+    --jump-highlight: rgba(77, 142, 240, 0.22);
     --mark-bg: rgba(251, 191, 36, 0.30);
 
     --primary-color: #4d8ef0;
@@ -966,15 +968,26 @@ textarea.form-input {
     color: var(--text-color);
 }
 
-/* Tap-to-scroll landing flash on the replied-to message. */
+/* Landing flash on a scrolled-to message: a reply quote, or a jump from the
+ * attachments / search panel. */
 .room-message.reply-target-flash,
 .message.reply-target-flash {
-    animation: reply-target-flash 1.5s ease-out;
+    animation: reply-target-flash 2s ease-out;
 }
 
+/* A full-bleed inset shadow tints the row without replacing the element's own
+ * background, so the same keyframes work on a plain room row and on a 1:1
+ * bubble. The second shadow is the accent rule; inset keeps both off the
+ * layout, so nothing reflows when the highlight starts. */
 @keyframes reply-target-flash {
-    0%, 40% { background: var(--unread-bg); }
-    100% { background: transparent; }
+    0%, 55% {
+        box-shadow: inset 0 0 0 100vmax var(--jump-highlight),
+                    inset 3px 0 0 var(--primary-color);
+    }
+    100% {
+        box-shadow: inset 0 0 0 100vmax transparent,
+                    inset 3px 0 0 transparent;
+    }
 }
 
 .room-message .message-time {

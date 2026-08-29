@@ -1643,17 +1643,24 @@
     /**
      * Scroll a message into view and flash it. Searches the visible view, so
      * the same call works for the room list and the 1:1 list.
+     *
+     * The scroll is instant because the flash is a CSS animation on its own
+     * clock: a smooth scroll across a backfilled history takes longer than the
+     * animation, so the highlight would expire before the target arrived.
+     * `animationend` owns the class removal, so the two durations cannot drift.
+     *
      * Returns false when the mid is not in the DOM.
      */
     function scrollToMessage(mid) {
         const el = document.querySelector(`.view:not(.hidden) [data-mid="${mid}"]`);
         if (!el) return false;
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.scrollIntoView({ behavior: 'instant', block: 'center' });
         el.classList.remove('reply-target-flash');
         // Reflow between remove and add so a repeat tap restarts the animation.
         void el.offsetWidth;
         el.classList.add('reply-target-flash');
-        setTimeout(() => el.classList.remove('reply-target-flash'), 1600);
+        el.addEventListener(
+            'animationend', () => el.classList.remove('reply-target-flash'), { once: true });
         return true;
     }
     
