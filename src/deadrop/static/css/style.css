@@ -551,17 +551,64 @@ textarea.form-input {
     color: var(--text-muted);
 }
 
-.spinner {
-    width: 24px;
-    height: 24px;
+.spinner,
+.load-more-sentinel::before {
     border: 3px solid var(--border-color);
     border-top-color: var(--primary-color);
     border-radius: 50%;
     animation: spin 1s linear infinite;
+    flex: none;
+}
+
+.spinner {
+    width: 24px;
+    height: 24px;
 }
 
 @keyframes spin {
     to { transform: rotate(360deg); }
+}
+
+/* Inline ring: sized to sit beside a label rather than fill a panel. */
+.catchup-indicator .spinner,
+.load-more-sentinel::before {
+    width: 14px;
+    height: 14px;
+    border-width: 2px;
+}
+
+/* Header status shown while a room's message backlog is in flight. */
+.catchup-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+/* Older-history sentinel at the visual top of the message list. The ring is
+   a pseudo-element so a caller may rewrite the label via textContent without
+   removing it. */
+.load-more-sentinel {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px;
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+.load-more-sentinel::before {
+    content: '';
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .spinner,
+    .load-more-sentinel::before {
+        animation: none;
+    }
 }
 
 /* Utilities */

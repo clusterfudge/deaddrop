@@ -105,6 +105,10 @@
                 <div class="subtitle" id="room-chat-members"></div>
             </div>
             <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
+                <div id="room-catchup-indicator" class="catchup-indicator hidden" role="status" aria-live="polite">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span>Catching up…</span>
+                </div>
                 <button id="room-panel-btn" class="btn btn-icon" title="Attachments and search" aria-label="Attachments and search">🗂</button>
                 <button class="theme-toggle" id="theme-toggle-btn-room-chat" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
                 <button id="room-refresh-btn" class="btn btn-icon" title="Refresh messages">🔄</button>
@@ -374,6 +378,7 @@
     let roomMessagesLoading = false;  // Guard against concurrent fetches
     let roomHasOlderMessages = true;  // Whether there are more messages to load on scroll-up
     let roomLoadingOlder = false;     // Guard against concurrent scroll-up fetches
+    let roomCatchupDepth = 0;         // In-flight backlog fetches (see setRoomCatchupBusy)
     let roomReadCursorTimer = null;   // Debounce timer for read cursor updates
     // Legacy long-poll removed — subscriptions are the sole update mechanism
     let subscriptionManager = null;  // Unified subscription manager
@@ -1350,9 +1355,25 @@
     
     const ROOM_PAGE_SIZE = {{ ROOM_PAGE_SIZE }};
 
+    /**
+     * Toggle the room header's "Catching up…" indicator.
+     *
+     * Backlog fetches overlap: a foreground refresh (`refreshOnForeground`)
+     * can start while a subscription-driven catch-up is still in flight, and
+     * a boolean would then hide the indicator while a fetch is still running.
+     * Counting in-flight fetches makes the last one to settle the one that
+     * hides it.
+     */
+    function setRoomCatchupBusy(busy) {
+        roomCatchupDepth = Math.max(0, roomCatchupDepth + (busy ? 1 : -1));
+        const el = document.getElementById('room-catchup-indicator');
+        if (el) el.classList.toggle('hidden', roomCatchupDepth === 0);
+    }
+
     async function loadRoomMessages() {
         const list = document.getElementById('room-message-list');
         roomMessagesLoading = true;
+        setRoomCatchupBusy(true);
         roomHasOlderMessages = true;
         
         // Try loading from cache first for instant display
@@ -1417,6 +1438,7 @@
             }
         } finally {
             roomMessagesLoading = false;
+            setRoomCatchupBusy(false);
         }
     }
     
@@ -1496,7 +1518,6 @@
                     const sentinel = document.createElement('div');
                     sentinel.id = 'room-load-more';
                     sentinel.className = 'load-more-sentinel';
-                    sentinel.style.cssText = 'text-align:center;padding:12px;color:var(--text-muted);font-size:13px;';
                     sentinel.textContent = 'Loading older messages…';
                     fragment.appendChild(sentinel);
                 } else {
@@ -1704,7 +1725,6 @@
             const sentinel = document.createElement('div');
             sentinel.id = 'room-load-more';
             sentinel.className = 'load-more-sentinel';
-            sentinel.style.cssText = 'text-align:center;padding:12px;color:var(--text-muted);font-size:13px;';
             sentinel.textContent = 'Loading older messages…';
             fragment.appendChild(sentinel);
         }
@@ -2418,6 +2438,7 @@
             console.log('[fetchNew] skipped — full load in progress');
             return;
         }
+        setRoomCatchupBusy(true);
         try {
             // Deduplicate: use a Set of existing mids
             const existingMids = new Set(roomMessages.map(m => m.mid));
@@ -2455,6 +2476,8 @@
             }
         } catch (e) {
             console.error('Failed to fetch new room messages:', e);
+        } finally {
+            setRoomCatchupBusy(false);
         }
     }
     
