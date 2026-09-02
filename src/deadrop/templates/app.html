@@ -455,6 +455,36 @@
     
     // ==================== MARKDOWN RENDERING ====================
     
+    /** True for an absolute http(s) URL that resolves to another origin. */
+    function isExternalUrl(href) {
+        try {
+            const url = new URL(href, window.location.href);
+            if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+            return url.origin !== window.location.origin;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Hand an external URL to Safari from an installed iOS web app.
+     *
+     * An iOS standalone context resolves target="_blank" into an in-app
+     * browser view rather than the browser, and an in-app browser view does
+     * not resolve universal links. The `x-safari-https:` scheme re-dispatches
+     * the URL through Safari, where a universal link reaches its native app.
+     * An unhandled scheme leaves the document visible, so the deferred
+     * window.open opens the in-app view instead of dropping the link.
+     */
+    function openInSafari(href) {
+        window.location.href = href.replace(/^http(s?):/, 'x-safari-http$1:');
+        setTimeout(() => {
+            if (document.visibilityState === 'visible') {
+                window.open(href, '_blank', 'noopener,noreferrer');
+            }
+        }, 1000);
+    }
+    
     // Configure marked for GitHub Flavored Markdown
     const markedInstance = new marked.Marked({
         breaks: true,      // Convert \n to <br>
@@ -469,10 +499,13 @@
                 return `<img src="${escapeHtml(href)}" alt="${alt}"${titleAttr} class="md-image" loading="lazy" onclick="openLightbox(this)" />`;
             };
             
-            // Links: open in new tab
+            // Links: external destinations leave the app; in-app routes stay.
             renderer.link = function({ href, title, text }) {
                 const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-                return `<a href="${escapeHtml(href)}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+                const targetAttr = isExternalUrl(href)
+                    ? ' target="_blank" rel="noopener noreferrer"'
+                    : '';
+                return `<a href="${escapeHtml(href)}"${titleAttr}${targetAttr}>${text}</a>`;
             };
             
             return renderer;
@@ -2518,6 +2551,18 @@
     }
     
     // ==================== EVENT LISTENERS ====================
+    
+    // A browser tab honours the anchor's own target="_blank"; an installed iOS
+    // web app needs the hand-off in openInSafari().
+    document.addEventListener('click', (e) => {
+        if (!DeadropPush.standalone() || !DeadropPush.isIOS()) return;
+        const anchor = e.target.closest && e.target.closest('.markdown-body a[target="_blank"]');
+        if (!anchor) return;
+        const href = anchor.getAttribute('href');
+        if (!href || !isExternalUrl(href)) return;
+        e.preventDefault();
+        openInSafari(anchor.href);
+    });
     
     document.getElementById('invite-go-btn').addEventListener('click', () => {
         const url = document.getElementById('invite-url-input').value.trim();
