@@ -477,6 +477,22 @@
             
             return renderer;
         })(),
+        tokenizer: {
+            // marked's GFM `del` rule accepts a single tilde (`~text~`) as well as
+            // `~~text~~`. Unlike cmark-gfm it has no flanking-run check, so two
+            // unrelated approximation tildes pair into one strikethrough span.
+            // Require a matching `~~` pair.
+            del(src) {
+                const match = /^~~(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))~~(?=[^~]|$)/.exec(src);
+                if (!match) return undefined;
+                return {
+                    type: 'del',
+                    raw: match[0],
+                    text: match[1],
+                    tokens: this.lexer.inlineTokens(match[1]),
+                };
+            },
+        },
     });
     
     /**
