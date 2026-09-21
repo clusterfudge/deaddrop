@@ -80,6 +80,33 @@ def test_app_version_falls_back_when_version_module_is_absent(monkeypatch):
     assert api._app_version() == "unknown"
 
 
+def test_app_version_uses_git_rev_when_the_vcs_fallback_is_all_metadata_has(monkeypatch):
+    """A build with no ``.git`` is identified by the platform's GIT_REV."""
+    import deadrop._version
+
+    monkeypatch.setattr(deadrop._version, "__version__", api._VCS_FALLBACK_VERSION)
+    monkeypatch.setenv("GIT_REV", "fd4e11671b6879d3d0d135b1e2ec5ae8893e1a0d")
+    assert api._app_version() == "fd4e11671b68"
+
+
+def test_app_version_keeps_the_derived_version_over_git_rev(monkeypatch):
+    """Healthy metadata names the commit already; GIT_REV does not override it."""
+    import deadrop._version
+
+    monkeypatch.setattr(deadrop._version, "__version__", "0.5.4.dev93+g4bc897259")
+    monkeypatch.setenv("GIT_REV", "fd4e11671b6879d3d0d135b1e2ec5ae8893e1a0d")
+    assert api._app_version() == "0.5.4.dev93+g4bc897259"
+
+
+def test_app_version_keeps_the_vcs_fallback_when_git_rev_is_unset(monkeypatch):
+    """Off-platform builds have neither; the badge still renders something."""
+    import deadrop._version
+
+    monkeypatch.setattr(deadrop._version, "__version__", api._VCS_FALLBACK_VERSION)
+    monkeypatch.delenv("GIT_REV", raising=False)
+    assert api._app_version() == api._VCS_FALLBACK_VERSION
+
+
 # --- Cache-Control on the PWA control documents ---
 
 
