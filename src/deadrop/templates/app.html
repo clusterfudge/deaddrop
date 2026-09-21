@@ -1523,10 +1523,8 @@
             // excludeReactions=true is already passed to getRoomMessages above,
             // olderPage excludes reactions server-side; the filter here is
             // belt-and-suspenders for older server versions.
-            const collapsed = collapsibleAnswerMids(
-                roomMessages.filter(m => m.content_type !== 'reaction'), answerMap);
             const olderDisplay = olderPage.filter(
-                m => m.content_type !== 'reaction' && !collapsed.has(m.mid));
+                m => m.content_type !== 'reaction' && !isBareAnswerMessage(m, answerMap));
 
             // Build a DocumentFragment with the older messages.
             // column-reverse: DOM order is newest→oldest, so older messages
@@ -1651,10 +1649,14 @@
      * reference_mid in the loaded page, so a reply whose target is not loaded
      * degrades to a plain message rather than an empty quote.
      */
-    function renderReplyQuote(msg) {
+    function renderReplyQuote(msg, answerMap) {
         if (!msg.reference_mid || msg.content_type === 'reaction') return '';
         const target = findRoomMessage(msg.reference_mid);
         if (!target) return '';
+        // A quote of an answer that draws no element degrades the way a quote
+        // of a message outside the loaded window does: it is left out, so the
+        // jump-back is not offered for something there is nothing to jump to.
+        if (isBareAnswerMessage(target, answerMap)) return '';
         return `<button class="reply-quote" onclick="scrollToMessage('${target.mid}')"
                         title="Go to the replied-to message">
                     <span class="reply-quote-author">${escapeHtml(getMemberName(target.from_id))}</span>
@@ -1951,39 +1953,31 @@
     }
 
     /**
-     * The mids of answer messages whose bubble would only repeat the card it
-     * answers: this member has answered, so the card renders the whole Q&A,
-     * and no other message landed between the two. An answer something else
-     * points at — a reply, a reaction — or one carrying an attachment keeps
-     * its bubble, since the card reads back answers and not those.
+     * Whether a message is an answer: it points at a question card and
+     * carries a machine line for one of that question's qids. `answer:<qid>:
+     * <ids>` is the transport the card reads back, not prose, so an answer
+     * renders no text bubble — at any distance from its question, whoever
+     * sent it, whatever points at it. The card's read-back is the only view
+     * of an answer.
      *
-     * An answer already collapsed is not an intervening message, so a
-     * question answered by two members back to back collapses both.
+     * Identification goes through the answer map rather than the line's shape
+     * alone, so a member who types `answer:x:y` at a message we cannot parse
+     * as a question keeps their bubble.
      */
-    function collapsibleAnswerMids(displayMessages, answerMap) {
-        const pointedAt = new Set();
-        for (const msg of roomMessages) {
-            if (msg.reference_mid) pointedAt.add(msg.reference_mid);
-        }
-        const position = new Map();
-        displayMessages.forEach((msg, i) => position.set(msg.mid, i));
+    function isAnswerMessage(msg, answerMap) {
+        if (!msg.reference_mid || msg.content_type === 'reaction') return false;
+        const entries = (answerMap && answerMap[msg.reference_mid]) || [];
+        return entries.some(a => a.mid === msg.mid);
+    }
 
-        const collapsed = new Set();
-        displayMessages.forEach((msg, i) => {
-            const entries = (msg.reference_mid && answerMap[msg.reference_mid]) || [];
-            if (!entries.some(a => a.mid === msg.mid)) return;
-            if (!entries.some(a => a.from_id === credentials.id)) return;
-            if (pointedAt.has(msg.mid)) return;
-            if (msg.attachments && msg.attachments.length) return;
-
-            const questionAt = position.get(msg.reference_mid);
-            if (questionAt === undefined || questionAt >= i) return;
-            for (let k = questionAt + 1; k < i; k++) {
-                if (!collapsed.has(displayMessages[k].mid)) return;
-            }
-            collapsed.add(msg.mid);
-        });
-        return collapsed;
+    /**
+     * An answer with nothing of its own to show, so no element at all. An
+     * answer carrying an attachment keeps one: the card reads back answers
+     * and not files, and dropping the element would drop the file.
+     */
+    function isBareAnswerMessage(msg, answerMap) {
+        if (!isAnswerMessage(msg, answerMap)) return false;
+        return !(msg.attachments && msg.attachments.length);
     }
 
     /**
@@ -2053,7 +2047,9 @@
      * step, then prev/next. A card this member has answered renders as a Q&A
      * read-back — each prompt paired with the answer given — because the
      * wizard, the buttons and the free-text row are all for answering, and
-     * that is over.
+     * that is over. A card someone else has answered keeps its controls and
+     * carries their read-back below them, since an answer has no bubble and
+     * the card is the only place it can be read.
      *
      * Question bodies are agent-authored, so every payload-derived string
      * lands via textContent on an element built here. Nothing from the
@@ -2102,16 +2098,20 @@
             }
         }
 
+        // Another member's answer has no bubble either, so this is where it
+        // shows: the same read-back, over the answers that exist, while the
+        // card stays open for this member's own.
+        if (answers.length && !answeredByMe) {
+            const others = buildAnswerReadback(payload, answers);
+            others.classList.add('question-qa-others');
+            card.appendChild(others);
+        }
+
         if (answers.length) {
             const footer = document.createElement('div');
             footer.className = 'question-answered-by';
-            const parts = [`Answered by ${answers.map(a => getMemberName(a.from_id)).join(', ')}`];
-            if (!payload.isForm && !answeredByMe) {
-                for (const a of answersFor(answers, payload.questions[0].qid)) {
-                    if (a.freeText) parts.push(`${getMemberName(a.from_id)}: \u201c${a.freeText}\u201d`);
-                }
-            }
-            footer.textContent = parts.join(' \u00b7 ');
+            footer.textContent =
+                `Answered by ${answers.map(a => getMemberName(a.from_id)).join(', ')}`;
             card.appendChild(footer);
         }
 
@@ -2582,13 +2582,16 @@
         const isPending = msg.pending;
         const question = msg.content_type === QUESTION_CONTENT_TYPE
             ? parseQuestion(msg.body) : null;
+        // A question's body is drawn as a card and an answer's is machine
+        // plumbing the card reads back; neither renders as message text.
+        const bodyIsRendered = !question && !isAnswerMessage(msg, answerMap);
         const el = document.createElement('div');
         el.className = `room-message${isMe ? ' from-me' : ''}${isPending ? ' pending' : ''}`;
         el.dataset.mid = msg.mid;
         el.innerHTML = `
             <div class="sender-name">${getMemberName(msg.from_id)}</div>
-            ${renderReplyQuote(msg)}
-            <div class="message-body markdown-body">${question ? '' : renderMessageBody(msg.body, msg.content_type)}</div>
+            ${renderReplyQuote(msg, answerMap)}
+            <div class="message-body markdown-body">${bodyIsRendered ? renderMessageBody(msg.body, msg.content_type) : ''}</div>
             ${renderAttachments(msg)}
             ${renderReactionBadges(msg.mid, reactionMap)}
             <div class="message-time" title="${isPending ? '' : formatAbsolute(msg.created_at)}">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
@@ -2610,10 +2613,8 @@
         // Filter out reaction messages from the main list
         const displayMessages = roomMessages.filter(m => m.content_type !== 'reaction');
 
-        // An answer the card above it already reads back is drawn in place of
-        // that card rather than under it.
-        const collapsed = collapsibleAnswerMids(displayMessages, answerMap);
-        const visible = displayMessages.filter(m => !collapsed.has(m.mid));
+        // An answer is read back by its card, so it has no bubble of its own.
+        const visible = displayMessages.filter(m => !isBareAnswerMessage(m, answerMap));
         
         // column-reverse layout: newest message must be first in DOM order
         // (DOM top = visual bottom, DOM bottom = visual top / oldest).

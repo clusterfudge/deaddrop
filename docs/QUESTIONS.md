@@ -197,13 +197,26 @@ change.
 - The answered state is **derived from the reply at render time** — the same
   way a reply quote is. Several members can answer the same question and each
   answer is attributed.
-- **An answer sitting immediately under the card is drawn in place of it.**
-  The card already reads the whole exchange back, so the reply's own bubble
-  would repeat it; the bubble is suppressed and the read-back stands alone.
-  With any other message between the question and the answer, the bubble
-  stays — collapsing it there would move the answer back past that message.
-  An answer someone replied to, reacted to, or that carries an attachment
-  keeps its bubble too, since the card reads back answers and not those.
+- A card **someone else** has answered keeps its controls, since it is still
+  yours to fill in, and carries their read-back below them. That is the only
+  place their answer appears, so it names them and includes the free text no
+  option button could show.
+- **An answer never renders as a bubble.** `answer:<qid>:<ids>` is how a card
+  gets its answer back, not a message, so it is drawn nowhere in the stream —
+  at any distance from its question, whoever sent it, whatever points at it.
+  The card's read-back is the only view of an answer. A member who types
+  `answer:x:y` at a message that is not a question card they name a qid on
+  keeps their bubble: identification runs through the parsed payload, not the
+  line's shape.
+- Three things follow from that, and are what the tests pin down:
+  - An answer carrying an **attachment** keeps an element for the file alone —
+    the chip, without the machine line — because the card reads back answers
+    and not files.
+  - A **reply quoting** an answer keeps its own bubble and loses the quote,
+    which is what the app already does with a quote of a message outside the
+    loaded window.
+  - A **reaction** on an answer is drawn on an element that is not there, so
+    it leaves no trace.
 
 ### A form
 
@@ -231,8 +244,8 @@ change.
 - A submitted form is a read-back, not something to navigate: every prompt
   with the answer given for it, in payload order, an unanswered optional
   question reading *Skipped*. Another member's submission does not lock it
-  for you — until you have answered, the wizard is still yours to fill in and
-  their reply stays in the stream.
+  for you — until you have answered, the wizard is still yours to fill in,
+  and their answers read back underneath it.
 
 Question bodies are agent-authored, so every payload-derived string is set
 via `textContent` on an element built in JS. No payload field is interpolated
@@ -245,7 +258,7 @@ into HTML.
 | File | Covers |
 |---|---|
 | `tests/test_question_messages.py` (9) | The API stores both payload shapes verbatim; answers survive `exclude_reactions`; several members can answer; a form's single reply parses as N answers under the documented grammar. |
-| `tests/test_question_playwright.py` (49) | Rendering, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across navigation and a reload, wizard nav (step order, first-step Back, ungated Next, review reachability, jump-back lines), required-gating, review contents, the exact single-submit body, and the answered card's Q&A read-back. The in-place rule is tested from the stream's order: adjacent answers collapse (including two in a row), an intervening message or a reply pointing at the answer keeps the bubble, and another member's answer alone collapses nothing. Touch targets are **measured**: every `button` and `input` in a form card is asserted ≥ 44×44px on every step, portrait and landscape, and a read-back is asserted to carry none. |
+| `tests/test_question_playwright.py` (54) | Rendering, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across navigation and a reload, wizard nav (step order, first-step Back, ungated Next, review reachability, jump-back lines), required-gating, review contents, the exact single-submit body, and the answered card's Q&A read-back. Bubble suppression is tested from the stream's order — adjacent, with a message in between, four messages later, two answers at once, another member's alone — plus the attachment, reply-quote and reaction dispositions and the mismatched-qid case that must keep its bubble. Touch targets are **measured**: every `button` and `input` in a form card is asserted ≥ 44×44px on every step, portrait and landscape, and a read-back is asserted to carry none. |
 
 ---
 
