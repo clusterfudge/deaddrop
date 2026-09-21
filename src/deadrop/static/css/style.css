@@ -1171,7 +1171,7 @@ textarea.form-input {
     color: var(--text-muted);
 }
 
-/* ---- Multi-question forms: one card, one submit ---- */
+/* ---- Multi-question forms: one question in view, one submit ---- */
 
 .question-card.question-form { gap: 14px; }
 
@@ -1220,42 +1220,92 @@ textarea.form-input {
     color: var(--primary-color);
 }
 
-.question-form-chrome {
+/* The wizard's prev/next row. Bottom of the card, full-width targets: this
+   is answered with a thumb on a 390px screen. */
+.question-wizard-nav {
     display: flex;
-    flex-direction: column;
     gap: 8px;
+    align-items: stretch;
     padding-top: 10px;
     border-top: 1px solid var(--border-color);
 }
 
-.question-review {
+.question-wizard-prev,
+.question-wizard-next {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 14px;
     border: 1px solid var(--border-color);
     border-radius: var(--radius);
     background: var(--input-bg);
-}
-
-.question-review-summary {
-    min-height: 44px;
-    display: flex;
-    align-items: center;
-    padding: 0 12px;
-    font-size: 14px;
-    font-weight: 600;
     color: var(--text-color);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
     cursor: pointer;
 }
 
-.question-review-summary:focus-visible {
-    outline: 2px solid var(--primary-color);
-    outline-offset: -2px;
+.question-wizard-prev { flex: 0 0 auto; }
+
+.question-wizard-next {
+    flex: 1;
+    border-color: var(--primary-color);
+    color: var(--primary-color);
 }
 
+.question-wizard-prev:hover:not(:disabled),
+.question-wizard-next:hover:not(:disabled) {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+.question-wizard-prev:focus-visible,
+.question-wizard-next:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 1px;
+}
+
+.question-wizard-prev:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.question-wizard-nav .question-form-submit { flex: 1; }
+
+.question-review {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    background: var(--input-bg);
+    overflow: hidden;
+}
+
+/* A review line is a jump back to its question, so it is a tap target. */
 .question-review-line {
     display: flex;
     flex-direction: column;
+    justify-content: center;
     gap: 2px;
+    width: 100%;
+    min-height: 44px;
     padding: 8px 12px;
+    border: none;
     border-top: 1px solid var(--border-color);
+    background: transparent;
+    color: inherit;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.question-review-line:first-child { border-top: none; }
+
+.question-review-line:hover { background: var(--hover-bg); }
+
+.question-review-line:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: -2px;
 }
 
 .question-review-prompt {
