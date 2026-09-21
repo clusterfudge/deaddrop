@@ -1024,6 +1024,288 @@ textarea.form-input {
     100% { background: transparent; }
 }
 
+/* ---- Interactive question cards (application/x-question) ---- */
+
+.question-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 420px;
+    padding: 12px;
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--primary-color);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    background: var(--card-bg);
+    text-align: left;
+}
+
+.question-card.sending { opacity: 0.7; }
+
+.question-prompt {
+    font-weight: 600;
+    color: var(--text-color);
+    line-height: 1.35;
+}
+
+.question-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* 44px minimum target: these are tapped on a phone. */
+.question-option {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-height: 44px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    background: var(--input-bg);
+    color: var(--text-color);
+    font-family: inherit;
+    font-size: 15px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.question-option:hover:not(:disabled) {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+.question-option:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 1px;
+}
+
+.question-option:disabled { cursor: default; }
+
+.question-option-label { font-weight: 500; }
+
+.question-option-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.question-option-who {
+    font-size: 11px;
+    color: var(--primary-color);
+    font-weight: 600;
+}
+
+/* Staged in a multi-select card, not yet sent. */
+.question-option.staged {
+    border-color: var(--primary-color);
+    background: var(--unread-bg);
+}
+
+/* The answer that was taken, and the ones that weren't. */
+.question-option.chosen {
+    border-color: var(--success-color);
+    border-width: 2px;
+    background: var(--hover-bg);
+    opacity: 1;
+}
+
+.question-option.dimmed {
+    opacity: 0.55;
+    color: var(--text-muted);
+}
+
+.question-multi-send,
+.question-free-send {
+    min-height: 44px;
+    padding: 10px 14px;
+    border: none;
+    border-radius: var(--radius);
+    background: var(--primary-color);
+    color: #fff;
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.question-multi-send:hover:not(:disabled),
+.question-free-send:hover:not(:disabled) {
+    background: var(--primary-hover);
+}
+
+.question-multi-send:disabled,
+.question-free-send:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.question-free-text {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+}
+
+.question-free-input {
+    flex: 1;
+    min-width: 0;
+    min-height: 44px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    background: var(--input-bg);
+    color: var(--text-color);
+    font-family: inherit;
+    font-size: 15px;
+}
+
+.question-free-input:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.question-free-send { flex-shrink: 0; }
+
+.question-answered-by {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+/* ---- Multi-question forms: one card, one submit ---- */
+
+.question-card.question-form { gap: 14px; }
+
+.question-title {
+    font-weight: 700;
+    font-size: 16px;
+    color: var(--text-color);
+    line-height: 1.3;
+}
+
+.question-form-progress {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+}
+
+.question-item {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* A required question with nothing chosen yet reads as an open slot. */
+.question-form .question-item {
+    padding-left: 10px;
+    border-left: 2px solid var(--success-color);
+}
+
+.question-form .question-item.unanswered {
+    border-left: 2px dashed var(--border-color);
+}
+
+.question-optional-tag {
+    margin-left: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.question-item-answer {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--primary-color);
+}
+
+.question-form-chrome {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-color);
+}
+
+.question-review {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    background: var(--input-bg);
+}
+
+.question-review-summary {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-color);
+    cursor: pointer;
+}
+
+.question-review-summary:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: -2px;
+}
+
+.question-review-line {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border-color);
+}
+
+.question-review-prompt {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.question-review-answer {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-color);
+}
+
+.question-review-answer.missing {
+    font-weight: 500;
+    font-style: italic;
+    color: var(--text-muted);
+}
+
+.question-form-submit {
+    min-height: 44px;
+    padding: 10px 14px;
+    border: none;
+    border-radius: var(--radius);
+    background: var(--primary-color);
+    color: #fff;
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.question-form-submit:hover:not(:disabled) { background: var(--primary-hover); }
+
+.question-form-submit:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* Questions keep the left-anchored card layout even when self-sent, so an
+   agent's own question reads the same as anyone's. */
+.room-message.from-me .question-card { align-self: flex-start; }
+
+@media (max-width: 480px) {
+    .question-card {
+        max-width: 100%;
+        width: 100%;
+    }
+}
+
 .room-message .message-time {
     font-size: 11px;
     color: var(--text-muted);

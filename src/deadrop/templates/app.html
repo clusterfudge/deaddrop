@@ -528,6 +528,13 @@
             }
         }
         
+        if (contentType === QUESTION_CONTENT_TYPE) {
+            // A question whose card could not be built (malformed payload,
+            // or a non-room surface). Show the prompt and option labels, not
+            // the JSON.
+            return escapeHtml(questionFallbackText(body)).replace(/\n/g, '<br>');
+        }
+        
         // text/plain or no content_type: escape and convert newlines
         return escapeHtml(body).replace(/\n/g, '<br>');
     }
@@ -1506,6 +1513,7 @@
 
             // Build reaction map across the full updated message set
             const reactionMap = buildReactionMap(roomMessages);
+            const answerMap = buildAnswerMap(roomMessages);
 
             // Filter out reactions from display set.
             // NOTE: prior versions referenced a stale `allOlder` variable — an
@@ -1523,7 +1531,7 @@
             // so we reverse it to maintain newest→oldest DOM order.
             const fragment = document.createDocumentFragment();
             for (let i = olderDisplay.length - 1; i >= 0; i--) {
-                fragment.appendChild(renderMessageElement(olderDisplay[i], reactionMap));
+                fragment.appendChild(renderMessageElement(olderDisplay[i], reactionMap, answerMap));
             }
 
             // If there are still more pages, keep the sentinel at the
@@ -1613,7 +1621,11 @@
      * but it must not show `**bold**` as literal asterisks either.
      */
     function replySnippet(msg) {
-        const text = (msg.body || '')
+        // A question's body is JSON; the quote gets its prompt.
+        const source = msg.content_type === QUESTION_CONTENT_TYPE
+            ? questionFallbackText(msg.body).split('\n')[0]
+            : (msg.body || '');
+        const text = source
             .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')   // links → link text
             .replace(/[*_`~#>]/g, '')
             .replace(/\s+/g, ' ')
@@ -1694,24 +1706,756 @@
         return true;
     }
     
+    // ==================== INTERACTIVE QUESTIONS ====================
+
+    // A question is a room message with this content_type and a JSON body.
+    // An answer is an ordinary text/markdown message whose reference_mid is
+    // the question's mid, carrying a machine line `answer:<qid>:<ids>`. No
+    // server-side state: the answered view is derived from the stream at
+    // render time, the same way reply quotes are.
+    const QUESTION_CONTENT_TYPE = 'application/x-question';
+    const QUESTION_FREE_TEXT_ID = '_free';
+    const QUESTION_MAX_OPTIONS = 12;
+    const QUESTION_MAX_QUESTIONS = 20;
+    const QUESTION_FREE_TEXT_MAX = 500;
+    const ANSWER_LINE_RE = /^answer:([^\s:]+):(\S*)[ \t]*$/gm;
+    const ANSWER_BULLET = '\u25b8';
+    const FORM_PROMPT_SEP = ' \u2014 ';
+    const ID_RE = /^[A-Za-z0-9._-]+$/;
+    const STAGED_PREFIX = 'ddq:';
+
+    // Question mids with an answer POST in flight. A second tap returns
+    // early, so a double-tap cannot post twice.
+    const questionSending = new Set();
+    // Form mids whose review pane is expanded. A tap rerenders the card, so
+    // the disclosure state lives outside the DOM.
+    const questionReviewOpen = new Set();
+    // Used when localStorage throws (private mode, quota): staging still
+    // works for the life of the page, it just does not survive a reload.
+    const stagedFallback = new Map();
+
+    function stagedKey(mid, qid) {
+        return `${STAGED_PREFIX}${mid}:${qid}`;
+    }
+
+    /**
+     * Staged (chosen but unsent) state for one question of one message.
+     * Persisted per mid+qid so a half-filled form survives a reload, an app
+     * switch, or a phone lock.
+     */
+    function readStaged(mid, qid) {
+        const key = stagedKey(mid, qid);
+        let raw = null;
+        try {
+            raw = localStorage.getItem(key);
+        } catch (e) {
+            raw = stagedFallback.get(key) || null;
+        }
+        let ids = [];
+        let free = '';
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed.ids)) ids = parsed.ids.filter(i => typeof i === 'string');
+                if (typeof parsed.free === 'string') free = parsed.free;
+            } catch (e) { /* corrupt entry: treat as unstaged */ }
+        }
+        return { ids: new Set(ids), free };
+    }
+
+    function writeStaged(mid, qid, ids, free) {
+        const key = stagedKey(mid, qid);
+        const idList = [...ids];
+        if (!idList.length && !free) {
+            try {
+                localStorage.removeItem(key);
+            } catch (e) { /* ignore */ }
+            stagedFallback.delete(key);
+            return;
+        }
+        const raw = JSON.stringify({ ids: idList, free });
+        try {
+            localStorage.setItem(key, raw);
+        } catch (e) {
+            stagedFallback.set(key, raw);
+        }
+    }
+
+    /** Drop every staged answer for a message. Called on a successful send. */
+    function clearStaged(mid) {
+        const prefix = `${STAGED_PREFIX}${mid}:`;
+        try {
+            const doomed = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith(prefix)) doomed.push(key);
+            }
+            doomed.forEach(k => localStorage.removeItem(k));
+        } catch (e) { /* ignore */ }
+        for (const key of [...stagedFallback.keys()]) {
+            if (key.startsWith(prefix)) stagedFallback.delete(key);
+        }
+    }
+
+    /**
+     * Validate one question entry. Returns null if it is not well formed, so
+     * a payload carrying it degrades to text rather than a partial card.
+     */
+    function parseQuestionEntry(data) {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+        if (typeof data.qid !== 'string' || !ID_RE.test(data.qid.trim())) return null;
+        if (typeof data.prompt !== 'string' || !data.prompt.trim()) return null;
+        if (!Array.isArray(data.options)) return null;
+        if (data.options.length === 0 || data.options.length > QUESTION_MAX_OPTIONS) return null;
+
+        const seen = new Set();
+        const options = [];
+        for (const opt of data.options) {
+            if (!opt || typeof opt !== 'object') return null;
+            const id = typeof opt.id === 'string' ? opt.id.trim() : '';
+            const label = typeof opt.label === 'string' ? opt.label.trim() : '';
+            // Ids travel inside a colon/comma-delimited machine line and the
+            // free-text id is reserved, so both are constrained here.
+            if (!id || !label || id === QUESTION_FREE_TEXT_ID) return null;
+            if (!ID_RE.test(id) || seen.has(id)) return null;
+            seen.add(id);
+            options.push({
+                id,
+                label,
+                description: typeof opt.description === 'string' ? opt.description.trim() : '',
+            });
+        }
+        return {
+            qid: data.qid.trim(),
+            prompt: data.prompt.trim(),
+            options,
+            allow_free_text: data.allow_free_text === true,
+            multi: data.multi === true,
+            optional: data.optional === true,
+        };
+    }
+
+    /**
+     * Validate and normalize a question payload into one shape:
+     * {title, isForm, questions:[entry]}. A single-question payload is a
+     * one-entry form with isForm false, which is what keeps its round-one
+     * behavior (a tap posts immediately) distinct from a form's (a tap
+     * stages, one Submit posts).
+     *
+     * Returns null for anything not well formed, including a form with one
+     * bad entry: dropping the bad question silently would leave an agent
+     * waiting forever for a qid the card never rendered.
+     */
+    function parseQuestion(body) {
+        let data;
+        try {
+            data = JSON.parse(body);
+        } catch (e) {
+            return null;
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+
+        const title = typeof data.title === 'string' ? data.title.trim() : '';
+
+        if (Array.isArray(data.questions)) {
+            if (data.questions.length === 0) return null;
+            if (data.questions.length > QUESTION_MAX_QUESTIONS) return null;
+            const questions = [];
+            const seen = new Set();
+            for (const raw of data.questions) {
+                const entry = parseQuestionEntry(raw);
+                if (!entry || seen.has(entry.qid)) return null;
+                seen.add(entry.qid);
+                questions.push(entry);
+            }
+            return { title, isForm: true, questions };
+        }
+
+        const single = parseQuestionEntry(data);
+        if (!single) return null;
+        return { title, isForm: false, questions: [single] };
+    }
+
+    /**
+     * Readable text for a question body that is not being rendered as a card.
+     */
+    function questionFallbackText(body) {
+        let data;
+        try {
+            data = JSON.parse(body);
+        } catch (e) {
+            return body || '';
+        }
+        if (!data || typeof data !== 'object') return body || '';
+        const entries = Array.isArray(data.questions) ? data.questions : [data];
+        const lines = [];
+        if (typeof data.title === 'string' && data.title.trim()) lines.push(data.title.trim());
+        for (const entry of entries) {
+            if (!entry || typeof entry !== 'object') continue;
+            if (typeof entry.prompt === 'string' && entry.prompt.trim()) {
+                lines.push(entry.prompt.trim());
+            }
+            if (Array.isArray(entry.options)) {
+                for (const opt of entry.options) {
+                    if (opt && typeof opt.label === 'string') {
+                        lines.push(`${ANSWER_BULLET} ${opt.label}`);
+                    }
+                }
+            }
+        }
+        return lines.length ? lines.join('\n') : (body || '');
+    }
+
+    /**
+     * question mid -> [{from_id, byQid: Map<qid, {optionIds:Set, freeText}>}]
+     * for every reply carrying at least one machine line whose qid belongs to
+     * that question. A form's single reply carries one line per question, so
+     * one reply yields N entries in its map.
+     */
+    function buildAnswerMap(messages) {
+        const payloadByMid = new Map();
+        for (const msg of messages) {
+            if (msg.content_type !== QUESTION_CONTENT_TYPE) continue;
+            const payload = parseQuestion(msg.body);
+            if (payload) payloadByMid.set(msg.mid, payload);
+        }
+
+        const map = {};
+        for (const msg of messages) {
+            if (!msg.reference_mid || msg.content_type === 'reaction') continue;
+            const payload = payloadByMid.get(msg.reference_mid);
+            if (!payload) continue;
+            const body = msg.body || '';
+            const byQid = new Map();
+            for (const match of body.matchAll(ANSWER_LINE_RE)) {
+                const question = payload.questions.find(q => q.qid === match[1]);
+                if (!question) continue;
+                const optionIds = new Set(match[2].split(',').map(s => s.trim()).filter(Boolean));
+                if (optionIds.size === 0) continue;
+                byQid.set(question.qid, {
+                    optionIds,
+                    freeText: optionIds.has(QUESTION_FREE_TEXT_ID)
+                        ? extractFreeText(body, question, payload.isForm) : '',
+                });
+            }
+            if (!byQid.size) continue;
+            if (!map[msg.reference_mid]) map[msg.reference_mid] = [];
+            map[msg.reference_mid].push({ from_id: msg.from_id, byQid });
+        }
+        return map;
+    }
+
+    /**
+     * Recover a free-text answer from the human-readable bullet lines. A
+     * single-question answer's bullets are labels alone; a form's are
+     * `prompt — labels`, so the question's own prompt locates its line.
+     */
+    function extractFreeText(body, question, isForm) {
+        const bullets = body.split('\n').filter(line => line.startsWith(`${ANSWER_BULLET} `))
+            .map(line => line.slice(2));
+        if (!isForm) return bullets.join(' ').trim();
+        const marker = `${question.prompt}${FORM_PROMPT_SEP}`;
+        for (const line of bullets) {
+            if (line.startsWith(marker)) return line.slice(marker.length).trim();
+        }
+        return '';
+    }
+
+    /** The answer entry this member submitted for a question, if any. */
+    function myAnswer(answers, qid) {
+        for (const a of answers) {
+            if (a.from_id === credentials.id && a.byQid.has(qid)) return a.byQid.get(qid);
+        }
+        return null;
+    }
+
+    /** Everyone's answer for one question, as [{from_id, optionIds, freeText}]. */
+    function answersFor(answers, qid) {
+        const out = [];
+        for (const a of answers) {
+            const entry = a.byQid.get(qid);
+            if (entry) out.push({ from_id: a.from_id, ...entry });
+        }
+        return out;
+    }
+
+    /** A question counts as chosen when an option is staged or text is typed. */
+    function isStagedAnswered(mid, question) {
+        const staged = readStaged(mid, question.qid);
+        if (staged.ids.size) return true;
+        return question.allow_free_text && staged.free.trim().length > 0;
+    }
+
+    /** The labels a staged answer would post, for the review pane. */
+    function stagedLabels(mid, question) {
+        const staged = readStaged(mid, question.qid);
+        const labels = [];
+        for (const opt of question.options) {
+            if (staged.ids.has(opt.id)) labels.push(opt.label);
+        }
+        if (question.allow_free_text && staged.free.trim()) labels.push(staged.free.trim());
+        return labels;
+    }
+
+    /**
+     * Build the tappable card for a question payload — one question, or a
+     * form of several with a single Submit.
+     *
+     * Question bodies are agent-authored, so every payload-derived string
+     * lands via textContent on an element built here. Nothing from the
+     * payload is interpolated into HTML.
+     */
+    function renderQuestionCard(msg, payload, answerMap) {
+        const answers = (answerMap && answerMap[msg.mid]) || [];
+        const answeredByMe = answers.some(a => a.from_id === credentials.id);
+        const sending = questionSending.has(msg.mid);
+        const locked = answeredByMe || sending;
+
+        const card = document.createElement('div');
+        card.className = 'question-card';
+        if (payload.isForm) card.classList.add('question-form');
+        if (answers.length) card.classList.add('answered');
+        if (sending) card.classList.add('sending');
+        card.dataset.qid = payload.questions[0].qid;
+
+        if (payload.title) {
+            const title = document.createElement('div');
+            title.className = 'question-title';
+            title.textContent = payload.title;
+            card.appendChild(title);
+        }
+
+        if (payload.isForm) {
+            const progress = document.createElement('div');
+            progress.className = 'question-form-progress';
+            card.appendChild(progress);
+        }
+
+        for (const question of payload.questions) {
+            card.appendChild(buildQuestionItem(msg, payload, question, answers, locked));
+        }
+
+        if (payload.isForm && !locked) {
+            card.appendChild(buildFormChrome(msg, payload));
+        }
+
+        if (answers.length) {
+            const footer = document.createElement('div');
+            footer.className = 'question-answered-by';
+            const parts = [`Answered by ${answers.map(a => getMemberName(a.from_id)).join(', ')}`];
+            if (!payload.isForm) {
+                for (const a of answersFor(answers, payload.questions[0].qid)) {
+                    if (a.freeText) parts.push(`${getMemberName(a.from_id)}: \u201c${a.freeText}\u201d`);
+                }
+            }
+            footer.textContent = parts.join(' \u00b7 ');
+            card.appendChild(footer);
+        }
+
+        if (payload.isForm) syncFormChrome(card, msg, payload);
+        return card;
+    }
+
+    /** One question inside a card: prompt, option buttons, optional extras. */
+    function buildQuestionItem(msg, payload, question, answers, locked) {
+        const mine = myAnswer(answers, question.qid);
+        const everyone = answersFor(answers, question.qid);
+        const staged = readStaged(msg.mid, question.qid);
+        const itemLocked = locked;
+
+        const item = document.createElement('div');
+        item.className = 'question-item';
+        item.dataset.qid = question.qid;
+
+        const prompt = document.createElement('div');
+        prompt.className = 'question-prompt';
+        prompt.textContent = question.prompt;
+        if (payload.isForm && question.optional) {
+            const opt = document.createElement('span');
+            opt.className = 'question-optional-tag';
+            opt.textContent = 'optional';
+            prompt.appendChild(opt);
+        }
+        item.appendChild(prompt);
+
+        const optionList = document.createElement('div');
+        optionList.className = 'question-options';
+        for (const opt of question.options) {
+            const chosenBy = everyone.filter(a => a.optionIds.has(opt.id));
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'question-option';
+            if (chosenBy.length) btn.classList.add('chosen');
+            else if (everyone.length) btn.classList.add('dimmed');
+            const isStaged = staged.ids.has(opt.id);
+            if (isStaged && !mine) btn.classList.add('staged');
+            btn.dataset.optionId = opt.id;
+            btn.disabled = itemLocked;
+            if (payload.isForm || question.multi) btn.setAttribute('aria-pressed', String(isStaged));
+
+            const label = document.createElement('span');
+            label.className = 'question-option-label';
+            label.textContent = opt.label;
+            btn.appendChild(label);
+
+            if (opt.description) {
+                const desc = document.createElement('span');
+                desc.className = 'question-option-desc';
+                desc.textContent = opt.description;
+                btn.appendChild(desc);
+            }
+            if (chosenBy.length) {
+                const who = document.createElement('span');
+                who.className = 'question-option-who';
+                who.textContent = chosenBy.map(a => getMemberName(a.from_id)).join(', ');
+                btn.appendChild(who);
+            }
+
+            btn.addEventListener('click', () => {
+                if (payload.isForm || question.multi) {
+                    stageQuestionOption(msg.mid, question, opt.id);
+                } else {
+                    answerQuestion(msg.mid, question.qid, [opt.id]);
+                }
+            });
+            optionList.appendChild(btn);
+        }
+        item.appendChild(optionList);
+
+        // A single-question multi card sends itself; in a form the Submit
+        // button at the bottom of the card sends every question at once.
+        if (!payload.isForm && question.multi && !itemLocked) {
+            const send = document.createElement('button');
+            send.type = 'button';
+            send.className = 'question-multi-send';
+            send.textContent = staged.ids.size
+                ? `Send ${staged.ids.size} answer${staged.ids.size > 1 ? 's' : ''}`
+                : 'Select one or more';
+            send.disabled = staged.ids.size === 0;
+            send.addEventListener('click',
+                () => answerQuestion(msg.mid, question.qid, [...staged.ids]));
+            item.appendChild(send);
+        }
+
+        if (question.allow_free_text && !itemLocked) {
+            item.appendChild(buildFreeTextRow(msg, payload, question, staged));
+        }
+
+        if (payload.isForm && mine) {
+            const chose = document.createElement('div');
+            chose.className = 'question-item-answer';
+            const labels = [...mine.optionIds]
+                .map(id => id === QUESTION_FREE_TEXT_ID
+                    ? mine.freeText
+                    : (question.options.find(o => o.id === id) || {}).label)
+                .filter(Boolean);
+            chose.textContent = labels.length ? labels.join(', ') : 'Not answered';
+            item.appendChild(chose);
+        }
+        return item;
+    }
+
+    /**
+     * A free-text input. In a form it stages like an option tap; alone it
+     * posts on Send, which is the round-one behavior.
+     */
+    function buildFreeTextRow(msg, payload, question, staged) {
+        const row = document.createElement('div');
+        row.className = 'question-free-text';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'question-free-input';
+        input.placeholder = 'Something else\u2026';
+        input.maxLength = QUESTION_FREE_TEXT_MAX;
+        input.setAttribute('aria-label', 'Free-text answer');
+        if (payload.isForm) input.value = staged.free;
+        row.appendChild(input);
+
+        if (payload.isForm) {
+            // Typing stages; the card's chrome is refreshed in place so the
+            // caret is not thrown out of the input on every keystroke.
+            input.addEventListener('input', () => {
+                const current = readStaged(msg.mid, question.qid);
+                writeStaged(msg.mid, question.qid, current.ids, input.value);
+                refreshFormChrome(msg.mid);
+            });
+            return row;
+        }
+
+        const send = document.createElement('button');
+        send.type = 'button';
+        send.className = 'question-free-send';
+        send.textContent = 'Send';
+        const submit = () => {
+            const text = input.value.trim();
+            if (!text) return;
+            answerQuestion(msg.mid, question.qid, [QUESTION_FREE_TEXT_ID], text);
+        };
+        send.addEventListener('click', submit);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                submit();
+            }
+        });
+        row.appendChild(send);
+        return row;
+    }
+
+    /**
+     * The form's review pane and its single Submit. Submit is enabled only
+     * once every required question has a staged answer.
+     */
+    function buildFormChrome(msg, payload) {
+        const chrome = document.createElement('div');
+        chrome.className = 'question-form-chrome';
+
+        const review = document.createElement('details');
+        review.className = 'question-review';
+        review.open = questionReviewOpen.has(msg.mid);
+        review.addEventListener('toggle', () => {
+            if (review.open) questionReviewOpen.add(msg.mid);
+            else questionReviewOpen.delete(msg.mid);
+        });
+
+        const summary = document.createElement('summary');
+        summary.className = 'question-review-summary';
+        summary.textContent = 'Review answers';
+        review.appendChild(summary);
+
+        for (const question of payload.questions) {
+            const line = document.createElement('div');
+            line.className = 'question-review-line';
+            line.dataset.qid = question.qid;
+
+            const q = document.createElement('span');
+            q.className = 'question-review-prompt';
+            q.textContent = question.prompt;
+            line.appendChild(q);
+
+            const labels = stagedLabels(msg.mid, question);
+            const a = document.createElement('span');
+            a.className = labels.length
+                ? 'question-review-answer' : 'question-review-answer missing';
+            a.textContent = labels.length
+                ? labels.join(', ')
+                : (question.optional ? 'Skipped' : 'Not chosen yet');
+            line.appendChild(a);
+            review.appendChild(line);
+        }
+        chrome.appendChild(review);
+
+        const submit = document.createElement('button');
+        submit.type = 'button';
+        submit.className = 'question-form-submit';
+        submit.addEventListener('click', () => submitQuestionForm(msg.mid));
+        chrome.appendChild(submit);
+        return chrome;
+    }
+
+    /** Progress text, per-item answered class, and the Submit label/state. */
+    function syncFormChrome(card, msg, payload) {
+        const required = payload.questions.filter(q => !q.optional);
+        let chosen = 0;
+        for (const question of payload.questions) {
+            const answered = isStagedAnswered(msg.mid, question);
+            if (answered) chosen += 1;
+            const item = card.querySelector(`.question-item[data-qid="${question.qid}"]`);
+            if (item) item.classList.toggle('unanswered', !answered && !question.optional);
+        }
+        const progress = card.querySelector('.question-form-progress');
+        if (progress) {
+            progress.textContent =
+                `${chosen} of ${payload.questions.length} chosen`;
+        }
+        const missing = required.filter(q => !isStagedAnswered(msg.mid, q)).length;
+        const submit = card.querySelector('.question-form-submit');
+        if (submit) {
+            submit.disabled = missing > 0;
+            submit.textContent = missing > 0
+                ? `${missing} left to choose`
+                : `Submit ${chosen} answer${chosen > 1 ? 's' : ''}`;
+        }
+    }
+
+    /**
+     * Rebuild a form's review pane, progress, and Submit state without
+     * touching the question list, so a focused free-text input keeps focus.
+     */
+    function refreshFormChrome(questionMid) {
+        const card = document.querySelector(
+            `.view:not(.hidden) .room-message[data-mid="${questionMid}"] .question-card`);
+        const msg = findRoomMessage(questionMid);
+        if (!card || !msg) return;
+        const payload = parseQuestion(msg.body);
+        if (!payload || !payload.isForm) return;
+        const old = card.querySelector('.question-form-chrome');
+        if (old) old.replaceWith(buildFormChrome(msg, payload));
+        syncFormChrome(card, msg, payload);
+    }
+
+    /**
+     * Swap a whole question card in place. Used for staging so toggling an
+     * option does not rebuild the message list.
+     */
+    function rerenderQuestionCard(questionMid) {
+        const holder = document.querySelector(
+            `.view:not(.hidden) .room-message[data-mid="${questionMid}"] .message-body`);
+        const msg = findRoomMessage(questionMid);
+        if (!holder || !msg) return;
+        const payload = parseQuestion(msg.body);
+        if (!payload) return;
+        holder.innerHTML = '';
+        holder.appendChild(renderQuestionCard(msg, payload, buildAnswerMap(roomMessages)));
+    }
+
+    /**
+     * Stage an option. A multi question toggles; a single-select question
+     * inside a form replaces its choice, so it reads as a radio group.
+     */
+    function stageQuestionOption(questionMid, question, optionId) {
+        const staged = readStaged(questionMid, question.qid);
+        if (question.multi) {
+            if (staged.ids.has(optionId)) staged.ids.delete(optionId);
+            else staged.ids.add(optionId);
+        } else {
+            const had = staged.ids.has(optionId);
+            staged.ids.clear();
+            if (!had) staged.ids.add(optionId);
+        }
+        writeStaged(questionMid, question.qid, staged.ids, staged.free);
+        rerenderQuestionCard(questionMid);
+    }
+
+    /**
+     * Answer a single-question card immediately: bullet lines a human reads,
+     * plus one machine line a watcher parses.
+     */
+    async function answerQuestion(questionMid, qid, optionIds, freeText = '') {
+        const question = questionByQid(questionMid, qid);
+        if (!question) return;
+        const labels = [];
+        for (const id of optionIds) {
+            if (id === QUESTION_FREE_TEXT_ID) {
+                const text = freeText.trim().slice(0, QUESTION_FREE_TEXT_MAX);
+                if (!text) return;
+                labels.push(text);
+                continue;
+            }
+            const opt = question.options.find(o => o.id === id);
+            if (!opt) return;
+            labels.push(opt.label);
+        }
+        if (!labels.length) return;
+
+        const body = labels.map(l => `${ANSWER_BULLET} ${l}`).join('\n')
+            + `\nanswer:${question.qid}:${optionIds.join(',')}`;
+        await postQuestionReply(questionMid, body);
+    }
+
+    /**
+     * Submit a whole form as one reply: one `▸ prompt — answer` line per
+     * answered question, then one `answer:<qid>:<ids>` line each, so an
+     * existing watcher reads a form response as N answers.
+     */
+    async function submitQuestionForm(questionMid) {
+        const msg = findRoomMessage(questionMid);
+        if (!msg) return;
+        const payload = parseQuestion(msg.body);
+        if (!payload || !payload.isForm) return;
+        if (payload.questions.some(q => !q.optional && !isStagedAnswered(questionMid, q))) return;
+
+        const bullets = [];
+        const machine = [];
+        for (const question of payload.questions) {
+            const staged = readStaged(questionMid, question.qid);
+            const ids = question.options
+                .filter(o => staged.ids.has(o.id)).map(o => o.id);
+            const labels = question.options
+                .filter(o => staged.ids.has(o.id)).map(o => o.label);
+            const free = question.allow_free_text ? staged.free.trim() : '';
+            if (free) {
+                ids.push(QUESTION_FREE_TEXT_ID);
+                labels.push(free.slice(0, QUESTION_FREE_TEXT_MAX));
+            }
+            if (!ids.length) continue;
+            bullets.push(
+                `${ANSWER_BULLET} ${question.prompt}${FORM_PROMPT_SEP}${labels.join(', ')}`);
+            machine.push(`answer:${question.qid}:${ids.join(',')}`);
+        }
+        if (!machine.length) return;
+        await postQuestionReply(questionMid, bullets.concat(machine).join('\n'));
+    }
+
+    /** The question entry with this qid on this message. */
+    function questionByQid(questionMid, qid) {
+        const msg = findRoomMessage(questionMid);
+        if (!msg) return null;
+        const payload = parseQuestion(msg.body);
+        if (!payload) return null;
+        return payload.questions.find(q => q.qid === qid) || null;
+    }
+
+    /**
+     * Post an answer reply. Guarded per message so a double-tap — or a tap on
+     * Submit while the POST is in flight — posts once.
+     */
+    async function postQuestionReply(questionMid, body) {
+        if (questionSending.has(questionMid)) return;
+        questionSending.add(questionMid);
+        setQuestionCardBusy(questionMid, true);
+        try {
+            const result = await DeadropAPI.sendRoomMessage(
+                credentials, currentRoomId, body, 'text/markdown', questionMid);
+            roomMessages.push(result);
+            clearStaged(questionMid);
+            questionReviewOpen.delete(questionMid);
+        } catch (e) {
+            console.error('Failed to send answer:', e);
+            alert('Failed to send answer: ' + e.message);
+        } finally {
+            questionSending.delete(questionMid);
+            renderRoomMessages();
+        }
+    }
+
+    /**
+     * Disable a card's controls the moment a tap is accepted, before the POST
+     * resolves, so the card cannot be tapped again while it is in flight.
+     */
+    function setQuestionCardBusy(questionMid, busy) {
+        const card = document.querySelector(
+            `.view:not(.hidden) .room-message[data-mid="${questionMid}"] .question-card`);
+        if (!card) return;
+        card.classList.toggle('sending', busy);
+        card.querySelectorAll('button, input').forEach(el => { el.disabled = busy; });
+    }
+
     /**
      * Render a single room message into an HTMLElement.
      * Shared by the full-render and incremental-prepend paths.
      */
-    function renderMessageElement(msg, reactionMap) {
+    function renderMessageElement(msg, reactionMap, answerMap) {
         const isMe = msg.from_id === credentials.id;
         const isPending = msg.pending;
+        const question = msg.content_type === QUESTION_CONTENT_TYPE
+            ? parseQuestion(msg.body) : null;
         const el = document.createElement('div');
         el.className = `room-message${isMe ? ' from-me' : ''}${isPending ? ' pending' : ''}`;
         el.dataset.mid = msg.mid;
         el.innerHTML = `
             <div class="sender-name">${getMemberName(msg.from_id)}</div>
             ${renderReplyQuote(msg)}
-            <div class="message-body markdown-body">${renderMessageBody(msg.body, msg.content_type)}</div>
+            <div class="message-body markdown-body">${question ? '' : renderMessageBody(msg.body, msg.content_type)}</div>
             ${renderAttachments(msg)}
             ${renderReactionBadges(msg.mid, reactionMap)}
             <div class="message-time" title="${isPending ? '' : formatAbsolute(msg.created_at)}">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
         `;
+        if (question) {
+            el.querySelector('.message-body')
+              .appendChild(renderQuestionCard(msg, question, answerMap));
+        }
         return el;
     }
 
@@ -1720,6 +2464,7 @@
         
         // Build reaction map from all messages
         const reactionMap = buildReactionMap(roomMessages);
+        const answerMap = buildAnswerMap(roomMessages);
         
         // Filter out reaction messages from the main list
         const displayMessages = roomMessages.filter(m => m.content_type !== 'reaction');
@@ -1732,7 +2477,7 @@
 
         // Newest first (DOM order matches visual order for column-reverse)
         for (let i = displayMessages.length - 1; i >= 0; i--) {
-            fragment.appendChild(renderMessageElement(displayMessages[i], reactionMap));
+            fragment.appendChild(renderMessageElement(displayMessages[i], reactionMap, answerMap));
         }
 
         // Sentinel lives at the physical end of the DOM (= visual top).
