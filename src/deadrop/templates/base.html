@@ -14,6 +14,10 @@
     <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
 
+    <!-- Build identity. The single source of the version literal in the shell;
+         every .vbadge element reads its text from this tag. -->
+    <meta name="app-version" content="{{ app_version }}">
+
     <!-- FOUC prevention: apply theme before first paint -->
     <script>
         (function() {
@@ -50,15 +54,33 @@
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
                 navigator.serviceWorker.register('/sw.js', { scope: '/' }).then((reg) => {
+                    // A worker that finished installing before this page loaded is
+                    // already in `waiting`, and `updatefound` has already fired for
+                    // it. Without this check that update is never surfaced.
+                    if (reg.waiting && navigator.serviceWorker.controller) {
+                        _showUpdateBanner(reg);
+                    }
+
                     // Listen for a new SW waiting to activate → show update banner.
                     reg.addEventListener('updatefound', () => {
                         const newWorker = reg.installing;
+                        if (!newWorker) return;
                         newWorker.addEventListener('statechange', () => {
                             if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                                _showUpdateBanner();
+                                _showUpdateBanner(reg);
                             }
                         });
                     });
+
+                    // An installed web app can run for days without a navigation,
+                    // and a registration only checks for a new worker on
+                    // navigation. Poll on foreground and on a fixed interval.
+                    // update() rejects while offline; swallow it.
+                    const _checkForUpdate = () => { try { reg.update().catch(() => {}); } catch (err) { /* offline */ } };
+                    document.addEventListener('visibilitychange', () => {
+                        if (document.visibilityState === 'visible') _checkForUpdate();
+                    });
+                    setInterval(_checkForUpdate, 20 * 60 * 1000);
                 }).catch((err) => {
                     console.warn('[pwa] service worker registration failed:', err);
                 });
@@ -79,7 +101,17 @@
             });
         }
 
-        function _showUpdateBanner() {
+        // Fill every version badge from the single meta-tag source.
+        document.addEventListener('DOMContentLoaded', () => {
+            const meta = document.querySelector('meta[name="app-version"]');
+            if (!meta) return;
+            document.querySelectorAll('.vbadge').forEach((el) => {
+                el.textContent = meta.content;
+                el.title = meta.content;
+            });
+        });
+
+        function _showUpdateBanner(reg) {
             if (document.getElementById('pwa-update-banner')) return;
             const banner = document.createElement('div');
             banner.id = 'pwa-update-banner';
@@ -90,9 +122,16 @@
                 'display:flex', 'gap:0.75rem', 'align-items:center',
                 'box-shadow:0 4px 12px rgba(0,0,0,0.3)', 'cursor:pointer'
             ].join(';');
-            banner.innerHTML = '🔄 Update available \u2014 <strong>tap to reload</strong>';
+            const _meta = document.querySelector('meta[name="app-version"]');
+            const _running = _meta ? ' <span style="opacity:0.7">(on ' + _meta.content + ')</span>' : '';
+            banner.innerHTML = '🔄 Update available \u2014 <strong>tap to reload</strong>' + _running;
             banner.addEventListener('click', () => {
-                navigator.serviceWorker.controller?.postMessage('skipWaiting');
+                // skipWaiting must be received by the WAITING worker: it is the one
+                // held back from activating. navigator.serviceWorker.controller is
+                // the currently active worker, for which self.skipWaiting() is a
+                // no-op. Activation fires controllerchange, which reloads the page.
+                const target = reg && (reg.waiting || reg.installing);
+                if (target) target.postMessage('skipWaiting');
             });
             document.body.appendChild(banner);
         }

@@ -396,6 +396,21 @@ def _asset_version() -> str:
     return digest.hexdigest()[:12]
 
 
+def _app_version() -> str:
+    """Package version, for identifying which build a client is running.
+
+    ``_version.py`` is generated at build time by hatch-vcs and derives from
+    the git describe of the commit being built, so the value changes on every
+    commit. It is absent from a source tree that has not been built.
+    """
+    try:
+        from ._version import __version__
+
+        return __version__
+    except ImportError:
+        return "unknown"
+
+
 # Initialize templates if directory exists
 templates = Jinja2Templates(directory=TEMPLATES_DIR) if TEMPLATES_DIR.exists() else None
 
@@ -403,6 +418,7 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR) if TEMPLATES_DIR.exists() e
 if templates:
     templates.env.globals["ROOM_PAGE_SIZE"] = int(os.environ.get("DEADROP_ROOM_PAGE_SIZE", "20"))
     templates.env.globals["asset_v"] = _asset_version()
+    templates.env.globals["app_version"] = _app_version()
 
 
 # --- Request/Response Models ---
@@ -3079,7 +3095,11 @@ def pwa_manifest():
     return FileResponse(
         manifest_path,
         media_type="application/manifest+json",
-        headers={"Cache-Control": "public, max-age=3600"},
+        # no-cache, matching /sw.js: the response must be revalidated on every
+        # load. A copy minted under a max-age cannot be evicted by a later
+        # header change, so a manifest edit would not reach an installed client
+        # until its freshness lifetime elapsed.
+        headers={"Cache-Control": "no-cache"},
     )
 
 
