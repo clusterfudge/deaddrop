@@ -273,9 +273,10 @@ Each shows an unanswered card with the free-text row, a multi-select card
 with its send button, and an answered single-select card — read back as the
 prompt and the answer, with no separate reply bubble under it.
 
-The same form twice: above, answered with a message in between, so the reply
-keeps its bubble; below, answered with nothing in between, so the Q&A is
-drawn in place of the card and the bubble is gone.
+The same form twice. Above, answered by Bob with a message in between: his
+bubble is gone all the same, and his answers — including the text he typed —
+read back under the controls that are still Alice's. Below, answered by
+Alice: the card is the read-back. Neither answer appears in the stream.
 
 | | Light | Dark |
 |---|---|---|
