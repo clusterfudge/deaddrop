@@ -396,16 +396,26 @@ def _asset_version() -> str:
     return digest.hexdigest()[:12]
 
 
+# pyproject.toml's ``[tool.hatch.version] fallback-version``: what hatch-vcs
+# writes when it cannot run git describe, identical across every such build.
+_VCS_FALLBACK_VERSION = "0.0.0.dev0"
+
+
 def _app_version() -> str:
     """Package version, for identifying which build a client is running.
 
     ``_version.py`` is generated at build time by hatch-vcs and derives from
     the git describe of the commit being built, so the value changes on every
     commit. It is absent from a source tree that has not been built.
+
+    A build from a tree with no ``.git`` gets the constant VCS fallback
+    instead, which names no commit; the deploy platform's ``GIT_REV`` does.
     """
     try:
         from ._version import __version__
 
+        if __version__ == _VCS_FALLBACK_VERSION:
+            return os.environ.get("GIT_REV", "")[:12] or __version__
         return __version__
     except ImportError:
         return "unknown"
