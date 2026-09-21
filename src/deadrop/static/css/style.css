@@ -1214,12 +1214,6 @@ textarea.form-input {
     letter-spacing: 0.04em;
 }
 
-.question-item-answer {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--primary-color);
-}
-
 /* The wizard's prev/next row. Bottom of the card, full-width targets: this
    is answered with a thumb on a 390px screen. */
 .question-wizard-nav {
@@ -1272,7 +1266,11 @@ textarea.form-input {
 
 .question-wizard-nav .question-form-submit { flex: 1; }
 
-.question-review {
+/* The review pane and the answered card's read-back are the same list of
+   prompt-and-answer lines, so they share every rule that is not about being
+   tappable. */
+.question-review,
+.question-qa {
     display: flex;
     flex-direction: column;
     border: 1px solid var(--border-color);
@@ -1280,6 +1278,16 @@ textarea.form-input {
     background: var(--input-bg);
     overflow: hidden;
 }
+
+.question-qa-line {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border-color);
+}
+
+.question-qa-line:first-child { border-top: none; }
 
 /* A review line is a jump back to its question, so it is a tap target. */
 .question-review-line {
@@ -1308,18 +1316,21 @@ textarea.form-input {
     outline-offset: -2px;
 }
 
-.question-review-prompt {
+.question-review-prompt,
+.question-qa-prompt {
     font-size: 12px;
     color: var(--text-muted);
 }
 
-.question-review-answer {
+.question-review-answer,
+.question-qa-answer {
     font-size: 14px;
     font-weight: 600;
     color: var(--text-color);
 }
 
-.question-review-answer.missing {
+.question-review-answer.missing,
+.question-qa-answer.missing {
     font-weight: 500;
     font-style: italic;
     color: var(--text-muted);
