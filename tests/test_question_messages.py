@@ -12,6 +12,7 @@ If either property changes, the client-side feature breaks silently.
 """
 
 import json
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -159,3 +160,112 @@ class TestQuestionRoundTrip:
         ).json()["messages"]
         answers = [m for m in page if m.get("reference_mid") == question["mid"]]
         assert {m["from_id"] for m in answers} == {room["bob"]["id"], room["alice"]["id"]}
+
+
+FORM_PAYLOAD = {
+    "title": "Ship checklist",
+    "questions": [
+        {
+            "qid": "q-when",
+            "prompt": "Deploy when?",
+            "options": [
+                {"id": "tonight", "label": "Tonight"},
+                {"id": "monday", "label": "Monday morning"},
+            ],
+        },
+        {
+            "qid": "q-who",
+            "prompt": "Who reviews?",
+            "multi": True,
+            "options": [{"id": "sean", "label": "Sean"}, {"id": "fritz", "label": "Fritz"}],
+        },
+        {
+            "qid": "q-note",
+            "prompt": "Anything to add?",
+            "optional": True,
+            "allow_free_text": True,
+            "options": [{"id": "no", "label": "Nothing"}],
+        },
+    ],
+}
+
+FORM_ANSWER_BODY = (
+    "\u25b8 Deploy when? \u2014 Monday morning\n"
+    "\u25b8 Who reviews? \u2014 Sean, Fritz\n"
+    "\u25b8 Anything to add? \u2014 watch the queue\n"
+    "answer:q-when:monday\n"
+    "answer:q-who:sean,fritz\n"
+    "answer:q-note:_free"
+)
+
+ANSWER_LINE_RE = re.compile(r"^answer:([^\s:]+):(\S*)[ \t]*$", re.MULTILINE)
+
+
+def parse_answers(body):
+    """The documented watcher grammar: one machine line per answered qid."""
+    return {qid: ids.split(",") for qid, ids in ANSWER_LINE_RE.findall(body)}
+
+
+class TestFormRoundTrip:
+    def test_form_payload_is_stored_verbatim(self, client, room):
+        """The multi-question shape needs no server change either."""
+        sent = _send(client, room, "alice", json.dumps(FORM_PAYLOAD), QUESTION_CONTENT_TYPE)
+        assert sent["content_type"] == QUESTION_CONTENT_TYPE
+
+        fetched = client.get(
+            f"/{room['ns']}/rooms/{room['room_id']}/messages",
+            headers={"X-Inbox-Secret": room["alice"]["secret"]},
+        ).json()["messages"]
+        assert json.loads(fetched[0]["body"]) == FORM_PAYLOAD
+
+    def test_one_reply_carries_one_answer_per_question(self, client, room):
+        """A single submit is a single reply that a watcher reads as N answers."""
+        question = _send(client, room, "alice", json.dumps(FORM_PAYLOAD), QUESTION_CONTENT_TYPE)
+        answer = _send(
+            client, room, "bob", FORM_ANSWER_BODY, "text/markdown", reference_mid=question["mid"]
+        )
+
+        assert answer["reference_mid"] == question["mid"]
+        assert parse_answers(answer["body"]) == {
+            "q-when": ["monday"],
+            "q-who": ["sean", "fritz"],
+            "q-note": ["_free"],
+        }
+
+    def test_a_single_question_answer_still_parses_as_one(self, client, room):
+        """Round-one bodies keep their exact grammar under the same parser."""
+        question = _send(client, room, "alice", json.dumps(QUESTION_PAYLOAD), QUESTION_CONTENT_TYPE)
+        answer = _send(
+            client,
+            room,
+            "bob",
+            "\u25b8 Monday morning\nanswer:q-deploy-window:monday",
+            "text/markdown",
+            reference_mid=question["mid"],
+        )
+        assert parse_answers(answer["body"]) == {"q-deploy-window": ["monday"]}
+
+    def test_prose_in_a_reply_is_not_an_answer(self, client, room):
+        """A human replying in prose to a form is a reply, not a submission."""
+        question = _send(client, room, "alice", json.dumps(FORM_PAYLOAD), QUESTION_CONTENT_TYPE)
+        answer = _send(
+            client,
+            room,
+            "bob",
+            "answer: not sure yet, ask me tomorrow\nanswer:q-when:",
+            "text/markdown",
+            reference_mid=question["mid"],
+        )
+        assert parse_answers(answer["body"]) == {"q-when": [""]}
+
+    def test_form_and_its_answer_survive_exclude_reactions(self, client, room):
+        question = _send(client, room, "alice", json.dumps(FORM_PAYLOAD), QUESTION_CONTENT_TYPE)
+        _send(client, room, "bob", FORM_ANSWER_BODY, "text/markdown", reference_mid=question["mid"])
+        _send(client, room, "bob", "\U0001f44d", "reaction", reference_mid=question["mid"])
+
+        page = client.get(
+            f"/{room['ns']}/rooms/{room['room_id']}/messages?exclude_reactions=true",
+            headers={"X-Inbox-Secret": room["alice"]["secret"]},
+        ).json()["messages"]
+        assert [m["content_type"] for m in page] == [QUESTION_CONTENT_TYPE, "text/markdown"]
+        assert len(parse_answers(page[1]["body"])) == 3

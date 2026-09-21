@@ -142,6 +142,8 @@ def server():
 QUESTION_MID = "0192a000-0000-7000-8000-000000000001"
 MULTI_MID = "0192a000-0000-7000-8000-000000000002"
 BROKEN_MID = "0192a000-0000-7000-8000-000000000003"
+FORM_MID = "0192a000-0000-7000-8000-000000000004"
+BROKEN_FORM_MID = "0192a000-0000-7000-8000-000000000005"
 ANSWER_MID = "0192a000-0000-7000-8000-00000000000a"
 
 SETUP_ROOM_JS = """
@@ -173,6 +175,25 @@ SETUP_ROOM_JS = """
             allow_free_text: false,
             multi: true,
         };
+        window.__form = {
+            title: 'Ship checklist',
+            questions: [
+                {qid: 'q-when', prompt: 'Deploy when?',
+                 options: [{id: 'tonight', label: 'Tonight'},
+                           {id: 'monday', label: 'Monday morning'}]},
+                {qid: 'q-who', prompt: 'Who reviews?', multi: true,
+                 options: [{id: 'sean', label: 'Sean'}, {id: 'fritz', label: 'Fritz'}]},
+                {qid: 'q-note', prompt: 'Anything to add?', optional: true,
+                 allow_free_text: true, options: [{id: 'no', label: 'Nothing'}]},
+            ],
+        };
+        window.__brokenForm = {
+            title: 'Half-built',
+            questions: [
+                {qid: 'q-ok', prompt: 'A real question', options: [{id: 'y', label: 'Yes'}]},
+                {qid: 'q-bad', prompt: 'No options here', options: []},
+            ],
+        };
         roomMessages = [
             {mid: '0192a000-0000-7000-8000-000000000001', room_id: 'room-test',
              from_id: 'bob-id', body: JSON.stringify(window.__question),
@@ -187,6 +208,14 @@ SETUP_ROOM_JS = """
              body: JSON.stringify({prompt: 'No options here', options: []}),
              content_type: 'application/x-question',
              created_at: '2026-08-01T10:02:00Z'},
+            {mid: '0192a000-0000-7000-8000-000000000004', room_id: 'room-test',
+             from_id: 'bob-id', body: JSON.stringify(window.__form),
+             content_type: 'application/x-question',
+             created_at: '2026-08-01T10:03:00Z'},
+            {mid: '0192a000-0000-7000-8000-000000000005', room_id: 'room-test',
+             from_id: 'bob-id', body: JSON.stringify(window.__brokenForm),
+             content_type: 'application/x-question',
+             created_at: '2026-08-01T10:04:00Z'},
         ];
         document.getElementById('view-room-chat').classList.remove('hidden');
         window.__sent = [];
@@ -405,3 +434,288 @@ class TestAnswerQuoting:
         text = quote.inner_text()
         assert "Deploy tonight or Monday?" in text
         assert "qid" not in text and "{" not in text
+
+
+def _form(page):
+    return _card(page, FORM_MID)
+
+
+def _stage_all(page):
+    """Choose an answer for every question in the form card."""
+    form = _form(page)
+    form.locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+    _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
+    _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="fritz"]').click()
+    _form(page).locator('.question-item[data-qid="q-note"] .question-free-input').fill(
+        "watch the queue"
+    )
+
+
+class TestFormRendering:
+    def test_form_renders_one_item_per_question_with_a_single_submit(self, page):
+        form = _form(page)
+        assert form.count() == 1
+        assert "question-form" in (form.get_attribute("class") or "")
+        assert form.locator(".question-title").inner_text() == "Ship checklist"
+        assert form.locator(".question-item").count() == 3
+        assert form.locator(".question-form-submit").count() == 1
+        # No per-question send button: the form submits once.
+        assert form.locator(".question-multi-send").count() == 0
+        # The "optional" tag lives inside the prompt, and CSS uppercases it.
+        prompts = [
+            p.replace("OPTIONAL", "").strip()
+            for p in form.locator(".question-prompt").all_inner_texts()
+        ]
+        assert prompts == [
+            "Deploy when?",
+            "Who reviews?",
+            "Anything to add?",
+        ]
+
+    def test_progress_starts_at_zero_and_required_items_are_marked(self, page):
+        form = _form(page)
+        assert form.locator(".question-form-progress").inner_text() == "0 of 3 chosen"
+        assert form.locator(".question-item.unanswered").count() == 2
+        # The optional question is not counted as an open slot.
+        assert "unanswered" not in (
+            form.locator('.question-item[data-qid="q-note"]').get_attribute("class") or ""
+        )
+        assert "OPTIONAL" in form.locator('.question-item[data-qid="q-note"]').inner_text()
+
+    def test_form_option_targets_are_at_least_44px(self, page):
+        heights = page.eval_on_selector_all(
+            f'.room-message[data-mid="{FORM_MID}"] .question-option',
+            "els => els.map(e => e.getBoundingClientRect().height)",
+        )
+        assert heights and all(h >= 44 for h in heights), heights
+        summary_h = page.eval_on_selector(
+            f'.room-message[data-mid="{FORM_MID}"] .question-review-summary',
+            "e => e.getBoundingClientRect().height",
+        )
+        assert summary_h >= 44
+
+    def test_a_form_with_one_malformed_question_degrades_to_text(self, page):
+        """Dropping the bad entry would leave a watcher waiting on a qid that
+        was never rendered, so the whole payload falls back."""
+        msg = page.locator(f'.room-message[data-mid="{BROKEN_FORM_MID}"]')
+        assert msg.locator(".question-card").count() == 0
+        body = msg.locator(".message-body").inner_text()
+        assert "Half-built" in body and "A real question" in body
+        assert "{" not in body and "qid" not in body
+
+
+class TestFormStaging:
+    def test_tapping_stages_without_posting_and_updates_progress(self, page):
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        form = _form(page)
+        assert page.evaluate("window.__sent.length") == 0
+        assert form.locator(".question-form-progress").inner_text() == "1 of 3 chosen"
+        assert "staged" in (
+            form.locator(
+                '.question-item[data-qid="q-when"] [data-option-id="monday"]'
+            ).get_attribute("class")
+            or ""
+        )
+        assert "unanswered" not in (
+            form.locator('.question-item[data-qid="q-when"]').get_attribute("class") or ""
+        )
+
+    def test_single_select_question_in_a_form_replaces_its_choice(self, page):
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="tonight"]').click()
+        form = _form(page)
+        item = form.locator('.question-item[data-qid="q-when"]')
+        assert "staged" in (item.locator('[data-option-id="tonight"]').get_attribute("class") or "")
+        assert "staged" not in (
+            item.locator('[data-option-id="monday"]').get_attribute("class") or ""
+        )
+        assert form.locator(".question-form-progress").inner_text() == "1 of 3 chosen"
+
+    def test_multi_question_in_a_form_toggles(self, page):
+        who = '.question-item[data-qid="q-who"]'
+        _form(page).locator(f'{who} [data-option-id="sean"]').click()
+        _form(page).locator(f'{who} [data-option-id="fritz"]').click()
+        assert _form(page).locator(f"{who} .question-option.staged").count() == 2
+        _form(page).locator(f'{who} [data-option-id="sean"]').click()
+        assert _form(page).locator(f"{who} .question-option.staged").count() == 1
+
+    def test_free_text_stages_and_keeps_focus(self, page):
+        inp = _form(page).locator('.question-item[data-qid="q-note"] .question-free-input')
+        inp.click()
+        inp.type("watch the queue")
+        assert page.evaluate("document.activeElement.className") == "question-free-input"
+        assert _form(page).locator(".question-form-progress").inner_text() == "1 of 3 chosen"
+        assert page.evaluate("window.__sent.length") == 0
+
+    def test_staged_state_survives_a_reload(self, page):
+        """Sean's ask: choose now, lock the phone, come back to the choices."""
+        _stage_all(page)
+        assert _form(page).locator(".question-form-progress").inner_text() == "3 of 3 chosen"
+
+        page.reload()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_function("typeof submitQuestionForm === 'function'", timeout=10000)
+        page.evaluate(SETUP_ROOM_JS)
+
+        form = _form(page)
+        assert form.locator(".question-form-progress").inner_text() == "3 of 3 chosen"
+        assert "staged" in (
+            form.locator(
+                '.question-item[data-qid="q-when"] [data-option-id="monday"]'
+            ).get_attribute("class")
+            or ""
+        )
+        assert form.locator('.question-item[data-qid="q-who"] .question-option.staged').count() == 2
+        assert (
+            form.locator('.question-item[data-qid="q-note"] .question-free-input').input_value()
+            == "watch the queue"
+        )
+
+
+class TestFormReviewAndSubmit:
+    def test_submit_is_gated_on_every_required_question(self, page):
+        submit = _form(page).locator(".question-form-submit")
+        assert submit.is_disabled()
+        assert submit.inner_text() == "2 left to choose"
+
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        assert _form(page).locator(".question-form-submit").inner_text() == "1 left to choose"
+        assert _form(page).locator(".question-form-submit").is_disabled()
+
+        _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
+        submit = _form(page).locator(".question-form-submit")
+        assert submit.is_enabled()
+        # The optional question is still unanswered, and that is allowed.
+        assert submit.inner_text() == "Submit 2 answers"
+
+    def test_review_pane_lists_each_prompt_and_its_choice(self, page):
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
+        _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="fritz"]').click()
+
+        review = _form(page).locator(".question-review")
+        review.locator(".question-review-summary").click()
+        lines = _form(page).locator(".question-review-line")
+        assert lines.count() == 3
+        assert lines.nth(0).locator(".question-review-prompt").inner_text() == "Deploy when?"
+        assert lines.nth(0).locator(".question-review-answer").inner_text() == "Monday morning"
+        assert lines.nth(1).locator(".question-review-answer").inner_text() == "Sean, Fritz"
+        # Unanswered and optional reads as skipped, not as a hole.
+        assert lines.nth(2).locator(".question-review-answer").inner_text() == "Skipped"
+        assert "missing" in (
+            lines.nth(2).locator(".question-review-answer").get_attribute("class") or ""
+        )
+
+    def test_review_pane_stays_open_across_a_tap(self, page):
+        _form(page).locator(".question-review-summary").click()
+        assert page.evaluate(
+            f'document.querySelector(\'.room-message[data-mid="{FORM_MID}"]'
+            " .question-review').open"
+        )
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        assert page.evaluate(
+            f'document.querySelector(\'.room-message[data-mid="{FORM_MID}"]'
+            " .question-review').open"
+        )
+
+    def test_submit_posts_one_reply_with_a_machine_line_per_question(self, page):
+        _stage_all(page)
+        _form(page).locator(".question-form-submit").click()
+        page.wait_for_function("window.__sent.length === 1", timeout=5000)
+
+        sent = page.evaluate("window.__sent[0]")
+        assert sent["content_type"] == "text/markdown"
+        assert sent["reference_mid"] == FORM_MID
+        assert sent["body"] == (
+            "\u25b8 Deploy when? \u2014 Monday morning\n"
+            "\u25b8 Who reviews? \u2014 Sean, Fritz\n"
+            "\u25b8 Anything to add? \u2014 watch the queue\n"
+            "answer:q-when:monday\n"
+            "answer:q-who:sean,fritz\n"
+            "answer:q-note:_free"
+        )
+
+    def test_double_tap_on_submit_posts_once(self, page):
+        _stage_all(page)
+        submit = _form(page).locator(".question-form-submit")
+        submit.dispatch_event("click")
+        submit.dispatch_event("click")
+        page.wait_for_timeout(400)
+        assert page.evaluate("window.__sent.length") == 1
+
+    def test_submitted_form_locks_and_shows_each_choice(self, page):
+        _stage_all(page)
+        _form(page).locator(".question-form-submit").click()
+        page.wait_for_function(f"roomMessages.some(m => m.mid === '{ANSWER_MID}')", timeout=5000)
+        page.wait_for_timeout(200)
+
+        form = _form(page)
+        assert "answered" in (form.get_attribute("class") or "")
+        assert form.locator(".question-form-chrome").count() == 0
+        assert form.locator(".question-free-text").count() == 0
+        assert page.evaluate(
+            f"""[...document.querySelectorAll(
+                '.room-message[data-mid="{FORM_MID}"] .question-option')
+            ].every(b => b.disabled)"""
+        )
+        # Every machine line locks its own question, chosen options outlined.
+        item = form.locator('.question-item[data-qid="q-who"]')
+        assert item.locator(".question-option.chosen").count() == 2
+        assert (
+            form.locator('.question-item[data-qid="q-when"] [data-option-id="monday"]')
+            .locator(".question-option-who")
+            .inner_text()
+            == "You"
+        )
+        assert "dimmed" in (
+            form.locator(
+                '.question-item[data-qid="q-when"] [data-option-id="tonight"]'
+            ).get_attribute("class")
+            or ""
+        )
+        answers = form.locator(".question-item-answer").all_inner_texts()
+        assert answers == ["Monday morning", "Sean, Fritz", "watch the queue"]
+        assert "Answered by You" in form.locator(".question-answered-by").inner_text()
+
+    def test_submit_clears_the_staged_state(self, page):
+        _stage_all(page)
+        _form(page).locator(".question-form-submit").click()
+        page.wait_for_function(f"roomMessages.some(m => m.mid === '{ANSWER_MID}')", timeout=5000)
+        assert (
+            page.evaluate(
+                f"Object.keys(localStorage).filter(k => k.startsWith('ddq:{FORM_MID}:')).length"
+            )
+            == 0
+        )
+
+    def test_another_members_form_answer_is_attributed(self, page):
+        page.evaluate(
+            """() => {
+            roomMessages.push({
+                mid: '0192a000-0000-7000-8000-0000000000dd', room_id: 'room-test',
+                from_id: 'bob-id', content_type: 'text/markdown',
+                reference_mid: '0192a000-0000-7000-8000-000000000004',
+                body: '\\u25b8 Deploy when? \\u2014 Tonight\\nanswer:q-when:tonight',
+                created_at: '2026-08-01T10:09:00Z'});
+            renderRoomMessages({skipReadCursor: true});
+        }"""
+        )
+        form = _form(page)
+        assert (
+            form.locator('.question-item[data-qid="q-when"] [data-option-id="tonight"]')
+            .locator(".question-option-who")
+            .inner_text()
+            == "Bob"
+        )
+        assert "Answered by Bob" in form.locator(".question-answered-by").inner_text()
+        # Bob's answer does not lock the form for me.
+        assert form.locator(".question-form-submit").count() == 1
+
+    def test_form_quote_uses_the_title(self, page):
+        _stage_all(page)
+        _form(page).locator(".question-form-submit").click()
+        page.wait_for_function(f"roomMessages.some(m => m.mid === '{ANSWER_MID}')", timeout=5000)
+        page.wait_for_timeout(200)
+        quote = page.locator(f'.room-message[data-mid="{ANSWER_MID}"] .reply-quote-body')
+        assert "Ship checklist" in quote.inner_text()
+        assert "{" not in quote.inner_text()
