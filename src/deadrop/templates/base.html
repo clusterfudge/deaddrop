@@ -107,6 +107,7 @@
             if (!meta) return;
             document.querySelectorAll('.vbadge').forEach((el) => {
                 el.textContent = meta.content;
+                el.title = meta.content;
             });
         });
 

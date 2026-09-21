@@ -28,6 +28,8 @@ import pytest
 
 from playwright.sync_api import sync_playwright
 
+from deadrop.api import _app_version
+
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
@@ -78,6 +80,11 @@ def _build_app_html() -> str:
         .replace("{{ view | tojson if view is defined and view else 'null' }}", "null")
         .replace("{{ room_id | tojson if room_id is defined and room_id else 'null' }}", "null")
         .replace("{{ ROOM_PAGE_SIZE }}", "20")
+        # Jinja globals, substituted so the fixture carries values rather than
+        # template literals: asset_v lands inside asset URLs, app_version
+        # inside the app-version meta tag the shell reads at runtime.
+        .replace("{{ asset_v }}", "test")
+        .replace("{{ app_version }}", _app_version())
     )
 
     _rendered_app_html = rendered

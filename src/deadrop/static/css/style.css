@@ -1949,10 +1949,17 @@ kbd {
 }
 
 /* Build version badge. Text is filled at runtime from the app-version meta
-   tag; empty and zero-width until then. */
+   tag; empty and zero-width until then. The full identifier is longer than a
+   phone-width header can hold, so the box is clamped and the text elided —
+   the element still carries the whole string, in textContent and in title. */
 .vbadge {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 84px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px;
     color: var(--text-muted);
-    white-space: nowrap;
 }
