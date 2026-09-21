@@ -199,21 +199,31 @@ change.
 
 ### A form
 
+- A form is answered **one question at a time**. The card shows the question
+  at the current step, *"Question 2 of 3"* above it, and **‹ Back** /
+  **Next ›** at its foot — full-width targets in a thumb's reach on a phone.
 - Every tap **stages**; nothing posts until Submit. A single-select question
   behaves as a radio group, a `multi` question toggles, and a free-text input
   stages as you type.
 - Staged answers are persisted in `localStorage` under `ddq:<mid>:<qid>`, so a
+  question you navigate back to shows the choice already made, and a
   half-filled form survives a reload, an app switch, or a locked phone. They
-  are cleared when the submit is accepted.
-- The card carries an answered count (*"2 of 3 chosen"*) and marks required
-  questions that are still open with a dashed rule.
-- **Review answers** expands an inline summary of each prompt and the choice
-  it would post. Submit sits below it, enabled only once every required
-  question has an answer, and labelled *"N left to choose"* until then.
-- Submit posts **one** reply and disables on the accepted tap.
-- A submitted form locks the same way a single question does: chosen options
-  outlined, the rest dimmed, each answer echoed under its question, and every
-  answerer named. Another member's submission does not lock it for you.
+  are cleared when the submit is accepted. The **step** is page state: a
+  reload returns to the first question with every answer intact.
+- **Next is never gated.** A question can be paged past and answered on the
+  way back; the only gate is Submit. A required question with nothing chosen
+  carries a dashed rule.
+- The step after the last question is the **review**: every prompt and the
+  answer it would post, with *"Review · 2 of 3 chosen"* above. Each line is a
+  button that jumps back to its question, which is the one way to move
+  through the stack without the arrows.
+- Submit replaces Next on the review step, enabled only once every required
+  question has an answer and labelled *"N left to choose"* until then. It
+  posts **one** reply and disables on the accepted tap.
+- A submitted form is a read-back, not something to navigate: every question
+  renders flat with the choice made under it, chosen options outlined and the
+  rest dimmed, every answerer named. Another member's submission does not
+  lock it for you.
 
 Question bodies are agent-authored, so every payload-derived string is set
 via `textContent` on an element built in JS. No payload field is interpolated
@@ -226,7 +236,7 @@ into HTML.
 | File | Covers |
 |---|---|
 | `tests/test_question_messages.py` (9) | The API stores both payload shapes verbatim; answers survive `exclude_reactions`; several members can answer; a form's single reply parses as N answers under the documented grammar. |
-| `tests/test_question_playwright.py` (33) | Rendering, 44px targets, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across a reload, required-gating, review contents, the exact single-submit body, and the locked form. |
+| `tests/test_question_playwright.py` (41) | Rendering, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across navigation and a reload, wizard nav (step order, first-step Back, ungated Next, review reachability, jump-back lines), required-gating, review contents, the exact single-submit body, and the flat answered form. Touch targets are **measured**: every `button` and `input` in a form card is asserted ≥ 44×44px on every step, portrait and landscape. |
 
 ---
 
@@ -241,9 +251,9 @@ Each shows an answered single-select card (chosen option outlined, the other
 dimmed, answerer named), a multi-select card with its send button, and an
 unanswered card with the free-text row.
 
-A form, staged, with its review pane open. Desktop shows the gated state —
-one required question still open, a dashed rule beside it, *"1 left to
-choose"* on a disabled Submit. Mobile shows the same form complete.
+A form mid-stack. Desktop shows a question step — *"Question 2 of 3"*, one
+option staged, Back and Next live. Mobile shows the review step with every
+answer staged and Submit enabled.
 
 | | Light | Dark |
 |---|---|---|

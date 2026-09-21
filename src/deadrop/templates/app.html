@@ -1728,9 +1728,10 @@
     // Question mids with an answer POST in flight. A second tap returns
     // early, so a double-tap cannot post twice.
     const questionSending = new Set();
-    // Form mids whose review pane is expanded. A tap rerenders the card, so
-    // the disclosure state lives outside the DOM.
-    const questionReviewOpen = new Set();
+    // A form shows one question at a time: mid -> step index, where a step
+    // equal to the question count is the review step. A tap rerenders the
+    // card, so the step lives outside the DOM.
+    const questionStep = new Map();
     // Used when localStorage throws (private mode, quota): staging still
     // works for the life of the page, it just does not survive a reload.
     const stagedFallback = new Map();
@@ -1980,6 +1981,12 @@
         return out;
     }
 
+    /** The step a form is showing, clamped to its question count. */
+    function currentStep(mid, payload) {
+        const raw = questionStep.get(mid) || 0;
+        return Math.min(Math.max(raw, 0), payload.questions.length);
+    }
+
     /** A question counts as chosen when an option is staged or text is typed. */
     function isStagedAnswered(mid, question) {
         const staged = readStaged(mid, question.qid);
@@ -2000,7 +2007,12 @@
 
     /**
      * Build the tappable card for a question payload — one question, or a
-     * form of several with a single Submit.
+     * form of several answered a step at a time.
+     *
+     * An unanswered form renders as a wizard: the question at the current
+     * step, then prev/next. An answered one renders every question flat with
+     * the choice made under each, because the wizard is for answering and a
+     * read-back has nothing to navigate.
      *
      * Question bodies are agent-authored, so every payload-derived string
      * lands via textContent on an element built here. Nothing from the
@@ -2012,12 +2024,17 @@
         const sending = questionSending.has(msg.mid);
         const locked = answeredByMe || sending;
 
+        const wizard = payload.isForm && !locked;
+        const step = wizard ? currentStep(msg.mid, payload) : -1;
+
         const card = document.createElement('div');
         card.className = 'question-card';
         if (payload.isForm) card.classList.add('question-form');
+        if (wizard) card.classList.add('question-wizard');
         if (answers.length) card.classList.add('answered');
         if (sending) card.classList.add('sending');
         card.dataset.qid = payload.questions[0].qid;
+        if (wizard) card.dataset.step = String(step);
 
         if (payload.title) {
             const title = document.createElement('div');
@@ -2026,18 +2043,19 @@
             card.appendChild(title);
         }
 
-        if (payload.isForm) {
+        if (wizard) {
             const progress = document.createElement('div');
             progress.className = 'question-form-progress';
             card.appendChild(progress);
-        }
 
-        for (const question of payload.questions) {
-            card.appendChild(buildQuestionItem(msg, payload, question, answers, locked));
-        }
-
-        if (payload.isForm && !locked) {
-            card.appendChild(buildFormChrome(msg, payload));
+            card.appendChild(step < payload.questions.length
+                ? buildQuestionItem(msg, payload, payload.questions[step], answers, locked)
+                : buildReviewStep(msg, payload));
+            card.appendChild(buildWizardNav(msg, payload, step));
+        } else {
+            for (const question of payload.questions) {
+                card.appendChild(buildQuestionItem(msg, payload, question, answers, locked));
+            }
         }
 
         if (answers.length) {
@@ -2053,7 +2071,7 @@
             card.appendChild(footer);
         }
 
-        if (payload.isForm) syncFormChrome(card, msg, payload);
+        if (wizard) syncFormChrome(card, msg, payload, step);
         return card;
     }
 
@@ -2179,7 +2197,7 @@
             input.addEventListener('input', () => {
                 const current = readStaged(msg.mid, question.qid);
                 writeStaged(msg.mid, question.qid, current.ids, input.value);
-                refreshFormChrome(msg.mid);
+                syncStagedFormState(msg.mid);
             });
             return row;
         }
@@ -2205,30 +2223,20 @@
     }
 
     /**
-     * The form's review pane and its single Submit. Submit is enabled only
-     * once every required question has a staged answer.
+     * The wizard's last step: every question and the answer staged for it.
+     * A line is a button, so a review is also how you get back to a
+     * question — the only jump that skips the arrows.
      */
-    function buildFormChrome(msg, payload) {
-        const chrome = document.createElement('div');
-        chrome.className = 'question-form-chrome';
-
-        const review = document.createElement('details');
+    function buildReviewStep(msg, payload) {
+        const review = document.createElement('div');
         review.className = 'question-review';
-        review.open = questionReviewOpen.has(msg.mid);
-        review.addEventListener('toggle', () => {
-            if (review.open) questionReviewOpen.add(msg.mid);
-            else questionReviewOpen.delete(msg.mid);
-        });
 
-        const summary = document.createElement('summary');
-        summary.className = 'question-review-summary';
-        summary.textContent = 'Review answers';
-        review.appendChild(summary);
-
-        for (const question of payload.questions) {
-            const line = document.createElement('div');
+        payload.questions.forEach((question, index) => {
+            const line = document.createElement('button');
+            line.type = 'button';
             line.className = 'question-review-line';
             line.dataset.qid = question.qid;
+            line.setAttribute('aria-label', `Edit answer: ${question.prompt}`);
 
             const q = document.createElement('span');
             q.className = 'question-review-prompt';
@@ -2243,34 +2251,92 @@
                 ? labels.join(', ')
                 : (question.optional ? 'Skipped' : 'Not chosen yet');
             line.appendChild(a);
-            review.appendChild(line);
-        }
-        chrome.appendChild(review);
 
-        const submit = document.createElement('button');
-        submit.type = 'button';
-        submit.className = 'question-form-submit';
-        submit.addEventListener('click', () => submitQuestionForm(msg.mid));
-        chrome.appendChild(submit);
-        return chrome;
+            line.addEventListener('click', () => goToQuestionStep(msg.mid, index));
+            review.appendChild(line);
+        });
+        return review;
     }
 
-    /** Progress text, per-item answered class, and the Submit label/state. */
-    function syncFormChrome(card, msg, payload) {
-        const required = payload.questions.filter(q => !q.optional);
-        let chosen = 0;
-        for (const question of payload.questions) {
-            const answered = isStagedAnswered(msg.mid, question);
-            if (answered) chosen += 1;
-            const item = card.querySelector(`.question-item[data-qid="${question.qid}"]`);
-            if (item) item.classList.toggle('unanswered', !answered && !question.optional);
+    /**
+     * Prev/next at the foot of the card, inside a thumb's reach on a phone.
+     * Next is never gated: the gate is Submit, so a question can be paged
+     * past and answered on the way back. The review step swaps Next for
+     * Submit, which puts the form's one destructive control where the arrow
+     * that led to it was.
+     */
+    function buildWizardNav(msg, payload, step) {
+        const nav = document.createElement('div');
+        nav.className = 'question-wizard-nav';
+        const last = payload.questions.length - 1;
+
+        const prev = document.createElement('button');
+        prev.type = 'button';
+        prev.className = 'question-wizard-prev';
+        prev.textContent = '\u2039 Back';
+        prev.setAttribute('aria-label', 'Previous question');
+        prev.disabled = step === 0;
+        prev.addEventListener('click', () => goToQuestionStep(msg.mid, step - 1));
+        nav.appendChild(prev);
+
+        if (step > last) {
+            const submit = document.createElement('button');
+            submit.type = 'button';
+            submit.className = 'question-form-submit';
+            submit.addEventListener('click', () => submitQuestionForm(msg.mid));
+            nav.appendChild(submit);
+            return nav;
         }
+
+        const next = document.createElement('button');
+        next.type = 'button';
+        next.className = 'question-wizard-next';
+        next.textContent = step === last ? 'Review \u203a' : 'Next \u203a';
+        next.setAttribute('aria-label', step === last ? 'Review answers' : 'Next question');
+        next.addEventListener('click', () => goToQuestionStep(msg.mid, step + 1));
+        nav.appendChild(next);
+        return nav;
+    }
+
+    /**
+     * Show a form's step. Staged answers are untouched, so a question
+     * re-entered shows the choice already made.
+     */
+    function goToQuestionStep(questionMid, step) {
+        const msg = findRoomMessage(questionMid);
+        if (!msg) return;
+        const payload = parseQuestion(msg.body);
+        if (!payload || !payload.isForm) return;
+        questionStep.set(questionMid,
+            Math.min(Math.max(step, 0), payload.questions.length));
+        rerenderQuestionCard(questionMid);
+    }
+
+    /**
+     * Progress text, the open-slot mark on the question in view, and the
+     * Submit label/state. Submit is enabled only once every required
+     * question has a staged answer.
+     */
+    function syncFormChrome(card, msg, payload, step) {
+        const total = payload.questions.length;
+        const chosen = payload.questions.filter(q => isStagedAnswered(msg.mid, q)).length;
+
+        const item = card.querySelector('.question-item');
+        if (item) {
+            const question = payload.questions.find(q => q.qid === item.dataset.qid);
+            const open = question && !question.optional && !isStagedAnswered(msg.mid, question);
+            item.classList.toggle('unanswered', Boolean(open));
+        }
+
         const progress = card.querySelector('.question-form-progress');
         if (progress) {
-            progress.textContent =
-                `${chosen} of ${payload.questions.length} chosen`;
+            progress.textContent = step < total
+                ? `Question ${step + 1} of ${total}`
+                : `Review \u00b7 ${chosen} of ${total} chosen`;
         }
-        const missing = required.filter(q => !isStagedAnswered(msg.mid, q)).length;
+
+        const missing = payload.questions
+            .filter(q => !q.optional && !isStagedAnswered(msg.mid, q)).length;
         const submit = card.querySelector('.question-form-submit');
         if (submit) {
             submit.disabled = missing > 0;
@@ -2281,19 +2347,17 @@
     }
 
     /**
-     * Rebuild a form's review pane, progress, and Submit state without
-     * touching the question list, so a focused free-text input keeps focus.
+     * Re-sync the parts of a form card that read staged state, without
+     * rebuilding it, so a focused free-text input keeps focus.
      */
-    function refreshFormChrome(questionMid) {
+    function syncStagedFormState(questionMid) {
         const card = document.querySelector(
             `.view:not(.hidden) .room-message[data-mid="${questionMid}"] .question-card`);
         const msg = findRoomMessage(questionMid);
         if (!card || !msg) return;
         const payload = parseQuestion(msg.body);
         if (!payload || !payload.isForm) return;
-        const old = card.querySelector('.question-form-chrome');
-        if (old) old.replaceWith(buildFormChrome(msg, payload));
-        syncFormChrome(card, msg, payload);
+        syncFormChrome(card, msg, payload, currentStep(questionMid, payload));
     }
 
     /**
@@ -2411,7 +2475,7 @@
                 credentials, currentRoomId, body, 'text/markdown', questionMid);
             roomMessages.push(result);
             clearStaged(questionMid);
-            questionReviewOpen.delete(questionMid);
+            questionStep.delete(questionMid);
         } catch (e) {
             console.error('Failed to send answer:', e);
             alert('Failed to send answer: ' + e.message);

@@ -447,59 +447,126 @@ def _form(page):
     return _card(page, FORM_MID)
 
 
-def _stage_all(page):
-    """Choose an answer for every question in the form card."""
-    form = _form(page)
-    form.locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
-    _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
-    _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="fritz"]').click()
-    _form(page).locator('.question-item[data-qid="q-note"] .question-free-input').fill(
-        "watch the queue"
+def _next(page):
+    _form(page).locator(".question-wizard-next").click()
+
+
+def _back(page):
+    _form(page).locator(".question-wizard-prev").click()
+
+
+def _shown_qid(page):
+    return _form(page).locator(".question-item").get_attribute("data-qid")
+
+
+def _tap_targets_under_44px(page, mid):
+    """Every tappable control in a card, measured; returns the ones too small."""
+    return page.evaluate(
+        """(mid) => {
+            const card = document.querySelector(
+                '.room-message[data-mid="' + mid + '"] .question-card');
+            const bad = [];
+            card.querySelectorAll('button, input').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (r.height < 44 || r.width < 44) {
+                    bad.push({cls: el.className, w: r.width, h: r.height});
+                }
+            });
+            return bad;
+        }""",
+        mid,
     )
 
 
+def _stage_all(page):
+    """Answer every question, paging through the wizard. Ends on review."""
+    _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+    _next(page)
+    _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
+    _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="fritz"]').click()
+    _next(page)
+    _form(page).locator('.question-item[data-qid="q-note"] .question-free-input').fill(
+        "watch the queue"
+    )
+    _next(page)
+
+
 class TestFormRendering:
-    def test_form_renders_one_item_per_question_with_a_single_submit(self, page):
+    def test_form_renders_one_question_at_a_time_with_arrow_nav(self, page):
         form = _form(page)
         assert form.count() == 1
         assert "question-form" in (form.get_attribute("class") or "")
+        assert "question-wizard" in (form.get_attribute("class") or "")
         assert form.locator(".question-title").inner_text() == "Ship checklist"
-        assert form.locator(".question-item").count() == 3
-        assert form.locator(".question-form-submit").count() == 1
+        # One card, one question. The rest of the stack is behind the arrows.
+        assert form.locator(".question-item").count() == 1
+        assert _shown_qid(page) == "q-when"
+        assert form.locator(".question-prompt").inner_text() == "Deploy when?"
+        assert form.locator(".question-wizard-nav").count() == 1
+        # Submit belongs to the review step, not to a question step.
+        assert form.locator(".question-form-submit").count() == 0
         # No per-question send button: the form submits once.
         assert form.locator(".question-multi-send").count() == 0
-        # The "optional" tag lives inside the prompt, and CSS uppercases it.
-        prompts = [
-            p.replace("OPTIONAL", "").strip()
-            for p in form.locator(".question-prompt").all_inner_texts()
-        ]
-        assert prompts == [
-            "Deploy when?",
-            "Who reviews?",
-            "Anything to add?",
-        ]
 
-    def test_progress_starts_at_zero_and_required_items_are_marked(self, page):
+    def test_progress_names_the_step_and_required_items_are_marked(self, page):
         form = _form(page)
-        assert form.locator(".question-form-progress").inner_text() == "0 of 3 chosen"
-        assert form.locator(".question-item.unanswered").count() == 2
-        # The optional question is not counted as an open slot.
-        assert "unanswered" not in (
-            form.locator('.question-item[data-qid="q-note"]').get_attribute("class") or ""
-        )
+        assert form.locator(".question-form-progress").inner_text() == "Question 1 of 3"
+        assert form.locator(".question-item.unanswered").count() == 1
+
+        _next(page)
+        assert _form(page).locator(".question-form-progress").inner_text() == "Question 2 of 3"
+
+        _next(page)
+        form = _form(page)
+        assert form.locator(".question-form-progress").inner_text() == "Question 3 of 3"
+        # The optional question is not an open slot.
+        assert form.locator(".question-item.unanswered").count() == 0
         assert "OPTIONAL" in form.locator('.question-item[data-qid="q-note"]').inner_text()
 
-    def test_form_option_targets_are_at_least_44px(self, page):
-        heights = page.eval_on_selector_all(
-            f'.room-message[data-mid="{FORM_MID}"] .question-option',
-            "els => els.map(e => e.getBoundingClientRect().height)",
+    def test_every_tappable_control_clears_44px_on_every_step(self, page):
+        """Sean answers these with a thumb at 390px: measure the boxes, on
+        each step including review, rather than eyeballing a screenshot."""
+        assert page.viewport_size == {"width": 390, "height": 844}
+        for expected in ("Question 1 of 3", "Question 2 of 3", "Question 3 of 3"):
+            assert expected in _form(page).locator(".question-form-progress").inner_text()
+            assert _tap_targets_under_44px(page, FORM_MID) == []
+            _next(page)
+        # The review step's Submit and its jump-back lines are targets too.
+        assert "Review" in _form(page).locator(".question-form-progress").inner_text()
+        assert _form(page).locator(".question-form-submit").count() == 1
+        assert _form(page).locator(".question-review-line").count() == 3
+        assert _tap_targets_under_44px(page, FORM_MID) == []
+
+    def test_tap_targets_hold_up_in_landscape(self, page):
+        page.set_viewport_size({"width": 844, "height": 390})
+        page.wait_for_timeout(100)
+        assert _tap_targets_under_44px(page, FORM_MID) == []
+        _next(page)
+        assert _tap_targets_under_44px(page, FORM_MID) == []
+
+    def test_nav_sits_at_the_foot_of_the_card(self, page):
+        """Thumb zone: the arrows are the last thing in the card, below the
+        options, not stranded above them."""
+        assert (
+            page.eval_on_selector(
+                f'.room-message[data-mid="{FORM_MID}"] .question-card',
+                "c => c.lastElementChild.className",
+            )
+            == "question-wizard-nav"
         )
-        assert heights and all(h >= 44 for h in heights), heights
-        summary_h = page.eval_on_selector(
-            f'.room-message[data-mid="{FORM_MID}"] .question-review-summary',
-            "e => e.getBoundingClientRect().height",
+        boxes = page.evaluate(
+            f"""() => {{
+                const card = document.querySelector(
+                    '.room-message[data-mid="{FORM_MID}"] .question-card');
+                const opts = [...card.querySelectorAll('.question-option')];
+                const nav = card.querySelector('.question-wizard-nav');
+                return {{
+                    lastOption: Math.max(...opts.map(o => o.getBoundingClientRect().bottom)),
+                    navTop: nav.getBoundingClientRect().top,
+                }};
+            }}"""
         )
-        assert summary_h >= 44
+        assert boxes["navTop"] >= boxes["lastOption"]
 
     def test_a_form_with_one_malformed_question_degrades_to_text(self, page):
         """Dropping the bad entry would leave a watcher waiting on a qid that
@@ -512,11 +579,10 @@ class TestFormRendering:
 
 
 class TestFormStaging:
-    def test_tapping_stages_without_posting_and_updates_progress(self, page):
+    def test_tapping_stages_without_posting(self, page):
         _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
         form = _form(page)
         assert page.evaluate("window.__sent.length") == 0
-        assert form.locator(".question-form-progress").inner_text() == "1 of 3 chosen"
         assert "staged" in (
             form.locator(
                 '.question-item[data-qid="q-when"] [data-option-id="monday"]'
@@ -536,10 +602,11 @@ class TestFormStaging:
         assert "staged" not in (
             item.locator('[data-option-id="monday"]').get_attribute("class") or ""
         )
-        assert form.locator(".question-form-progress").inner_text() == "1 of 3 chosen"
+        assert form.locator(".question-item").count() == 1
 
     def test_multi_question_in_a_form_toggles(self, page):
         who = '.question-item[data-qid="q-who"]'
+        _next(page)
         _form(page).locator(f'{who} [data-option-id="sean"]').click()
         _form(page).locator(f'{who} [data-option-id="fritz"]').click()
         assert _form(page).locator(f"{who} .question-option.staged").count() == 2
@@ -547,49 +614,145 @@ class TestFormStaging:
         assert _form(page).locator(f"{who} .question-option.staged").count() == 1
 
     def test_free_text_stages_and_keeps_focus(self, page):
+        _next(page)
+        _next(page)
         inp = _form(page).locator('.question-item[data-qid="q-note"] .question-free-input')
         inp.click()
         inp.type("watch the queue")
         assert page.evaluate("document.activeElement.className") == "question-free-input"
-        assert _form(page).locator(".question-form-progress").inner_text() == "1 of 3 chosen"
+        assert _form(page).locator(".question-form-progress").inner_text() == "Question 3 of 3"
         assert page.evaluate("window.__sent.length") == 0
 
     def test_staged_state_survives_a_reload(self, page):
         """Sean's ask: choose now, lock the phone, come back to the choices."""
         _stage_all(page)
-        assert _form(page).locator(".question-form-progress").inner_text() == "3 of 3 chosen"
+        assert (
+            _form(page).locator(".question-form-progress").inner_text()
+            == "Review \u00b7 3 of 3 chosen"
+        )
 
         page.reload()
         page.wait_for_load_state("networkidle")
         page.wait_for_function("typeof submitQuestionForm === 'function'", timeout=10000)
         page.evaluate(SETUP_ROOM_JS)
 
+        # The step is page state and resets to the first question; the staged
+        # answers are persisted and are all still there.
         form = _form(page)
-        assert form.locator(".question-form-progress").inner_text() == "3 of 3 chosen"
+        assert form.locator(".question-form-progress").inner_text() == "Question 1 of 3"
         assert "staged" in (
             form.locator(
                 '.question-item[data-qid="q-when"] [data-option-id="monday"]'
             ).get_attribute("class")
             or ""
         )
-        assert form.locator('.question-item[data-qid="q-who"] .question-option.staged').count() == 2
-        assert (
-            form.locator('.question-item[data-qid="q-note"] .question-free-input').input_value()
-            == "watch the queue"
+        _next(page)
+        assert _form(page).locator(".question-option.staged").count() == 2
+        _next(page)
+        assert _form(page).locator(".question-free-input").input_value() == "watch the queue"
+        _next(page)
+        assert _form(page).locator(".question-form-submit").is_enabled()
+
+
+class TestFormWizardNav:
+    def test_next_and_back_walk_the_stack(self, page):
+        assert _shown_qid(page) == "q-when"
+        _next(page)
+        assert _shown_qid(page) == "q-who"
+        assert _form(page).locator(".question-prompt").inner_text() == "Who reviews?"
+        _next(page)
+        assert _shown_qid(page) == "q-note"
+        _back(page)
+        assert _shown_qid(page) == "q-who"
+        _back(page)
+        assert _shown_qid(page) == "q-when"
+
+    def test_back_is_disabled_on_the_first_question(self, page):
+        assert _form(page).locator(".question-wizard-prev").is_disabled()
+        _next(page)
+        assert _form(page).locator(".question-wizard-prev").is_enabled()
+
+    def test_next_is_not_gated_on_answering(self, page):
+        """The gate is Submit: a question can be paged past and answered on
+        the way back."""
+        assert _form(page).locator(".question-wizard-next").is_enabled()
+        _next(page)
+        assert _shown_qid(page) == "q-who"
+        assert page.evaluate("window.__sent.length") == 0
+
+    def test_a_staged_choice_is_still_there_when_you_navigate_back(self, page):
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        _next(page)
+        _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="fritz"]').click()
+        _back(page)
+
+        item = _form(page).locator('.question-item[data-qid="q-when"]')
+        assert "staged" in (item.locator('[data-option-id="monday"]').get_attribute("class") or "")
+        assert item.locator('[data-option-id="monday"]').get_attribute("aria-pressed") == "true"
+        assert "unanswered" not in (item.get_attribute("class") or "")
+        # Forward again and the other question's choice survived too.
+        _next(page)
+        assert "staged" in (
+            _form(page)
+            .locator('.question-item[data-qid="q-who"] [data-option-id="fritz"]')
+            .get_attribute("class")
+            or ""
         )
+        assert page.evaluate("window.__sent.length") == 0
+
+    def test_typed_free_text_is_still_there_when_you_navigate_back(self, page):
+        _next(page)
+        _next(page)
+        _form(page).locator(".question-free-input").fill("watch the queue")
+        _back(page)
+        assert _shown_qid(page) == "q-who"
+        _next(page)
+        assert _form(page).locator(".question-free-input").input_value() == "watch the queue"
+
+    def test_review_is_the_step_after_the_last_question(self, page):
+        assert _form(page).locator(".question-wizard-next").inner_text() == "Next \u203a"
+        _next(page)
+        _next(page)
+        assert _form(page).locator(".question-wizard-next").inner_text() == "Review \u203a"
+        _next(page)
+
+        form = _form(page)
+        assert form.locator(".question-item").count() == 0
+        assert form.locator(".question-review-line").count() == 3
+        assert form.locator(".question-form-submit").count() == 1
+        assert form.locator(".question-wizard-next").count() == 0
+        # Back out of review and you land on the last question.
+        _back(page)
+        assert _shown_qid(page) == "q-note"
+
+    def test_a_review_line_jumps_back_to_its_question(self, page):
+        _next(page)
+        _next(page)
+        _next(page)
+        _form(page).locator('.question-review-line[data-qid="q-who"]').click()
+        assert _shown_qid(page) == "q-who"
+        assert _form(page).locator(".question-form-progress").inner_text() == "Question 2 of 3"
 
 
 class TestFormReviewAndSubmit:
     def test_submit_is_gated_on_every_required_question(self, page):
+        for _ in range(3):
+            _next(page)
         submit = _form(page).locator(".question-form-submit")
         assert submit.is_disabled()
         assert submit.inner_text() == "2 left to choose"
 
-        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        _form(page).locator('.question-review-line[data-qid="q-when"]').click()
+        _form(page).locator('[data-option-id="monday"]').click()
+        for _ in range(3):
+            _next(page)
         assert _form(page).locator(".question-form-submit").inner_text() == "1 left to choose"
         assert _form(page).locator(".question-form-submit").is_disabled()
 
-        _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
+        _form(page).locator('.question-review-line[data-qid="q-who"]').click()
+        _form(page).locator('[data-option-id="sean"]').click()
+        _next(page)
+        _next(page)
         submit = _form(page).locator(".question-form-submit")
         assert submit.is_enabled()
         # The optional question is still unanswered, and that is allowed.
@@ -597,11 +760,12 @@ class TestFormReviewAndSubmit:
 
     def test_review_pane_lists_each_prompt_and_its_choice(self, page):
         _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        _next(page)
         _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
         _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="fritz"]').click()
+        _next(page)
+        _next(page)
 
-        review = _form(page).locator(".question-review")
-        review.locator(".question-review-summary").click()
         lines = _form(page).locator(".question-review-line")
         assert lines.count() == 3
         assert lines.nth(0).locator(".question-review-prompt").inner_text() == "Deploy when?"
@@ -611,18 +775,6 @@ class TestFormReviewAndSubmit:
         assert lines.nth(2).locator(".question-review-answer").inner_text() == "Skipped"
         assert "missing" in (
             lines.nth(2).locator(".question-review-answer").get_attribute("class") or ""
-        )
-
-    def test_review_pane_stays_open_across_a_tap(self, page):
-        _form(page).locator(".question-review-summary").click()
-        assert page.evaluate(
-            f'document.querySelector(\'.room-message[data-mid="{FORM_MID}"]'
-            " .question-review').open"
-        )
-        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
-        assert page.evaluate(
-            f'document.querySelector(\'.room-message[data-mid="{FORM_MID}"]'
-            " .question-review').open"
         )
 
     def test_submit_posts_one_reply_with_a_machine_line_per_question(self, page):
@@ -656,9 +808,15 @@ class TestFormReviewAndSubmit:
         page.wait_for_function(f"roomMessages.some(m => m.mid === '{ANSWER_MID}')", timeout=5000)
         page.wait_for_timeout(200)
 
+        # An answered form is a read-back, not something to navigate: every
+        # question flat, no wizard.
         form = _form(page)
         assert "answered" in (form.get_attribute("class") or "")
-        assert form.locator(".question-form-chrome").count() == 0
+        assert "question-wizard" not in (form.get_attribute("class") or "")
+        assert form.locator(".question-item").count() == 3
+        assert form.locator(".question-wizard-nav").count() == 0
+        assert form.locator(".question-form-submit").count() == 0
+        assert form.locator(".question-form-progress").count() == 0
         assert form.locator(".question-free-text").count() == 0
         assert page.evaluate(
             f"""[...document.querySelectorAll(
@@ -715,8 +873,9 @@ class TestFormReviewAndSubmit:
             == "Bob"
         )
         assert "Answered by Bob" in form.locator(".question-answered-by").inner_text()
-        # Bob's answer does not lock the form for me.
-        assert form.locator(".question-form-submit").count() == 1
+        # Bob's answer does not lock the form for me: my wizard is still live.
+        assert "question-wizard" in (form.get_attribute("class") or "")
+        assert form.locator(".question-wizard-nav").count() == 1
 
     def test_form_quote_uses_the_title(self, page):
         _stage_all(page)
