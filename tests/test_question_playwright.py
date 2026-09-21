@@ -6,11 +6,14 @@ Verifies, against the real client JS in a real browser:
   2. Tapping an option posts an ordinary ``text/markdown`` reply carrying
      ``reference_mid`` and an ``answer:<qid>:<id>`` machine line.
   3. A double-tap posts once.
-  4. The answered state is derived from the reply at render time: the chosen
-     option is highlighted, the others dimmed, and the answerers are named.
+  4. The answered state is derived from the reply at render time: a card this
+     member has answered reads back as Q&A pairs, and every answerer is named.
   5. ``multi`` stages a selection and sends it as one reply.
   6. ``allow_free_text`` posts the typed text under the reserved ``_free`` id.
   7. Agent-authored payload fields are escaped, never injected.
+  8. An answer sitting immediately under the card that reads it back is drawn
+     in place of that card, with no separate bubble; an answer with another
+     message between it and its question keeps its bubble.
 
 Harness mirrors tests/test_reply_playwright.py: app.html is rendered with
 minimal Jinja2 substitution and served locally, and
@@ -18,6 +21,7 @@ minimal Jinja2 substitution and served locally, and
 """
 
 import http.server
+import json
 import pathlib
 import re
 import socket
@@ -152,6 +156,22 @@ BROKEN_MID = "0192a000-0000-7000-8000-000000000003"
 FORM_MID = "0192a000-0000-7000-8000-000000000004"
 BROKEN_FORM_MID = "0192a000-0000-7000-8000-000000000005"
 ANSWER_MID = "0192a000-0000-7000-8000-00000000000a"
+
+# Mids for the seeded streams the collapse cases need, where what sits
+# between a question and its answer is the whole point.
+SEEDED_QUESTION_MID = "0192a000-0000-7000-8000-000000000011"
+SEEDED_ANSWER_MID = "0192a000-0000-7000-8000-000000000012"
+SEEDED_OTHER_MID = "0192a000-0000-7000-8000-000000000013"
+SEEDED_CHATTER_MID = "0192a000-0000-7000-8000-000000000014"
+
+FORM_ANSWER_BODY = (
+    "\u25b8 Deploy when? \u2014 Monday morning\n"
+    "\u25b8 Who reviews? \u2014 Sean, Fritz\n"
+    "\u25b8 Anything to add? \u2014 watch the queue\n"
+    "answer:q-when:monday\n"
+    "answer:q-who:sean,fritz\n"
+    "answer:q-note:_free"
+)
 
 SETUP_ROOM_JS = """
     () => {
@@ -328,19 +348,18 @@ class TestAnswering:
 
         card = _card(page, QUESTION_MID)
         assert "answered" in (card.get_attribute("class") or "")
-        chosen = card.locator('.question-option[data-option-id="tonight"]')
-        other = card.locator('.question-option[data-option-id="monday"]')
-        assert "chosen" in (chosen.get_attribute("class") or "")
-        assert "dimmed" in (other.get_attribute("class") or "")
-        # Who answered, on the option and in the footer.
-        assert chosen.locator(".question-option-who").inner_text() == "You"
+        assert "question-readback" in (card.get_attribute("class") or "")
+
+        # The question and the answer given for it, as one line.
+        line = card.locator(".question-qa-line")
+        assert line.count() == 1
+        assert line.get_attribute("data-qid") == "q-deploy"
+        assert line.locator(".question-qa-prompt").inner_text() == "Deploy tonight or Monday?"
+        assert line.locator(".question-qa-answer").inner_text() == "Tonight"
         assert "Answered by You" in card.locator(".question-answered-by").inner_text()
-        # Answered means locked, and the free-text row is gone.
-        assert page.evaluate(
-            f"""[...document.querySelectorAll(
-                '.room-message[data-mid="{QUESTION_MID}"] .question-option')
-            ].every(b => b.disabled)"""
-        )
+
+        # Answering is over: no buttons to press, no free-text row.
+        assert card.locator(".question-option").count() == 0
         assert card.locator(".question-free-text").count() == 0
 
     def test_another_members_answer_is_attributed(self, page):
@@ -415,8 +434,8 @@ class TestMultiAndFreeText:
 
         page.wait_for_timeout(200)
         assert (
-            "Wednesday, after the audit"
-            in _card(page, QUESTION_MID).locator(".question-answered-by").inner_text()
+            _card(page, QUESTION_MID).locator(".question-qa-answer").inner_text()
+            == "Wednesday, after the audit"
         )
 
     def test_empty_free_text_sends_nothing(self, page):
@@ -474,6 +493,16 @@ def _tap_targets_under_44px(page, mid):
             });
             return bad;
         }""",
+        mid,
+    )
+
+
+def _controls_in_card(page, mid):
+    """How many tappable controls a card still carries."""
+    return page.evaluate(
+        """(mid) => document.querySelectorAll(
+            '.room-message[data-mid="' + mid + '"] .question-card button,'
+            + '.room-message[data-mid="' + mid + '"] .question-card input').length""",
         mid,
     )
 
@@ -802,45 +831,63 @@ class TestFormReviewAndSubmit:
         page.wait_for_timeout(400)
         assert page.evaluate("window.__sent.length") == 1
 
-    def test_submitted_form_locks_and_shows_each_choice(self, page):
+    def test_submitted_form_reads_back_as_q_and_a(self, page):
         _stage_all(page)
         _form(page).locator(".question-form-submit").click()
         page.wait_for_function(f"roomMessages.some(m => m.mid === '{ANSWER_MID}')", timeout=5000)
         page.wait_for_timeout(200)
 
-        # An answered form is a read-back, not something to navigate: every
-        # question flat, no wizard.
+        # A submitted form is a transcript: each prompt with the answer given
+        # for it, in payload order.
         form = _form(page)
         assert "answered" in (form.get_attribute("class") or "")
+        assert "question-readback" in (form.get_attribute("class") or "")
         assert "question-wizard" not in (form.get_attribute("class") or "")
-        assert form.locator(".question-item").count() == 3
+        assert form.locator(".question-title").inner_text() == "Ship checklist"
+
+        lines = form.locator(".question-qa-line")
+        assert lines.count() == 3
+        assert [line.get_attribute("data-qid") for line in lines.all()] == [
+            "q-when",
+            "q-who",
+            "q-note",
+        ]
+        assert form.locator(".question-qa-prompt").all_inner_texts() == [
+            "Deploy when?",
+            "Who reviews?",
+            "Anything to add?",
+        ]
+        assert form.locator(".question-qa-answer").all_inner_texts() == [
+            "Monday morning",
+            "Sean, Fritz",
+            "watch the queue",
+        ]
+        assert "Answered by You" in form.locator(".question-answered-by").inner_text()
+
+        # Nothing about answering survives: no wizard, no items, no controls.
+        assert form.locator(".question-item").count() == 0
+        assert form.locator(".question-option").count() == 0
         assert form.locator(".question-wizard-nav").count() == 0
         assert form.locator(".question-form-submit").count() == 0
         assert form.locator(".question-form-progress").count() == 0
         assert form.locator(".question-free-text").count() == 0
-        assert page.evaluate(
-            f"""[...document.querySelectorAll(
-                '.room-message[data-mid="{FORM_MID}"] .question-option')
-            ].every(b => b.disabled)"""
-        )
-        # Every machine line locks its own question, chosen options outlined.
-        item = form.locator('.question-item[data-qid="q-who"]')
-        assert item.locator(".question-option.chosen").count() == 2
-        assert (
-            form.locator('.question-item[data-qid="q-when"] [data-option-id="monday"]')
-            .locator(".question-option-who")
-            .inner_text()
-            == "You"
-        )
-        assert "dimmed" in (
-            form.locator(
-                '.question-item[data-qid="q-when"] [data-option-id="tonight"]'
-            ).get_attribute("class")
-            or ""
-        )
-        answers = form.locator(".question-item-answer").all_inner_texts()
-        assert answers == ["Monday morning", "Sean, Fritz", "watch the queue"]
-        assert "Answered by You" in form.locator(".question-answered-by").inner_text()
+        assert _controls_in_card(page, FORM_MID) == 0
+
+    def test_a_skipped_optional_question_reads_as_skipped(self, page):
+        """An unanswered optional question is a line in the transcript, not a
+        hole in it."""
+        _form(page).locator('.question-item[data-qid="q-when"] [data-option-id="monday"]').click()
+        _next(page)
+        _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
+        _next(page)
+        _next(page)
+        _form(page).locator(".question-form-submit").click()
+        page.wait_for_function(f"roomMessages.some(m => m.mid === '{ANSWER_MID}')", timeout=5000)
+        page.wait_for_timeout(200)
+
+        skipped = _form(page).locator('.question-qa-line[data-qid="q-note"] .question-qa-answer')
+        assert skipped.inner_text() == "Skipped"
+        assert "missing" in (skipped.get_attribute("class") or "")
 
     def test_submit_clears_the_staged_state(self, page):
         _stage_all(page)
@@ -885,3 +932,218 @@ class TestFormReviewAndSubmit:
         quote = page.locator(f'.room-message[data-mid="{ANSWER_MID}"] .reply-quote-body')
         assert "Ship checklist" in quote.inner_text()
         assert "{" not in quote.inner_text()
+
+
+def _seed(page, messages):
+    """Replace the room's stream and re-render. The order of this list is the
+    thing under test: what sits between a question and its answer decides
+    whether the answer keeps a bubble."""
+    page.evaluate(
+        """(messages) => {
+            roomMessages = messages;
+            renderRoomMessages({skipReadCursor: true});
+        }""",
+        messages,
+    )
+
+
+def _question_msg(mid, payload, at="10:00:00"):
+    return {
+        "mid": mid,
+        "room_id": "room-test",
+        "from_id": "bob-id",
+        "body": json.dumps(payload),
+        "content_type": "application/x-question",
+        "created_at": f"2026-08-01T{at}Z",
+    }
+
+
+def _answer_msg(mid, ref_mid, body, from_id="alice-id", at="10:01:00"):
+    return {
+        "mid": mid,
+        "room_id": "room-test",
+        "from_id": from_id,
+        "content_type": "text/markdown",
+        "reference_mid": ref_mid,
+        "body": body,
+        "created_at": f"2026-08-01T{at}Z",
+    }
+
+
+def _plain_msg(mid, body="ping, did you see the checklist?", ref_mid=None, at="10:02:00"):
+    msg = {
+        "mid": mid,
+        "room_id": "room-test",
+        "from_id": "bob-id",
+        "content_type": "text/markdown",
+        "body": body,
+        "created_at": f"2026-08-01T{at}Z",
+    }
+    if ref_mid:
+        msg["reference_mid"] = ref_mid
+    return msg
+
+
+def _bubble(page, mid):
+    return page.locator(f'.room-message[data-mid="{mid}"]')
+
+
+class TestAnswerInPlace:
+    """An answer whose card already reads it back, with nothing in between, is
+    drawn as the card: the bubble that would repeat it is suppressed."""
+
+    def test_an_adjacent_answer_is_rendered_in_place_of_its_bubble(self, page):
+        form = page.evaluate("() => window.__form")
+        _seed(
+            page,
+            [
+                _question_msg(SEEDED_QUESTION_MID, form),
+                _answer_msg(SEEDED_ANSWER_MID, SEEDED_QUESTION_MID, FORM_ANSWER_BODY),
+            ],
+        )
+
+        card = _card(page, SEEDED_QUESTION_MID)
+        assert "question-readback" in (card.get_attribute("class") or "")
+        assert card.locator(".question-qa-answer").all_inner_texts() == [
+            "Monday morning",
+            "Sean, Fritz",
+            "watch the queue",
+        ]
+        assert _bubble(page, SEEDED_ANSWER_MID).count() == 0
+        # The machine line went with it, rather than showing up as prose.
+        assert "answer:q-when" not in page.locator("#room-message-list").inner_text()
+
+    def test_an_intervening_message_keeps_the_answer_in_the_stream(self, page):
+        """Chronology outranks tidiness: with a message in between, drawing the
+        answer at the card's position would move it back past that message."""
+        form = page.evaluate("() => window.__form")
+        _seed(
+            page,
+            [
+                _question_msg(SEEDED_QUESTION_MID, form),
+                _plain_msg(SEEDED_CHATTER_MID),
+                _answer_msg(
+                    SEEDED_ANSWER_MID, SEEDED_QUESTION_MID, FORM_ANSWER_BODY, at="10:03:00"
+                ),
+            ],
+        )
+
+        assert _card(page, SEEDED_QUESTION_MID).locator(".question-qa-line").count() == 3
+        assert _bubble(page, SEEDED_ANSWER_MID).count() == 1
+        assert _bubble(page, SEEDED_CHATTER_MID).count() == 1
+
+    def test_two_back_to_back_answers_both_collapse_and_are_named(self, page):
+        """A collapsed answer is not an intervening message, so the second one
+        collapses too — and the read-back names who chose what."""
+        form = page.evaluate("() => window.__form")
+        _seed(
+            page,
+            [
+                _question_msg(SEEDED_QUESTION_MID, form),
+                _answer_msg(SEEDED_ANSWER_MID, SEEDED_QUESTION_MID, FORM_ANSWER_BODY),
+                _answer_msg(
+                    SEEDED_OTHER_MID,
+                    SEEDED_QUESTION_MID,
+                    "\u25b8 Deploy when? \u2014 Tonight\nanswer:q-when:tonight",
+                    from_id="bob-id",
+                    at="10:02:00",
+                ),
+            ],
+        )
+
+        card = _card(page, SEEDED_QUESTION_MID)
+        assert card.locator('.question-qa-line[data-qid="q-when"] .question-qa-answer')
+        assert card.locator(
+            '.question-qa-line[data-qid="q-when"] .question-qa-answer'
+        ).all_inner_texts() == ["You: Monday morning", "Bob: Tonight"]
+        assert _bubble(page, SEEDED_ANSWER_MID).count() == 0
+        assert _bubble(page, SEEDED_OTHER_MID).count() == 0
+        assert "Answered by You, Bob" in card.locator(".question-answered-by").inner_text()
+
+    def test_another_members_answer_alone_is_not_collapsed(self, page):
+        """The card is still mine to fill in, so it reads back nothing — and
+        Bob's answer stays where he sent it."""
+        form = page.evaluate("() => window.__form")
+        _seed(
+            page,
+            [
+                _question_msg(SEEDED_QUESTION_MID, form),
+                _answer_msg(
+                    SEEDED_OTHER_MID,
+                    SEEDED_QUESTION_MID,
+                    "\u25b8 Deploy when? \u2014 Tonight\nanswer:q-when:tonight",
+                    from_id="bob-id",
+                ),
+            ],
+        )
+
+        card = _card(page, SEEDED_QUESTION_MID)
+        assert "question-wizard" in (card.get_attribute("class") or "")
+        assert card.locator(".question-qa-line").count() == 0
+        assert card.locator(".question-wizard-nav").count() == 1
+        assert _bubble(page, SEEDED_OTHER_MID).count() == 1
+
+    def test_an_answer_something_replies_to_keeps_its_bubble(self, page):
+        """Suppressing it would leave the reply quoting a message that is not
+        in the DOM, so the jump-back has nothing to jump to."""
+        form = page.evaluate("() => window.__form")
+        _seed(
+            page,
+            [
+                _question_msg(SEEDED_QUESTION_MID, form),
+                _answer_msg(SEEDED_ANSWER_MID, SEEDED_QUESTION_MID, FORM_ANSWER_BODY),
+                _plain_msg(
+                    SEEDED_CHATTER_MID,
+                    body="Monday works",
+                    ref_mid=SEEDED_ANSWER_MID,
+                    at="10:04:00",
+                ),
+            ],
+        )
+
+        assert _card(page, SEEDED_QUESTION_MID).locator(".question-qa-line").count() == 3
+        assert _bubble(page, SEEDED_ANSWER_MID).count() == 1
+        assert SEEDED_ANSWER_MID in _bubble(page, SEEDED_CHATTER_MID).locator(
+            ".reply-quote"
+        ).get_attribute("onclick")
+
+    def test_a_single_question_read_back_in_place(self, page):
+        """The same rule one level down: a single-select card answered with
+        nothing in between is the whole record of the exchange."""
+        question = page.evaluate("() => window.__question")
+        _seed(
+            page,
+            [
+                _question_msg(SEEDED_QUESTION_MID, question),
+                _answer_msg(
+                    SEEDED_ANSWER_MID,
+                    SEEDED_QUESTION_MID,
+                    "\u25b8 Monday morning\nanswer:q-deploy:monday",
+                ),
+            ],
+        )
+
+        card = _card(page, SEEDED_QUESTION_MID)
+        assert card.locator(".question-qa-prompt").inner_text() == "Deploy tonight or Monday?"
+        assert card.locator(".question-qa-answer").inner_text() == "Monday morning"
+        assert _bubble(page, SEEDED_ANSWER_MID).count() == 0
+
+    def test_a_read_back_has_nothing_to_tap_on_a_phone(self, page):
+        """The 44px floor is measured on controls; a read-back's answer is
+        that there are none, portrait and landscape."""
+        assert page.viewport_size == {"width": 390, "height": 844}
+        form = page.evaluate("() => window.__form")
+        _seed(
+            page,
+            [
+                _question_msg(SEEDED_QUESTION_MID, form),
+                _answer_msg(SEEDED_ANSWER_MID, SEEDED_QUESTION_MID, FORM_ANSWER_BODY),
+            ],
+        )
+
+        assert _controls_in_card(page, SEEDED_QUESTION_MID) == 0
+        assert _tap_targets_under_44px(page, SEEDED_QUESTION_MID) == []
+
+        page.set_viewport_size({"width": 844, "height": 390})
+        page.wait_for_timeout(100)
+        assert _tap_targets_under_44px(page, SEEDED_QUESTION_MID) == []

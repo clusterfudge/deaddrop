@@ -1523,7 +1523,10 @@
             // excludeReactions=true is already passed to getRoomMessages above,
             // olderPage excludes reactions server-side; the filter here is
             // belt-and-suspenders for older server versions.
-            const olderDisplay = olderPage.filter(m => m.content_type !== 'reaction');
+            const collapsed = collapsibleAnswerMids(
+                roomMessages.filter(m => m.content_type !== 'reaction'), answerMap);
+            const olderDisplay = olderPage.filter(
+                m => m.content_type !== 'reaction' && !collapsed.has(m.mid));
 
             // Build a DocumentFragment with the older messages.
             // column-reverse: DOM order is newest→oldest, so older messages
@@ -1909,7 +1912,7 @@
     }
 
     /**
-     * question mid -> [{from_id, byQid: Map<qid, {optionIds:Set, freeText}>}]
+     * question mid -> [{mid, from_id, byQid: Map<qid, {optionIds:Set, freeText}>}]
      * for every reply carrying at least one machine line whose qid belongs to
      * that question. A form's single reply carries one line per question, so
      * one reply yields N entries in its map.
@@ -1942,9 +1945,45 @@
             }
             if (!byQid.size) continue;
             if (!map[msg.reference_mid]) map[msg.reference_mid] = [];
-            map[msg.reference_mid].push({ from_id: msg.from_id, byQid });
+            map[msg.reference_mid].push({ mid: msg.mid, from_id: msg.from_id, byQid });
         }
         return map;
+    }
+
+    /**
+     * The mids of answer messages whose bubble would only repeat the card it
+     * answers: this member has answered, so the card renders the whole Q&A,
+     * and no other message landed between the two. An answer something else
+     * points at — a reply, a reaction — or one carrying an attachment keeps
+     * its bubble, since the card reads back answers and not those.
+     *
+     * An answer already collapsed is not an intervening message, so a
+     * question answered by two members back to back collapses both.
+     */
+    function collapsibleAnswerMids(displayMessages, answerMap) {
+        const pointedAt = new Set();
+        for (const msg of roomMessages) {
+            if (msg.reference_mid) pointedAt.add(msg.reference_mid);
+        }
+        const position = new Map();
+        displayMessages.forEach((msg, i) => position.set(msg.mid, i));
+
+        const collapsed = new Set();
+        displayMessages.forEach((msg, i) => {
+            const entries = (msg.reference_mid && answerMap[msg.reference_mid]) || [];
+            if (!entries.some(a => a.mid === msg.mid)) return;
+            if (!entries.some(a => a.from_id === credentials.id)) return;
+            if (pointedAt.has(msg.mid)) return;
+            if (msg.attachments && msg.attachments.length) return;
+
+            const questionAt = position.get(msg.reference_mid);
+            if (questionAt === undefined || questionAt >= i) return;
+            for (let k = questionAt + 1; k < i; k++) {
+                if (!collapsed.has(displayMessages[k].mid)) return;
+            }
+            collapsed.add(msg.mid);
+        });
+        return collapsed;
     }
 
     /**
@@ -1961,14 +2000,6 @@
             if (line.startsWith(marker)) return line.slice(marker.length).trim();
         }
         return '';
-    }
-
-    /** The answer entry this member submitted for a question, if any. */
-    function myAnswer(answers, qid) {
-        for (const a of answers) {
-            if (a.from_id === credentials.id && a.byQid.has(qid)) return a.byQid.get(qid);
-        }
-        return null;
     }
 
     /** Everyone's answer for one question, as [{from_id, optionIds, freeText}]. */
@@ -1994,6 +2025,15 @@
         return question.allow_free_text && staged.free.trim().length > 0;
     }
 
+    /** The labels one answer entry carries for its question. */
+    function answerLabels(question, entry) {
+        return [...entry.optionIds]
+            .map(id => id === QUESTION_FREE_TEXT_ID
+                ? entry.freeText
+                : (question.options.find(o => o.id === id) || {}).label)
+            .filter(Boolean);
+    }
+
     /** The labels a staged answer would post, for the review pane. */
     function stagedLabels(mid, question) {
         const staged = readStaged(mid, question.qid);
@@ -2010,9 +2050,10 @@
      * form of several answered a step at a time.
      *
      * An unanswered form renders as a wizard: the question at the current
-     * step, then prev/next. An answered one renders every question flat with
-     * the choice made under each, because the wizard is for answering and a
-     * read-back has nothing to navigate.
+     * step, then prev/next. A card this member has answered renders as a Q&A
+     * read-back — each prompt paired with the answer given — because the
+     * wizard, the buttons and the free-text row are all for answering, and
+     * that is over.
      *
      * Question bodies are agent-authored, so every payload-derived string
      * lands via textContent on an element built here. Nothing from the
@@ -2031,6 +2072,7 @@
         card.className = 'question-card';
         if (payload.isForm) card.classList.add('question-form');
         if (wizard) card.classList.add('question-wizard');
+        if (answeredByMe) card.classList.add('question-readback');
         if (answers.length) card.classList.add('answered');
         if (sending) card.classList.add('sending');
         card.dataset.qid = payload.questions[0].qid;
@@ -2052,6 +2094,8 @@
                 ? buildQuestionItem(msg, payload, payload.questions[step], answers, locked)
                 : buildReviewStep(msg, payload));
             card.appendChild(buildWizardNav(msg, payload, step));
+        } else if (answeredByMe) {
+            card.appendChild(buildAnswerReadback(payload, answers));
         } else {
             for (const question of payload.questions) {
                 card.appendChild(buildQuestionItem(msg, payload, question, answers, locked));
@@ -2062,7 +2106,7 @@
             const footer = document.createElement('div');
             footer.className = 'question-answered-by';
             const parts = [`Answered by ${answers.map(a => getMemberName(a.from_id)).join(', ')}`];
-            if (!payload.isForm) {
+            if (!payload.isForm && !answeredByMe) {
                 for (const a of answersFor(answers, payload.questions[0].qid)) {
                     if (a.freeText) parts.push(`${getMemberName(a.from_id)}: \u201c${a.freeText}\u201d`);
                 }
@@ -2077,7 +2121,6 @@
 
     /** One question inside a card: prompt, option buttons, optional extras. */
     function buildQuestionItem(msg, payload, question, answers, locked) {
-        const mine = myAnswer(answers, question.qid);
         const everyone = answersFor(answers, question.qid);
         const staged = readStaged(msg.mid, question.qid);
         const itemLocked = locked;
@@ -2107,7 +2150,7 @@
             if (chosenBy.length) btn.classList.add('chosen');
             else if (everyone.length) btn.classList.add('dimmed');
             const isStaged = staged.ids.has(opt.id);
-            if (isStaged && !mine) btn.classList.add('staged');
+            if (isStaged) btn.classList.add('staged');
             btn.dataset.optionId = opt.id;
             btn.disabled = itemLocked;
             if (payload.isForm || question.multi) btn.setAttribute('aria-pressed', String(isStaged));
@@ -2160,18 +2203,51 @@
             item.appendChild(buildFreeTextRow(msg, payload, question, staged));
         }
 
-        if (payload.isForm && mine) {
-            const chose = document.createElement('div');
-            chose.className = 'question-item-answer';
-            const labels = [...mine.optionIds]
-                .map(id => id === QUESTION_FREE_TEXT_ID
-                    ? mine.freeText
-                    : (question.options.find(o => o.id === id) || {}).label)
-                .filter(Boolean);
-            chose.textContent = labels.length ? labels.join(', ') : 'Not answered';
-            item.appendChild(chose);
-        }
         return item;
+    }
+
+    /**
+     * An answered card, read back as Q&A: every prompt with the answer given
+     * for it, named when more than one member answered or the answer is not
+     * this member's. A question no answer covers reads as skipped, not as a
+     * gap. Nothing here is interactive.
+     */
+    function buildAnswerReadback(payload, answers) {
+        const pane = document.createElement('div');
+        pane.className = 'question-qa';
+
+        for (const question of payload.questions) {
+            const line = document.createElement('div');
+            line.className = 'question-qa-line';
+            line.dataset.qid = question.qid;
+
+            const prompt = document.createElement('div');
+            prompt.className = 'question-qa-prompt';
+            prompt.textContent = question.prompt;
+            line.appendChild(prompt);
+
+            const given = answersFor(answers, question.qid)
+                .map(entry => ({ entry, labels: answerLabels(question, entry) }))
+                .filter(a => a.labels.length);
+
+            if (!given.length) {
+                const none = document.createElement('div');
+                none.className = 'question-qa-answer missing';
+                none.textContent = question.optional ? 'Skipped' : 'Not answered';
+                line.appendChild(none);
+            }
+            for (const a of given) {
+                const answer = document.createElement('div');
+                answer.className = 'question-qa-answer';
+                const labels = a.labels.join(', ');
+                answer.textContent = given.length > 1 || a.entry.from_id !== credentials.id
+                    ? `${getMemberName(a.entry.from_id)}: ${labels}`
+                    : labels;
+                line.appendChild(answer);
+            }
+            pane.appendChild(line);
+        }
+        return pane;
     }
 
     /**
@@ -2533,6 +2609,11 @@
         
         // Filter out reaction messages from the main list
         const displayMessages = roomMessages.filter(m => m.content_type !== 'reaction');
+
+        // An answer the card above it already reads back is drawn in place of
+        // that card rather than under it.
+        const collapsed = collapsibleAnswerMids(displayMessages, answerMap);
+        const visible = displayMessages.filter(m => !collapsed.has(m.mid));
         
         // column-reverse layout: newest message must be first in DOM order
         // (DOM top = visual bottom, DOM bottom = visual top / oldest).
@@ -2541,8 +2622,8 @@
         const fragment = document.createDocumentFragment();
 
         // Newest first (DOM order matches visual order for column-reverse)
-        for (let i = displayMessages.length - 1; i >= 0; i--) {
-            fragment.appendChild(renderMessageElement(displayMessages[i], reactionMap, answerMap));
+        for (let i = visible.length - 1; i >= 0; i--) {
+            fragment.appendChild(renderMessageElement(visible[i], reactionMap, answerMap));
         }
 
         // Sentinel lives at the physical end of the DOM (= visual top).

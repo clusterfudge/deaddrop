@@ -190,12 +190,20 @@ change.
 - Single-select: a tap posts immediately. Multi-select: taps stage a
   selection, a **Send N answers** button posts it as one reply.
 - Controls disable the instant a tap is accepted, so a double-tap posts once.
-- Once you have answered, the card locks for you: the chosen option is
-  highlighted, the rest dim, and the answerers are named on the option and in
-  the card footer.
+- Once you have answered, the card becomes a **Q&A read-back**: each prompt
+  paired with the answer given for it, and nothing to tap. The options, the
+  free-text row and the wizard were all for answering, and that is over. An
+  answer that is not yours, or one of several, carries the answerer's name.
 - The answered state is **derived from the reply at render time** — the same
   way a reply quote is. Several members can answer the same question and each
   answer is attributed.
+- **An answer sitting immediately under the card is drawn in place of it.**
+  The card already reads the whole exchange back, so the reply's own bubble
+  would repeat it; the bubble is suppressed and the read-back stands alone.
+  With any other message between the question and the answer, the bubble
+  stays — collapsing it there would move the answer back past that message.
+  An answer someone replied to, reacted to, or that carries an attachment
+  keeps its bubble too, since the card reads back answers and not those.
 
 ### A form
 
@@ -220,10 +228,11 @@ change.
 - Submit replaces Next on the review step, enabled only once every required
   question has an answer and labelled *"N left to choose"* until then. It
   posts **one** reply and disables on the accepted tap.
-- A submitted form is a read-back, not something to navigate: every question
-  renders flat with the choice made under it, chosen options outlined and the
-  rest dimmed, every answerer named. Another member's submission does not
-  lock it for you.
+- A submitted form is a read-back, not something to navigate: every prompt
+  with the answer given for it, in payload order, an unanswered optional
+  question reading *Skipped*. Another member's submission does not lock it
+  for you — until you have answered, the wizard is still yours to fill in and
+  their reply stays in the stream.
 
 Question bodies are agent-authored, so every payload-derived string is set
 via `textContent` on an element built in JS. No payload field is interpolated
@@ -236,7 +245,7 @@ into HTML.
 | File | Covers |
 |---|---|
 | `tests/test_question_messages.py` (9) | The API stores both payload shapes verbatim; answers survive `exclude_reactions`; several members can answer; a form's single reply parses as N answers under the documented grammar. |
-| `tests/test_question_playwright.py` (41) | Rendering, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across navigation and a reload, wizard nav (step order, first-step Back, ungated Next, review reachability, jump-back lines), required-gating, review contents, the exact single-submit body, and the flat answered form. Touch targets are **measured**: every `button` and `input` in a form card is asserted ≥ 44×44px on every step, portrait and landscape. |
+| `tests/test_question_playwright.py` (49) | Rendering, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across navigation and a reload, wizard nav (step order, first-step Back, ungated Next, review reachability, jump-back lines), required-gating, review contents, the exact single-submit body, and the answered card's Q&A read-back. The in-place rule is tested from the stream's order: adjacent answers collapse (including two in a row), an intervening message or a reply pointing at the answer keeps the bubble, and another member's answer alone collapses nothing. Touch targets are **measured**: every `button` and `input` in a form card is asserted ≥ 44×44px on every step, portrait and landscape, and a read-back is asserted to carry none. |
 
 ---
 
@@ -247,9 +256,18 @@ into HTML.
 | Desktop (1280×900) | ![](img/questions-desktop-light.png) | ![](img/questions-desktop-dark.png) |
 | Mobile (390×844) | ![](img/questions-mobile-light.png) | ![](img/questions-mobile-dark.png) |
 
-Each shows an answered single-select card (chosen option outlined, the other
-dimmed, answerer named), a multi-select card with its send button, and an
-unanswered card with the free-text row.
+Each shows an unanswered card with the free-text row, a multi-select card
+with its send button, and an answered single-select card — read back as the
+prompt and the answer, with no separate reply bubble under it.
+
+The same form twice: above, answered with a message in between, so the reply
+keeps its bubble; below, answered with nothing in between, so the Q&A is
+drawn in place of the card and the bubble is gone.
+
+| | Light | Dark |
+|---|---|---|
+| Desktop | ![](img/questions-readback-desktop-light.png) | ![](img/questions-readback-desktop-dark.png) |
+| Mobile | ![](img/questions-readback-mobile-light.png) | ![](img/questions-readback-mobile-dark.png) |
 
 A form mid-stack. Desktop shows a question step — *"Question 2 of 3"*, one
 option staged, Back and Next live. Mobile shows the review step with every
