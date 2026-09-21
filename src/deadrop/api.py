@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -365,12 +366,43 @@ async def add_timing_middleware(request: Request, call_next):
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+
+# Static assets under /static/ are served with ETag and Last-Modified but no
+# Cache-Control, so a browser is free to apply heuristic freshness and reuse a
+# copy without revalidating. The HTML shell is a server-rendered template and
+# is always fresh, which makes the two halves of a release land independently:
+# inline template JS updates while its stylesheet does not.
+#
+# Stamping the URL with a content hash removes the choice. The hash changes iff
+# a shell asset's bytes change, so a release requests URLs the cache has never
+# seen, and an unchanged release keeps hitting the cache.
+SHELL_ASSETS = (
+    "css/style.css",
+    "js/crypto.js",
+    "js/credentials.js",
+    "js/api.js",
+    "js/push.js",
+    "js/palette.js",
+)
+
+
+def _asset_version() -> str:
+    """Content hash of the shell assets, for cache-busting their URLs."""
+    digest = hashlib.sha256()
+    for rel in SHELL_ASSETS:
+        path = STATIC_DIR / rel
+        digest.update(rel.encode())
+        digest.update(path.read_bytes() if path.exists() else b"")
+    return digest.hexdigest()[:12]
+
+
 # Initialize templates if directory exists
 templates = Jinja2Templates(directory=TEMPLATES_DIR) if TEMPLATES_DIR.exists() else None
 
 # Expose server-side configuration to templates as Jinja globals
 if templates:
     templates.env.globals["ROOM_PAGE_SIZE"] = int(os.environ.get("DEADROP_ROOM_PAGE_SIZE", "20"))
+    templates.env.globals["asset_v"] = _asset_version()
 
 
 # --- Request/Response Models ---

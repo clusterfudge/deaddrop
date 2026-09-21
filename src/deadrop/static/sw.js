@@ -9,7 +9,7 @@
 //
 // Cache version: bump CACHE_NAME when shell assets change to force update.
 
-const CACHE_NAME = 'deadrop-shell-v4';
+const CACHE_NAME = 'deadrop-shell-v5';
 const APP_SHELL = [
   '/app',
   '/static/css/style.css',
@@ -99,7 +99,10 @@ self.addEventListener('fetch', (event) => {
         return response;
       })
       .catch(() =>
-        caches.match(request).then((cached) => {
+        // ignoreSearch: shell asset URLs carry a ?v=<content-hash>, so an
+        // exact match would miss every cached copy after a release. Offline,
+        // the previous release's stylesheet beats an error page.
+        caches.match(request, { ignoreSearch: true }).then((cached) => {
           if (cached) return cached;
           // Offline navigation fallback → serve /app shell if available.
           if (request.mode === 'navigate') {
