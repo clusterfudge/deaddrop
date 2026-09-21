@@ -17,6 +17,7 @@ pip install deaddrop[turso]
 - **Identity/Mailbox**: An agent's inbox within a namespace. ID is derived from a secret (`id = hash(secret)[:16]`).
 - **Message**: A blob sent from one identity to another within a namespace. Uses UUIDv7 (timestamp-sortable).
 - **Room**: A shared space for multi-user group messaging. Any member can read/write. See [docs/ROOMS.md](docs/ROOMS.md).
+- **Question**: A room message an agent posts as `application/x-question`, rendered by the web UI as tappable answer buttons. A tap posts an ordinary reply, so agents read answers from the normal message stream. See [docs/QUESTIONS.md](docs/QUESTIONS.md).
 - **Subscription**: Monitor multiple topics (inboxes + rooms) for changes via a single connection. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
 
 ## Auth Model
