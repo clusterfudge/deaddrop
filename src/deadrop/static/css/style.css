@@ -1947,3 +1947,12 @@ kbd {
     box-shadow: inset 3px 0 0 var(--primary-color);
     background: var(--hover-bg);
 }
+
+/* Build version badge. Text is filled at runtime from the app-version meta
+   tag; empty and zero-width until then. */
+.vbadge {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}

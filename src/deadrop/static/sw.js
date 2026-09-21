@@ -9,7 +9,7 @@
 //
 // Cache version: bump CACHE_NAME when shell assets change to force update.
 
-const CACHE_NAME = 'deadrop-shell-v5';
+const CACHE_NAME = 'deadrop-shell-v6';
 const APP_SHELL = [
   '/app',
   '/static/css/style.css',
@@ -27,7 +27,11 @@ self.addEventListener('install', (event) => {
         // Add each URL individually so one 404 doesn't poison the whole install.
         Promise.all(
           APP_SHELL.map((url) =>
-            cache.add(url).catch((err) => {
+            // cache: 'reload' bypasses the HTTP cache for the precache fetch.
+            // Without it a stale HTTP-cached response is copied into the SW
+            // cache, giving the same stale bytes a second home that outlives
+            // the HTTP entry.
+            cache.add(new Request(url, { cache: 'reload' })).catch((err) => {
               console.warn('[sw] precache miss:', url, err.message);
             }),
           ),
