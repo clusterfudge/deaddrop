@@ -43,7 +43,7 @@
     <!-- Unified Inbox View (1:1 + Rooms) -->
     <div id="view-inbox" class="view hidden">
         <div class="header">
-            <a href="/app" class="back-link" id="inbox-back">←</a>
+            <a href="/app" class="back-link" id="inbox-back" aria-label="Back">←</a>
             <div>
                 <h1 id="inbox-title">Namespace</h1>
                 <div class="subtitle" id="inbox-subtitle">as Identity</div>
@@ -80,7 +80,7 @@
     <!-- Conversation View (1:1) -->
     <div id="view-conversation" class="view hidden">
         <div class="header">
-            <a href="#" class="back-link" id="conversation-back">←</a>
+            <a href="#" class="back-link" id="conversation-back" aria-label="Back">←</a>
             <h1 id="conversation-title">Peer</h1>
             <div style="margin-left: auto; display: flex; align-items: center; gap: 8px;">
                 <button id="conversation-panel-btn" class="btn btn-icon" title="Attachments and search" aria-label="Attachments and search">🗂</button>
@@ -93,14 +93,14 @@
         <div class="compose-area">
             <textarea id="message-input" class="compose-input" 
                       placeholder="Type a message..." rows="1"></textarea>
-            <button id="send-btn" class="btn btn-primary">Send ➤</button>
+            <button id="send-btn" class="btn btn-primary" aria-label="Send message">Send ➤</button>
         </div>
     </div>
     
     <!-- Room Chat View -->
     <div id="view-room-chat" class="view hidden">
         <div class="header">
-            <a href="#" class="back-link" id="room-chat-back">←</a>
+            <a href="#" class="back-link" id="room-chat-back" aria-label="Back">←</a>
             <div>
                 <h1 id="room-chat-title">Room</h1>
                 <div class="subtitle" id="room-chat-members"></div>
@@ -112,7 +112,7 @@
                 </div>
                 <button id="room-panel-btn" class="btn btn-icon" title="Attachments and search" aria-label="Attachments and search">🗂</button>
                 <button class="theme-toggle" id="theme-toggle-btn-room-chat" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
-                <button id="room-refresh-btn" class="btn btn-icon" title="Refresh messages">🔄</button>
+                <button id="room-refresh-btn" class="btn btn-icon" title="Refresh messages" aria-label="Refresh messages">🔄</button>
             </div>
         </div>
         
@@ -121,18 +121,18 @@
         <div id="room-reply-preview" class="reply-preview hidden"></div>
         <div id="room-attachment-preview" class="attachment-preview hidden"></div>
         <div class="compose-area">
-            <button id="room-attach-btn" class="btn btn-icon" title="Attach image">📎</button>
+            <button id="room-attach-btn" class="btn btn-icon" title="Attach image" aria-label="Attach image">📎</button>
             <input type="file" id="room-file-input" accept="text/*,image/*,audio/*,video/*,application/json,application/xml,application/yaml,application/pdf,.md,.log,.yaml,.yml,.toml,.ini,.conf,.patch,.diff,.sql" multiple style="display:none">
             <textarea id="room-message-input" class="compose-input" 
                       placeholder="Type a message..." rows="1" enterkeyhint="send"></textarea>
-            <button id="room-send-btn" class="btn btn-primary">Send ➤</button>
+            <button id="room-send-btn" class="btn btn-primary" aria-label="Send message">Send ➤</button>
         </div>
     </div>
     
     <!-- Thread Panel (attachments + search) for rooms and 1:1 conversations -->
     <div id="view-thread-panel" class="view hidden">
         <div class="header">
-            <a href="#" class="back-link" id="thread-panel-back">←</a>
+            <a href="#" class="back-link" id="thread-panel-back" aria-label="Back">←</a>
             <div>
                 <h1 id="thread-panel-title">Thread</h1>
                 <div class="subtitle" id="thread-panel-subtitle">Attachments and search</div>
@@ -241,7 +241,7 @@
     <!-- Archived View -->
     <div id="view-archived" class="view hidden">
         <div class="header">
-            <a href="#" class="back-link" id="archived-back">←</a>
+            <a href="#" class="back-link" id="archived-back" aria-label="Back">←</a>
             <h1>Archived Messages</h1>
             <div style="margin-left: auto;">
                 <button class="theme-toggle" id="theme-toggle-btn-archived" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
@@ -1581,6 +1581,12 @@
     }
     
     const REACTION_EMOJIS = ['👍', '❤️', '😂', '🎉', '👀', '🙏'];
+    // A reaction control's contents are a glyph, so its computed accessible
+    // name is that glyph. These words are what the control is named instead.
+    const REACTION_NAMES = {
+        '👍': 'Thumbs up', '❤️': 'Heart', '😂': 'Laugh',
+        '🎉': 'Party', '👀': 'Eyes', '🙏': 'Thanks',
+    };
     
     function buildReactionMap(messages) {
         // Group reactions by reference_mid → { emoji → Set of sender IDs }
@@ -1602,11 +1608,12 @@
             const names = [...senders].map(id => getMemberName(id)).join(', ');
             return `<button class="reaction-badge ${isMine ? 'mine' : ''}"
                 title="${names}"
+                aria-label="${REACTION_NAMES[emoji] || emoji} reaction, ${senders.size}"
                 onclick="toggleReaction('${mid}', '${emoji}')"
                 >${emoji}<span class="reaction-count">${senders.size > 1 ? ' ' + senders.size : ''}</span></button>`;
         }).join('') : '';
         
-        return `<div class="reaction-badges">${badges}<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction">+</button><button class="reaction-badge reply-action" onclick="startReply('${mid}')" title="Reply" aria-label="Reply to this message">↩</button></div>`;
+        return `<div class="reaction-badges">${badges}<button class="reaction-badge add-reaction" onclick="showReactionPicker(event, '${mid}')" title="Add reaction" aria-label="Add reaction">+</button><button class="reaction-badge reply-action" onclick="startReply('${mid}')" title="Reply" aria-label="Reply to this message">↩</button></div>`;
     }
 
     // ==================== REPLY ====================
@@ -2827,7 +2834,7 @@
         picker.id = 'reaction-picker';
         picker.className = 'reaction-picker';
         picker.innerHTML = REACTION_EMOJIS.map(emoji =>
-            `<button class="reaction-picker-btn" onclick="pickReaction(event, '${targetMid}', '${emoji}')">${emoji}</button>`
+            `<button class="reaction-picker-btn" aria-label="React with ${REACTION_NAMES[emoji] || emoji}" onclick="pickReaction(event, '${targetMid}', '${emoji}')">${emoji}</button>`
         ).join('');
         
         // Position near the click, clamped to viewport
