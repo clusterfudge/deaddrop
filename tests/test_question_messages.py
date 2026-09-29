@@ -245,6 +245,23 @@ class TestFormRoundTrip:
         )
         assert parse_answers(answer["body"]) == {"q-deploy-window": ["monday"]}
 
+    def test_a_skipped_question_is_an_answer_under_the_same_grammar(self, client, room):
+        """A skip rides the reserved `_skip` id, so an existing watcher parses it
+        as one more answer line, distinct from a question left out."""
+        question = _send(client, room, "alice", json.dumps(FORM_PAYLOAD), QUESTION_CONTENT_TYPE)
+        answer = _send(
+            client,
+            room,
+            "bob",
+            "\u25b8 Deploy when? \u2014 Skipped\n"
+            "\u25b8 Who reviews? \u2014 Sean\n"
+            "answer:q-when:_skip\n"
+            "answer:q-who:sean",
+            "text/markdown",
+            reference_mid=question["mid"],
+        )
+        assert parse_answers(answer["body"]) == {"q-when": ["_skip"], "q-who": ["sean"]}
+
     def test_prose_in_a_reply_is_not_an_answer(self, client, room):
         """A human replying in prose to a form is a reply, not a submission."""
         question = _send(client, room, "alice", json.dumps(FORM_PAYLOAD), QUESTION_CONTENT_TYPE)
