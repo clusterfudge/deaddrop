@@ -31,7 +31,7 @@ JSON body.
 |---|---|---|
 | `qid` | yes | Stable id for this question. `[A-Za-z0-9._-]+`. Appears in every answer's machine line. |
 | `prompt` | yes | The question, as plain text. Not markdown. |
-| `options` | yes | 1–12 entries. Each needs `id` (`[A-Za-z0-9._-]+`, unique, not `_free`) and `label`; `description` is optional. |
+| `options` | yes | 1–12 entries. Each needs `id` (`[A-Za-z0-9._-]+`, unique, not `_free` or `_skip`) and `label`; `description` is optional. |
 | `allow_free_text` | no | `true` renders a text input beside the buttons. Default `false`. |
 | `multi` | no | `true` lets the answerer stage several options and send them in one reply. Default `false`. |
 
@@ -64,7 +64,7 @@ fields above, plus `optional`; `title` is an optional top-level label.
 |---|---|---|
 | `questions` | yes (for a form) | 1–20 entries, each validated as a question. `qid` unique across the form. |
 | `title` | no | Card heading, plain text. Also what an answer's reply quote shows. |
-| `optional` | no | `true` lets Submit go through with this question unanswered. Unmarked means required. |
+| `optional` | no | `true` lets Submit go through with this question untouched, and it posts no line. Unmarked means Submit waits until it is answered **or skipped**. Not needed for skipping: every question has a Skip control. |
 
 A form with **one** malformed entry renders no card and degrades to text, the
 same as a malformed single question. Dropping the bad entry and rendering the
@@ -95,6 +95,14 @@ Free text uses the reserved id `_free`; the text itself is the bullet line:
 answer:q-deploy-window:_free
 ```
 
+A skip uses the reserved id `_skip`. Every question can be skipped, whether
+or not it is `optional`:
+
+```
+▸ Skipped
+answer:q-deploy-window:_skip
+```
+
 **A form's answer is one reply with one machine line per question**, so a
 watcher written against a single question reads a form response as N answers
 with no change. The bullet lines carry the prompt so the human-readable half
@@ -109,7 +117,9 @@ answer:q-who:sean,fritz
 answer:q-note:_free
 ```
 
-A question left unanswered contributes no line at all. The separator between
+A skipped question contributes `answer:<qid>:_skip` and a `▸ prompt —
+Skipped` bullet; an untouched `optional` question contributes no line at
+all. A form can be submitted with every question skipped. The separator between
 a prompt and its answer is ` — ` (U+2014), which is also how a free-text
 answer is recovered for its question.
 
@@ -120,7 +130,8 @@ answer is recovered for its question.
 ^answer:(?<qid>[^\s:]+):(?<ids>\S*)$
 ```
 
-on the body, with `qid` equal to the one you sent. Ignore replies that don't
+on the body, with `qid` equal to the one you sent. `ids` equal to `_skip`
+means the answerer declined that question. Ignore replies that don't
 match — a human replying in prose to a question is a normal reply, not an
 answer.
 
@@ -189,6 +200,9 @@ change.
 - One button per option, minimum 44px tall, full-width on a phone.
 - Single-select: a tap posts immediately. Multi-select: taps stage a
   selection, a **Send N answers** button posts it as one reply.
+- Every question carries a **Skip** control below its options. On a
+  single-question card it posts `answer:<qid>:_skip` at once, dropping any
+  staged multi-select choice; the card then reads back *Skipped*.
 - Controls disable the instant a tap is accepted, so a double-tap posts once.
 - Once you have answered, the card becomes a **Q&A read-back**: each prompt
   paired with the answer given for it, and nothing to tap. The options, the
@@ -233,17 +247,21 @@ change.
   reload returns to the first question with every answer intact.
 - **Next is never gated.** A question can be paged past and answered on the
   way back; the only gate is Submit. A required question with nothing chosen
-  carries a dashed rule.
+  and no skip carries a dashed rule.
+- In a form, **Skip stages** like an option and toggles. Skipping clears the
+  question's staged choice and typed text; choosing an option or typing
+  clears the skip. A staged skip persists with the other staged state.
 - The step after the last question is the **review**: every prompt and the
   answer it would post, with *"Review · 2 of 3 chosen"* above. Each line is a
   button that jumps back to its question, which is the one way to move
   through the stack without the arrows.
 - Submit replaces Next on the review step, enabled only once every required
-  question has an answer and labelled *"N left to choose"* until then. It
-  posts **one** reply and disables on the accepted tap.
+  question has an answer or a skip, and labelled *"N left to choose"* until
+  then — *"Submit 2 answers"* or, with a skip, *"Submit · 1 skipped"* once
+  it is live. It posts **one** reply and disables on the accepted tap.
 - A submitted form is a read-back, not something to navigate: every prompt
-  with the answer given for it, in payload order, an unanswered optional
-  question reading *Skipped*. Another member's submission does not lock it
+  with the answer given for it, in payload order, a skipped or unanswered
+  optional question reading *Skipped*. Another member's submission does not lock it
   for you — until you have answered, the wizard is still yours to fill in,
   and their answers read back underneath it.
 
@@ -257,8 +275,8 @@ into HTML.
 
 | File | Covers |
 |---|---|
-| `tests/test_question_messages.py` (9) | The API stores both payload shapes verbatim; answers survive `exclude_reactions`; several members can answer; a form's single reply parses as N answers under the documented grammar. |
-| `tests/test_question_playwright.py` (54) | Rendering, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across navigation and a reload, wizard nav (step order, first-step Back, ungated Next, review reachability, jump-back lines), required-gating, review contents, the exact single-submit body, and the answered card's Q&A read-back. Bubble suppression is tested from the stream's order — adjacent, with a message in between, four messages later, two answers at once, another member's alone — plus the attachment, reply-quote and reaction dispositions and the mismatched-qid case that must keep its bubble. Touch targets are **measured**: every `button` and `input` in a form card is asserted ≥ 44×44px on every step, portrait and landscape, and a read-back is asserted to carry none. |
+| `tests/test_question_messages.py` (10) | The API stores both payload shapes verbatim; answers survive `exclude_reactions`; several members can answer; a form's single reply parses as N answers under the documented grammar, a `_skip` line included. |
+| `tests/test_question_playwright.py` (65) | Skip on single, multi and form cards (the posted `_skip` body, skip ↔ choice and skip ↔ typed text replacing each other, required questions settled by a skip, an all-skipped submit, a staged skip across a reload, `_skip` reserved as an option id, another member's skip dimming nothing). Rendering, tap→reply body, double-tap, derived answered state, multi, free text, escaping; form staging, `localStorage` persistence across navigation and a reload, wizard nav (step order, first-step Back, ungated Next, review reachability, jump-back lines), required-gating, review contents, the exact single-submit body, and the answered card's Q&A read-back. Bubble suppression is tested from the stream's order — adjacent, with a message in between, four messages later, two answers at once, another member's alone — plus the attachment, reply-quote and reaction dispositions and the mismatched-qid case that must keep its bubble. Touch targets are **measured**: every `button` and `input` in a form card is asserted ≥ 44×44px on every step, portrait and landscape, and a read-back is asserted to carry none. |
 
 ---
 

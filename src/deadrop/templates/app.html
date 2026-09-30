@@ -1728,6 +1728,10 @@
     // render time, the same way reply quotes are.
     const QUESTION_CONTENT_TYPE = 'application/x-question';
     const QUESTION_FREE_TEXT_ID = '_free';
+    // Any question can be skipped; a skip is posted as this reserved id so a
+    // watcher can tell "declined" from "not answered yet".
+    const QUESTION_SKIP_ID = '_skip';
+    const QUESTION_SKIP_LABEL = 'Skipped';
     const QUESTION_MAX_OPTIONS = 12;
     const QUESTION_MAX_QUESTIONS = 20;
     const QUESTION_FREE_TEXT_MAX = 500;
@@ -1767,27 +1771,30 @@
         }
         let ids = [];
         let free = '';
+        let skip = false;
         if (raw) {
             try {
                 const parsed = JSON.parse(raw);
                 if (Array.isArray(parsed.ids)) ids = parsed.ids.filter(i => typeof i === 'string');
                 if (typeof parsed.free === 'string') free = parsed.free;
+                skip = parsed.skip === true;
             } catch (e) { /* corrupt entry: treat as unstaged */ }
         }
-        return { ids: new Set(ids), free };
+        return { ids: new Set(ids), free, skip };
     }
 
-    function writeStaged(mid, qid, ids, free) {
+    /** A staged skip and a staged answer exclude each other; callers pick one. */
+    function writeStaged(mid, qid, ids, free, skip = false) {
         const key = stagedKey(mid, qid);
         const idList = [...ids];
-        if (!idList.length && !free) {
+        if (!idList.length && !free && !skip) {
             try {
                 localStorage.removeItem(key);
             } catch (e) { /* ignore */ }
             stagedFallback.delete(key);
             return;
         }
-        const raw = JSON.stringify({ ids: idList, free });
+        const raw = JSON.stringify(skip ? { ids: [], free: '', skip: true } : { ids: idList, free });
         try {
             localStorage.setItem(key, raw);
         } catch (e) {
@@ -1829,8 +1836,10 @@
             const id = typeof opt.id === 'string' ? opt.id.trim() : '';
             const label = typeof opt.label === 'string' ? opt.label.trim() : '';
             // Ids travel inside a colon/comma-delimited machine line and the
-            // free-text id is reserved, so both are constrained here.
-            if (!id || !label || id === QUESTION_FREE_TEXT_ID) return null;
+            // free-text and skip ids are reserved, so both are constrained here.
+            if (!id || !label || id === QUESTION_FREE_TEXT_ID || id === QUESTION_SKIP_ID) {
+                return null;
+            }
             if (!ID_RE.test(id) || seen.has(id)) return null;
             seen.add(id);
             options.push({
@@ -2026,8 +2035,13 @@
         return question.allow_free_text && staged.free.trim().length > 0;
     }
 
+    function isStagedSkipped(mid, question) {
+        return readStaged(mid, question.qid).skip;
+    }
+
     /** The labels one answer entry carries for its question. */
     function answerLabels(question, entry) {
+        if (entry.optionIds.has(QUESTION_SKIP_ID)) return [QUESTION_SKIP_LABEL];
         return [...entry.optionIds]
             .map(id => id === QUESTION_FREE_TEXT_ID
                 ? entry.freeText
@@ -2129,6 +2143,7 @@
     /** One question inside a card: prompt, option buttons, optional extras. */
     function buildQuestionItem(msg, payload, question, answers, locked) {
         const everyone = answersFor(answers, question.qid);
+        const choosers = everyone.filter(a => !a.optionIds.has(QUESTION_SKIP_ID));
         const staged = readStaged(msg.mid, question.qid);
         const itemLocked = locked;
 
@@ -2150,12 +2165,12 @@
         const optionList = document.createElement('div');
         optionList.className = 'question-options';
         for (const opt of question.options) {
-            const chosenBy = everyone.filter(a => a.optionIds.has(opt.id));
+            const chosenBy = choosers.filter(a => a.optionIds.has(opt.id));
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'question-option';
             if (chosenBy.length) btn.classList.add('chosen');
-            else if (everyone.length) btn.classList.add('dimmed');
+            else if (choosers.length) btn.classList.add('dimmed');
             const isStaged = staged.ids.has(opt.id);
             if (isStaged) btn.classList.add('staged');
             btn.dataset.optionId = opt.id;
@@ -2210,7 +2225,36 @@
             item.appendChild(buildFreeTextRow(msg, payload, question, staged));
         }
 
+        if (!itemLocked) item.appendChild(buildSkipButton(msg, payload, question, staged));
+
         return item;
+    }
+
+    /**
+     * Every question can be skipped, whether or not it is `optional`. Alone,
+     * Skip posts at once, like an option tap. In a form it stages like one:
+     * a skip clears the staged answer, and choosing or typing clears the skip.
+     */
+    function buildSkipButton(msg, payload, question, staged) {
+        const skip = document.createElement('button');
+        skip.type = 'button';
+        skip.className = 'question-skip';
+        if (!payload.isForm) {
+            skip.textContent = 'Skip';
+            skip.setAttribute('aria-label', `Skip: ${question.prompt}`);
+            skip.addEventListener('click',
+                () => answerQuestion(msg.mid, question.qid, [QUESTION_SKIP_ID]));
+            return skip;
+        }
+        syncSkipButton(skip, staged.skip);
+        skip.addEventListener('click', () => stageQuestionSkip(msg.mid, question));
+        return skip;
+    }
+
+    function syncSkipButton(skip, skipped) {
+        skip.classList.toggle('staged', skipped);
+        skip.setAttribute('aria-pressed', String(skipped));
+        skip.textContent = skipped ? 'Skipped' : 'Skip';
     }
 
     /**
@@ -2240,12 +2284,13 @@
             if (!given.length) {
                 const none = document.createElement('div');
                 none.className = 'question-qa-answer missing';
-                none.textContent = question.optional ? 'Skipped' : 'Not answered';
+                none.textContent = question.optional ? QUESTION_SKIP_LABEL : 'Not answered';
                 line.appendChild(none);
             }
             for (const a of given) {
                 const answer = document.createElement('div');
-                answer.className = 'question-qa-answer';
+                answer.className = a.entry.optionIds.has(QUESTION_SKIP_ID)
+                    ? 'question-qa-answer missing' : 'question-qa-answer';
                 const labels = a.labels.join(', ');
                 answer.textContent = given.length > 1 || a.entry.from_id !== credentials.id
                     ? `${getMemberName(a.entry.from_id)}: ${labels}`
@@ -2279,7 +2324,8 @@
             // caret is not thrown out of the input on every keystroke.
             input.addEventListener('input', () => {
                 const current = readStaged(msg.mid, question.qid);
-                writeStaged(msg.mid, question.qid, current.ids, input.value);
+                const skip = current.skip && !input.value.trim();
+                writeStaged(msg.mid, question.qid, current.ids, input.value, skip);
                 syncStagedFormState(msg.mid);
             });
             return row;
@@ -2327,12 +2373,13 @@
             line.appendChild(q);
 
             const labels = stagedLabels(msg.mid, question);
+            const skipped = isStagedSkipped(msg.mid, question);
             const a = document.createElement('span');
             a.className = labels.length
                 ? 'question-review-answer' : 'question-review-answer missing';
             a.textContent = labels.length
                 ? labels.join(', ')
-                : (question.optional ? 'Skipped' : 'Not chosen yet');
+                : (skipped || question.optional ? QUESTION_SKIP_LABEL : 'Not chosen yet');
             line.appendChild(a);
 
             line.addEventListener('click', () => goToQuestionStep(msg.mid, index));
@@ -2395,37 +2442,49 @@
         rerenderQuestionCard(questionMid);
     }
 
+    /** A question that does not hold Submit back: answered, skipped, or optional. */
+    function isStagedSettled(mid, question) {
+        return question.optional || isStagedAnswered(mid, question)
+            || isStagedSkipped(mid, question);
+    }
+
     /**
-     * Progress text, the open-slot mark on the question in view, and the
-     * Submit label/state. Submit is enabled only once every required
-     * question has a staged answer.
+     * Progress text, the open-slot mark and Skip state on the question in
+     * view, and the Submit label/state. Submit is enabled once every required
+     * question has a staged answer or a staged skip.
      */
     function syncFormChrome(card, msg, payload, step) {
         const total = payload.questions.length;
         const chosen = payload.questions.filter(q => isStagedAnswered(msg.mid, q)).length;
+        const skipped = payload.questions.filter(q => isStagedSkipped(msg.mid, q)).length;
 
         const item = card.querySelector('.question-item');
         if (item) {
             const question = payload.questions.find(q => q.qid === item.dataset.qid);
-            const open = question && !question.optional && !isStagedAnswered(msg.mid, question);
+            const open = question && !isStagedSettled(msg.mid, question);
             item.classList.toggle('unanswered', Boolean(open));
+            const skip = item.querySelector('.question-skip');
+            if (skip && question) syncSkipButton(skip, isStagedSkipped(msg.mid, question));
         }
 
         const progress = card.querySelector('.question-form-progress');
         if (progress) {
             progress.textContent = step < total
                 ? `Question ${step + 1} of ${total}`
-                : `Review \u00b7 ${chosen} of ${total} chosen`;
+                : `Review \u00b7 ${chosen} of ${total} chosen`
+                    + (skipped ? `, ${skipped} skipped` : '');
         }
 
-        const missing = payload.questions
-            .filter(q => !q.optional && !isStagedAnswered(msg.mid, q)).length;
+        const missing = payload.questions.filter(q => !isStagedSettled(msg.mid, q)).length;
         const submit = card.querySelector('.question-form-submit');
         if (submit) {
+            const answered = `${chosen} answer${chosen > 1 ? 's' : ''}`;
             submit.disabled = missing > 0;
-            submit.textContent = missing > 0
-                ? `${missing} left to choose`
-                : `Submit ${chosen} answer${chosen > 1 ? 's' : ''}`;
+            if (missing > 0) submit.textContent = `${missing} left to choose`;
+            // The review's progress line carries both counts; the button
+            // stays one line at 390px.
+            else if (!skipped) submit.textContent = `Submit ${answered}`;
+            else submit.textContent = `Submit \u00b7 ${skipped} skipped`;
         }
     }
 
@@ -2476,6 +2535,13 @@
         rerenderQuestionCard(questionMid);
     }
 
+    /** Toggle a form question's skip. Skipping drops whatever was staged. */
+    function stageQuestionSkip(questionMid, question) {
+        const skip = !readStaged(questionMid, question.qid).skip;
+        writeStaged(questionMid, question.qid, new Set(), '', skip);
+        rerenderQuestionCard(questionMid);
+    }
+
     /**
      * Answer a single-question card immediately: bullet lines a human reads,
      * plus one machine line a watcher parses.
@@ -2485,6 +2551,10 @@
         if (!question) return;
         const labels = [];
         for (const id of optionIds) {
+            if (id === QUESTION_SKIP_ID) {
+                labels.push(QUESTION_SKIP_LABEL);
+                continue;
+            }
             if (id === QUESTION_FREE_TEXT_ID) {
                 const text = freeText.trim().slice(0, QUESTION_FREE_TEXT_MAX);
                 if (!text) return;
@@ -2512,12 +2582,18 @@
         if (!msg) return;
         const payload = parseQuestion(msg.body);
         if (!payload || !payload.isForm) return;
-        if (payload.questions.some(q => !q.optional && !isStagedAnswered(questionMid, q))) return;
+        if (payload.questions.some(q => !isStagedSettled(questionMid, q))) return;
 
         const bullets = [];
         const machine = [];
         for (const question of payload.questions) {
             const staged = readStaged(questionMid, question.qid);
+            if (staged.skip) {
+                bullets.push(
+                    `${ANSWER_BULLET} ${question.prompt}${FORM_PROMPT_SEP}${QUESTION_SKIP_LABEL}`);
+                machine.push(`answer:${question.qid}:${QUESTION_SKIP_ID}`);
+                continue;
+            }
             const ids = question.options
                 .filter(o => staged.ids.has(o.id)).map(o => o.id);
             const labels = question.options

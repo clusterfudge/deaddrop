@@ -14,6 +14,9 @@ Verifies, against the real client JS in a real browser:
   8. An answer renders no bubble anywhere in the stream — the card's read-back
      is the only view of one — and an answer carrying an attachment keeps an
      element for the file without the machine line.
+  9. Every question has a Skip control: alone it posts ``answer:<qid>:_skip``;
+     in a form it stages, settles a required question for Submit, and
+     replaces (and is replaced by) a staged choice or typed text.
 
 Harness mirrors tests/test_reply_playwright.py: app.html is rendered with
 minimal Jinja2 substitution and served locally, and
@@ -954,6 +957,170 @@ class TestFormReviewAndSubmit:
         quote = page.locator(f'.room-message[data-mid="{reply_mid}"] .reply-quote-body')
         assert "Ship checklist" in quote.inner_text()
         assert "{" not in quote.inner_text()
+
+
+class TestSkip:
+    """Every question can be skipped, `optional` or not, and a skip is posted
+    as ``answer:<qid>:_skip`` so a watcher can tell it from silence."""
+
+    def test_skip_on_a_single_card_posts_a_skip_line(self, page):
+        _card(page, QUESTION_MID).locator(".question-skip").click()
+        page.wait_for_function("window.__sent.length === 1", timeout=5000)
+        sent = page.evaluate("window.__sent[0]")
+        assert sent["reference_mid"] == QUESTION_MID
+        assert sent["body"] == "\u25b8 Skipped\nanswer:q-deploy:_skip"
+
+        page.wait_for_timeout(200)
+        answer = _card(page, QUESTION_MID).locator(".question-qa-answer")
+        assert answer.inner_text() == "Skipped"
+        assert "missing" in (answer.get_attribute("class") or "")
+        assert _controls_in_card(page, QUESTION_MID) == 0
+
+    def test_skip_on_a_multi_card_drops_the_staged_selection(self, page):
+        card = _card(page, MULTI_MID)
+        card.locator('.question-option[data-option-id="sean"]').click()
+        _card(page, MULTI_MID).locator(".question-skip").click()
+        page.wait_for_function("window.__sent.length === 1", timeout=5000)
+        assert page.evaluate("window.__sent[0].body") == "\u25b8 Skipped\nanswer:q-review:_skip"
+
+    def test_another_members_skip_dims_nothing(self, page):
+        page.evaluate("""() => {
+            roomMessages.push({
+                mid: '0192a000-0000-7000-8000-0000000000b1', room_id: 'room-test',
+                from_id: 'bob-id', content_type: 'text/markdown',
+                reference_mid: '0192a000-0000-7000-8000-000000000001',
+                body: '\\u25b8 Skipped\\nanswer:q-deploy:_skip',
+                created_at: '2026-08-01T10:05:00Z'});
+            renderRoomMessages({skipReadCursor: true});
+        }""")
+        card = _card(page, QUESTION_MID)
+        assert card.locator(".question-option.dimmed").count() == 0
+        assert card.locator(".question-option.chosen").count() == 0
+        # Still mine to answer, and Bob's skip reads back under the controls.
+        assert card.locator(".question-skip").count() == 1
+        assert card.locator(".question-qa-others .question-qa-answer").inner_text() == (
+            "Bob: Skipped"
+        )
+
+    def test_the_skip_id_is_reserved(self, page):
+        page.evaluate("""() => {
+            roomMessages[0].body = JSON.stringify({
+                qid: 'q-x', prompt: 'Reserved id',
+                options: [{id: '_skip', label: 'Skip'}, {id: 'b', label: 'B'}],
+            });
+            renderRoomMessages({skipReadCursor: true});
+        }""")
+        assert _card(page, QUESTION_MID).count() == 0
+
+    def test_every_form_question_has_a_skip_control(self, page):
+        for qid in ("q-when", "q-who", "q-note"):
+            skip = _form(page).locator(f'.question-item[data-qid="{qid}"] .question-skip')
+            assert skip.count() == 1
+            assert skip.get_attribute("aria-pressed") == "false"
+            _next(page)
+
+    def test_a_skip_settles_a_required_question(self, page):
+        _form(page).locator(".question-skip").click()
+        form = _form(page)
+        skip = form.locator(".question-skip")
+        assert skip.get_attribute("aria-pressed") == "true"
+        assert skip.inner_text() == "Skipped"
+        assert "unanswered" not in (form.locator(".question-item").get_attribute("class") or "")
+        assert page.evaluate("window.__sent.length") == 0
+
+    def test_skip_and_a_choice_replace_each_other(self, page):
+        when = '.question-item[data-qid="q-when"]'
+        _form(page).locator(f'{when} [data-option-id="monday"]').click()
+        _form(page).locator(f"{when} .question-skip").click()
+        form = _form(page)
+        assert form.locator(f"{when} .question-option.staged").count() == 0
+        assert form.locator(f"{when} .question-skip").get_attribute("aria-pressed") == "true"
+
+        _form(page).locator(f'{when} [data-option-id="tonight"]').click()
+        form = _form(page)
+        assert form.locator(f"{when} .question-option.staged").count() == 1
+        assert form.locator(f"{when} .question-skip").get_attribute("aria-pressed") == "false"
+
+        # Skip toggles: a second tap un-skips, leaving the question open.
+        _form(page).locator(f"{when} .question-skip").click()
+        _form(page).locator(f"{when} .question-skip").click()
+        form = _form(page)
+        assert form.locator(f"{when} .question-skip").get_attribute("aria-pressed") == "false"
+        assert "unanswered" in (form.locator(when).get_attribute("class") or "")
+
+    def test_skip_and_typed_text_replace_each_other(self, page):
+        _next(page)
+        _next(page)
+        inp = _form(page).locator(".question-free-input")
+        inp.fill("watch the queue")
+        _form(page).locator(".question-skip").click()
+        assert _form(page).locator(".question-free-input").input_value() == ""
+
+        inp = _form(page).locator(".question-free-input")
+        inp.click()
+        inp.type("never mind")
+        # Typing un-skips in place, without rebuilding the input under the caret.
+        assert page.evaluate("document.activeElement.className") == "question-free-input"
+        assert _form(page).locator(".question-skip").get_attribute("aria-pressed") == "false"
+
+    def test_skip_one_answer_one_then_submit(self, page):
+        _form(page).locator('.question-item[data-qid="q-when"] .question-skip').click()
+        _next(page)
+        _form(page).locator('.question-item[data-qid="q-who"] [data-option-id="sean"]').click()
+        _next(page)
+        _next(page)
+
+        form = _form(page)
+        assert form.locator(".question-form-progress").inner_text() == (
+            "Review \u00b7 1 of 3 chosen, 1 skipped"
+        )
+        review = form.locator('.question-review-line[data-qid="q-when"] .question-review-answer')
+        assert review.inner_text() == "Skipped"
+        submit = form.locator(".question-form-submit")
+        assert submit.is_enabled()
+        assert submit.inner_text() == "Submit \u00b7 1 skipped"
+
+        submit.click()
+        page.wait_for_function("window.__sent.length === 1", timeout=5000)
+        # The untouched optional question contributes no line, as before.
+        assert page.evaluate("window.__sent[0].body") == (
+            "\u25b8 Deploy when? \u2014 Skipped\n"
+            "\u25b8 Who reviews? \u2014 Sean\n"
+            "answer:q-when:_skip\n"
+            "answer:q-who:sean"
+        )
+        page.wait_for_timeout(200)
+        assert _form(page).locator(".question-qa-answer").all_inner_texts() == [
+            "Skipped",
+            "Sean",
+            "Skipped",
+        ]
+
+    def test_a_form_with_every_question_skipped_submits(self, page):
+        for _ in range(3):
+            _form(page).locator(".question-skip").click()
+            _next(page)
+        submit = _form(page).locator(".question-form-submit")
+        assert submit.is_enabled()
+        assert submit.inner_text() == "Submit \u00b7 3 skipped"
+        submit.click()
+        page.wait_for_function("window.__sent.length === 1", timeout=5000)
+        assert page.evaluate("window.__sent[0].body") == (
+            "\u25b8 Deploy when? \u2014 Skipped\n"
+            "\u25b8 Who reviews? \u2014 Skipped\n"
+            "\u25b8 Anything to add? \u2014 Skipped\n"
+            "answer:q-when:_skip\n"
+            "answer:q-who:_skip\n"
+            "answer:q-note:_skip"
+        )
+
+    def test_a_staged_skip_survives_a_reload(self, page):
+        _form(page).locator(".question-skip").click()
+        page.reload()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_function("typeof submitQuestionForm === 'function'", timeout=10000)
+        page.evaluate(SETUP_ROOM_JS)
+        assert _form(page).locator(".question-skip").get_attribute("aria-pressed") == "true"
 
 
 def _seed(page, messages):

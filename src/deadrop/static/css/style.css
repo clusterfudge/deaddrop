@@ -1166,6 +1166,41 @@ textarea.form-input {
 
 .question-free-send { flex-shrink: 0; }
 
+/* Secondary to the options: every question has one, so it stays quiet. */
+.question-skip {
+    align-self: flex-start;
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 14px;
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.question-skip:hover:not(:disabled) {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+.question-skip:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 1px;
+}
+
+.question-skip:disabled { cursor: default; }
+
+.question-skip.staged {
+    border-style: solid;
+    border-color: var(--primary-color);
+    background: var(--unread-bg);
+    color: var(--text-color);
+}
+
 .question-answered-by {
     font-size: 12px;
     color: var(--text-muted);
