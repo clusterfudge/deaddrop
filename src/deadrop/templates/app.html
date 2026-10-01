@@ -454,6 +454,34 @@
         return div.innerHTML;
     }
     
+    // ==================== NATIVE APP LINKS ====================
+    
+    /**
+     * The URL that opens a message link in a native app, or null to leave the
+     * tap to the browser.
+     *
+     * An installed iOS web app opens target="_blank" in an in-app browser
+     * view. mail.google.com publishes no `applinks` association for the Gmail
+     * app, so no https URL reaches it from any context; its registered
+     * `googlegmail:` scheme is the only way in, and that scheme has no
+     * supported form that addresses a message, so the app opens at its inbox.
+     * The anchor's href is not rewritten: a long-press still offers the web
+     * URL of the message itself.
+     */
+    function nativeAppUrl(href, { ios, standalone }) {
+        if (!ios || !standalone) return null;
+        let url;
+        try {
+            url = new URL(href, window.location.href);
+        } catch (e) {
+            return null;
+        }
+        if (url.protocol === 'https:' && url.hostname === 'mail.google.com') {
+            return 'googlegmail://';
+        }
+        return null;
+    }
+    
     // ==================== MARKDOWN RENDERING ====================
     
     // Configure marked for GitHub Flavored Markdown
@@ -3509,6 +3537,18 @@
     }
     
     // ==================== EVENT LISTENERS ====================
+    
+    document.addEventListener('click', (e) => {
+        const anchor = e.target.closest && e.target.closest('.markdown-body a[href]');
+        if (!anchor) return;
+        const appUrl = nativeAppUrl(anchor.href, {
+            ios: DeadropPush.isIOS(),
+            standalone: DeadropPush.standalone(),
+        });
+        if (!appUrl) return;
+        e.preventDefault();
+        window.location.href = appUrl;
+    });
     
     document.getElementById('invite-go-btn').addEventListener('click', () => {
         const url = document.getElementById('invite-url-input').value.trim();
