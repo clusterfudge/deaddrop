@@ -62,10 +62,11 @@ SETUP_JS = """
         }
         DeadropAPI.listRoomAttachments = async () => ({attachments, has_more: true});
         // A 1x1 transparent PNG, so thumbnail loading never hits the network.
-        DeadropAPI.getAttachment = async () => ({
-            content_type: 'image/png',
-            data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mN' +
-                  'k+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        const png = atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mN' +
+                         'k+A8AAQUBAScY42YAAAAASUVORK5CYII=');
+        DeadropAPI.downloadAttachment = async () => ({
+            blob: new Blob([Uint8Array.from(png, c => c.charCodeAt(0))], {type: 'image/png'}),
+            filename: 'shot.png',
         });
 
         openThreadPanel();

@@ -6,6 +6,15 @@
 const STORAGE_KEY = 'deadrop_credentials';
 const STORAGE_VERSION = 1;
 
+// The service worker's attachment cache (sw.js ATTACHMENT_CACHE). Its entries
+// were fetched with a credential, so they go when a credential goes.
+const ATTACHMENT_CACHE = 'deadrop-attachments-v1';
+
+function clearAttachmentCache() {
+    if (typeof caches === 'undefined') return;
+    caches.delete(ATTACHMENT_CACHE).catch(() => {});
+}
+
 const CredentialStore = {
     /**
      * Get all stored credential data.
@@ -181,6 +190,7 @@ const CredentialStore = {
         }
         
         this.save(data);
+        clearAttachmentCache();
         return true;
     },
 
@@ -193,6 +203,7 @@ const CredentialStore = {
         if (key) {
             delete data.namespaces[key];
             this.save(data);
+            clearAttachmentCache();
             return true;
         }
         return false;
@@ -211,6 +222,7 @@ const CredentialStore = {
      */
     clear() {
         localStorage.removeItem(STORAGE_KEY);
+        clearAttachmentCache();
     },
 };
 

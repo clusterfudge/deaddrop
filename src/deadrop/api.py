@@ -271,6 +271,8 @@ async def add_timing_middleware(request: Request, call_next):
             endpoint = f"rooms.{method}"
     elif "/inbox/" in path:
         endpoint = f"inbox.{method}"
+    elif "/attachments/" in path:
+        endpoint = "attachments.download" if path.endswith("/download") else "attachments"
     elif path.startswith("/admin"):
         endpoint = "admin"
     elif path in ("/health", "/metrics"):
@@ -1734,6 +1736,7 @@ DOWNLOAD_SAFE_CONTENT_TYPE = "text/plain; charset=utf-8"
 # denies every subresource fetch. Together they make an image/svg+xml payload
 # inert even if a browser renders it as a document instead of downloading it.
 ATTACHMENT_CSP = "sandbox; default-src 'none'"
+ATTACHMENT_CACHE_CONTROL = "private, max-age=31536000, immutable"
 
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10MB per attachment
 MAX_ATTACHMENTS_PER_MESSAGE = 10
@@ -2891,6 +2894,10 @@ async def download_attachment(
     wire_content_type, headers = _safe_download_headers(
         attachment.get("filename"), attachment["content_type"]
     )
+    # An attachment id is a random UUID and no route rewrites an attachment,
+    # so the bytes behind this URL never change. `private` keeps the
+    # header-authenticated response out of any shared cache.
+    headers["Cache-Control"] = ATTACHMENT_CACHE_CONTROL
     return Response(content=raw, media_type=wire_content_type, headers=headers)
 
 

@@ -549,8 +549,40 @@
     // Pending attachments for the current compose
     let pendingAttachments = [];
 
-    // In-memory cache for fetched attachment data: attachmentId -> {content_type, data}
+    // attachmentId -> Promise<object URL> for the attachment's raw bytes.
+    // One request per attachment per page; the service worker's
+    // ATTACHMENT_CACHE serves repeat requests across page loads.
     const attachmentCache = new Map();
+
+    function attachmentObjectUrl(attachmentId) {
+        if (!attachmentCache.has(attachmentId)) {
+            const url = DeadropAPI.downloadAttachment(credentials, attachmentId)
+                .then(({ blob }) => URL.createObjectURL(blob));
+            url.catch(() => attachmentCache.delete(attachmentId));
+            attachmentCache.set(attachmentId, url);
+        }
+        return attachmentCache.get(attachmentId);
+    }
+
+    // Image placeholders load when they come within a screen of the message
+    // list's viewport, not all at once on render.
+    let imagePlaceholderObserver = null;
+
+    function observeImagePlaceholders(root) {
+        if (!imagePlaceholderObserver) {
+            imagePlaceholderObserver = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    if (!entry.isIntersecting) continue;
+                    imagePlaceholderObserver.unobserve(entry.target);
+                    loadImageInline(entry.target, entry.target.dataset.attachmentId);
+                }
+            }, { root: document.getElementById('room-message-list'), rootMargin: '100% 0px' });
+        }
+        root.querySelectorAll('.image-placeholder:not([data-observed])').forEach(el => {
+            el.dataset.observed = 'true';
+            imagePlaceholderObserver.observe(el);
+        });
+    }
 
     function renderAttachments(msg) {
         if (!msg.attachments || msg.attachments.length === 0) return '';
@@ -568,6 +600,7 @@
                     // Image without data — show clickable placeholder that auto-loads
                     return `<div class="image-placeholder" 
                                  data-attachment-id="${att.id}"
+                                 data-filename="${escapeHtml(att.filename || 'image')}"
                                  onclick="loadImageInline(this, '${att.id}')"
                                  style="min-width:80px;min-height:60px;max-width:min(300px,100%);background:var(--surface,#eee);border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:8px;gap:6px;font-size:13px;color:var(--text-secondary,#666);border:1px solid var(--border,#ddd);">
                                  🖼️ ${escapeHtml(att.filename || 'image')} (${formatFileSize(att.size)})
@@ -595,17 +628,10 @@
         placeholderEl.innerHTML = '⏳ Loading...';
         placeholderEl.style.opacity = '0.6';
         try {
-            // Serve from cache if already fetched, otherwise fetch and store
-            let att;
-            if (attachmentCache.has(attachmentId)) {
-                att = attachmentCache.get(attachmentId);
-            } else {
-                att = await DeadropAPI.getAttachment(credentials, attachmentId);
-                attachmentCache.set(attachmentId, { content_type: att.content_type, data: att.data });
-            }
+            const src = await attachmentObjectUrl(attachmentId);
             const img = document.createElement('img');
-            img.src = `data:${att.content_type};base64,${att.data}`;
-            img.alt = att.filename || 'image';
+            img.src = src;
+            img.alt = placeholderEl.dataset.filename || 'image';
             img.dataset.attachmentId = attachmentId;
             img.dataset.loaded = 'true';
             img.onclick = () => openLightbox(img);
@@ -625,8 +651,7 @@
             return;
         }
         try {
-            const att = await DeadropAPI.getAttachment(credentials, attachmentId);
-            imgEl.src = `data:${att.content_type};base64,${att.data}`;
+            imgEl.src = await attachmentObjectUrl(attachmentId);
             imgEl.dataset.loaded = 'true';
             openLightbox(imgEl);
         } catch (e) {
@@ -1563,14 +1588,7 @@
             // Highlight any code blocks in the newly inserted elements
             highlightCodeBlocks(list);
 
-            // Auto-load image placeholders in newly added messages
-            list.querySelectorAll('.image-placeholder').forEach(el => {
-                const attId = el.dataset.attachmentId;
-                if (attId && !el.dataset.loading) {
-                    el.dataset.loading = 'true';
-                    loadImageInline(el, attId);
-                }
-            });
+            observeImagePlaceholders(list);
 
             console.log(`Loaded ${olderPage.length} older messages (${olderDisplay.length} visible, total: ${roomMessages.length})`);
         } catch (e) {
@@ -2726,11 +2744,7 @@
         // Apply syntax highlighting to code blocks
         highlightCodeBlocks(list);
         
-        // Auto-load image placeholders
-        list.querySelectorAll('.image-placeholder').forEach(el => {
-            const attId = el.dataset.attachmentId;
-            if (attId) loadImageInline(el, attId);
-        });
+        observeImagePlaceholders(list);
         
         // Only update read cursor if the newest message is actually visible
         // (i.e. the user hasn't scrolled up away from the bottom).
@@ -3146,10 +3160,9 @@
     }
 
     /**
-     * Thumbnails need the base64 body, which only the JSON endpoint serves
-     * (the raw download requires an auth header, so it can't be an img src).
-     * Fetch on first visibility and cache, so a long gallery costs one request
-     * per tile the user actually scrolls to.
+     * Thumbnails are object URLs over the raw download (it requires an auth
+     * header, so it can't be an img src). Fetch on first visibility, so a long
+     * gallery costs one request per tile the user actually scrolls to.
      */
     function observePanelThumbs() {
         if (!panelThumbObserver) {
@@ -3171,14 +3184,8 @@
         const attachmentId = btn.dataset.attachmentId;
         if (!attachmentId || btn.dataset.loaded === 'true') return;
         try {
-            let att = attachmentCache.get(attachmentId);
-            if (!att) {
-                const fetched = await DeadropAPI.getAttachment(credentials, attachmentId);
-                att = { content_type: fetched.content_type, data: fetched.data };
-                attachmentCache.set(attachmentId, att);
-            }
             const img = document.createElement('img');
-            img.src = `data:${att.content_type};base64,${att.data}`;
+            img.src = await attachmentObjectUrl(attachmentId);
             img.alt = btn.dataset.filename || 'image';
             img.loading = 'lazy';
             btn.textContent = '';
