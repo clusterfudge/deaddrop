@@ -5,6 +5,7 @@
 //   - Network-first for same-origin GET requests; fall back to cache.
 //   - Skip all API/dynamic routes — those must always hit the network
 //     (fresh state + auth). See NO_CACHE_PATTERNS below.
+//   - Cache-first for attachment downloads, which are immutable.
 //   - Don't cache POST/PUT/DELETE or cross-origin requests.
 //
 // Cache version: bump CACHE_NAME when shell assets change to force update.
@@ -45,7 +46,13 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((k) => k !== CACHE_NAME && k !== ATTACHMENT_CACHE)
+            .map((k) => caches.delete(k)),
+        ),
+      )
       .then(() => self.clients.claim()),
   );
 });
@@ -59,7 +66,8 @@ self.addEventListener('activate', (event) => {
 //   /{ns}/identities/**            — identity directory (dynamic)
 //   /{ns}/invites/**               — invite list (dynamic)
 //   /{ns}/rooms/**                 — room list + messages + unread (dynamic)
-//   /{ns}/attachments/**           — binary attachment data (dynamic)
+//   /{ns}/attachments/**           — attachment JSON (the /download bytes
+//                                    are cache-first; see ATTACHMENT_CACHE)
 //   /{ns}/push/**, /push/**        — push subscription state + VAPID key
 //   /health, /metrics              — ops endpoints
 //
@@ -84,12 +92,67 @@ function shouldBypass(path) {
   return NO_CACHE_PATTERNS.some((re) => re.test(path));
 }
 
+// Attachment bytes, cache-first.
+//
+// An attachment id is a random UUID and no route rewrites an attachment, so
+// the bytes behind /{ns}/attachments/{id}/download never change and a cached
+// copy never needs revalidating. Only 200 image responses are stored: an auth
+// failure, a non-image file, or the JSON attachment/message routes never are.
+// Entries are evicted oldest-stored first (Cache.keys() is insertion-ordered)
+// once the stored Content-Length total passes ATTACHMENT_CACHE_MAX_BYTES.
+// The page deletes this cache when credentials are removed (credentials.js).
+const ATTACHMENT_CACHE = 'deadrop-attachments-v1';
+const ATTACHMENT_CACHE_MAX_BYTES = 200 * 1024 * 1024;
+const ATTACHMENT_DOWNLOAD = /^\/[^/]+\/attachments\/[^/]+\/download$/;
+
+async function attachmentCacheFirst(event) {
+  const cache = await caches.open(ATTACHMENT_CACHE);
+  const cached = await cache.match(event.request, { ignoreVary: true });
+  if (cached) return cached;
+  const response = await fetch(event.request);
+  const type = response.headers.get('Content-Type') || '';
+  if (response.status === 200 && type.startsWith('image/')) {
+    event.waitUntil(cache.put(event.request, response.clone()).then(trimAttachmentCache));
+  }
+  return response;
+}
+
+let attachmentTrim = null;
+
+// One trim at a time; a put that lands mid-trim is covered by the next one.
+function trimAttachmentCache() {
+  if (!attachmentTrim) {
+    attachmentTrim = (async () => {
+      const cache = await caches.open(ATTACHMENT_CACHE);
+      const keys = await cache.keys();
+      const sizes = await Promise.all(
+        keys.map(async (key) => {
+          const r = await cache.match(key, { ignoreVary: true });
+          return Number(r && r.headers.get('Content-Length')) || 0;
+        }),
+      );
+      let total = sizes.reduce((a, b) => a + b, 0);
+      for (let i = 0; i < keys.length && total > ATTACHMENT_CACHE_MAX_BYTES; i++) {
+        await cache.delete(keys[i]);
+        total -= sizes[i];
+      }
+    })().finally(() => {
+      attachmentTrim = null;
+    });
+  }
+  return attachmentTrim;
+}
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   if (request.method !== 'GET') return;
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+  if (ATTACHMENT_DOWNLOAD.test(url.pathname)) {
+    event.respondWith(attachmentCacheFirst(event));
+    return;
+  }
   if (shouldBypass(url.pathname)) return;
 
   event.respondWith(

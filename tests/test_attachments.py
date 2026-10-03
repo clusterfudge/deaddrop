@@ -780,6 +780,44 @@ class TestSafeAttachmentDownload:
         cd = resp.headers["content-disposition"]
         assert "\r" not in cd and "\n" not in cd
 
+    def test_download_is_privately_cacheable_forever(self, client, room_setup):
+        """Attachment bytes never change, so a browser may keep them; a shared
+        cache may not, because the request is authenticated by header."""
+        s = room_setup
+        att_id = self._upload(client, s, "pic.png", "image/png", base64.b64decode(_make_png_b64()))
+        resp = client.get(
+            f"/{s['ns']}/attachments/{att_id}/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+    def test_download_errors_are_not_marked_cacheable(self, client, room_setup):
+        s = room_setup
+        unauthenticated = client.get(f"/{s['ns']}/attachments/any-id/download")
+        missing = client.get(
+            f"/{s['ns']}/attachments/no-such-id/download",
+            headers={"X-Inbox-Secret": s["alice_secret"]},
+        )
+        assert unauthenticated.status_code == 401
+        assert missing.status_code == 404
+        for resp in (unauthenticated, missing):
+            assert "immutable" not in resp.headers.get("cache-control", "")
+
+    def test_attachment_routes_have_their_own_metrics_endpoint(self, client, room_setup):
+        """Attachment fetches are timed under their own endpoint label rather
+        than the catch-all 'other'."""
+        from deadrop.metrics import metrics
+
+        s = room_setup
+        att_id = self._upload(client, s, "note.txt", "text/plain", b"x")
+        headers = {"X-Inbox-Secret": s["alice_secret"]}
+        client.get(f"/{s['ns']}/attachments/{att_id}", headers=headers)
+        client.get(f"/{s['ns']}/attachments/{att_id}/download", headers=headers)
+        requests = metrics.to_dict()["requests"]
+        assert "attachments" in requests
+        assert "attachments.download" in requests
+
     def test_malicious_svg_download_is_inert(self, client, room_setup):
         """A scripted SVG keeps its real Content-Type but is served with a
         sandbox CSP, forced download, and nosniff, so nothing in it executes."""
