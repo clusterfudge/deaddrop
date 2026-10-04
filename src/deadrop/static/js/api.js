@@ -208,13 +208,6 @@ const DeadropAPI = {
     },
 
     /**
-     * Fetch a single attachment with its base64 data.
-     */
-    async getAttachment(credentials, attachmentId) {
-        return this.request('GET', `/${credentials.ns}/attachments/${attachmentId}`, { credentials });
-    },
-
-    /**
      * Fetch an attachment's raw bytes as a downloadable Blob. The server forces
      * Content-Disposition: attachment and serves text/html as text/plain, so
      * the bytes can never render inline as live HTML.
