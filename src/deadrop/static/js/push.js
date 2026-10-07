@@ -125,8 +125,15 @@ const DeadropPush = {
             });
         }
 
+        await this.register(credentials, subscription);
+        await this.setEnabled(credentials, true);
+        return subscription;
+    },
+
+    /** Store this device's subscription for an identity (upsert by endpoint). */
+    async register(credentials, subscription) {
         const raw = subscription.toJSON();
-        await DeadropAPI.request('POST', `/${credentials.ns}/push/subscriptions`, {
+        return DeadropAPI.request('POST', `/${credentials.ns}/push/subscriptions`, {
             credentials,
             body: {
                 endpoint: raw.endpoint,
@@ -134,8 +141,6 @@ const DeadropPush = {
                 user_agent: navigator.userAgent.slice(0, 200),
             },
         });
-        await this.setEnabled(credentials, true);
-        return subscription;
     },
 
     /** Unsubscribe locally, drop the server-side row, and switch push off. */

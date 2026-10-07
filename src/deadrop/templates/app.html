@@ -1045,6 +1045,9 @@
         if (on) {
             try {
                 on = (await DeadropPush.prefs(credentials)).enabled;
+                // Re-register on every launch: the push service may have
+                // rotated this device's endpoint since the server last saw it.
+                if (on) DeadropPush.register(credentials, subscription).catch(() => {});
             } catch (e) {
                 // Leave the toggle showing the device state we can see.
             }
@@ -1053,6 +1056,15 @@
         btn.title = on ? 'Notifications on — tap to disable' : 'Enable notifications';
         btn.classList.remove('hidden');
         DeadropPush.syncBadge(credentials);
+    }
+
+    // The service worker re-subscribes when the push service rotates this
+    // device's subscription; only the page holds the credentials needed to
+    // register the new endpoint with the server.
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.addEventListener('message', (event) => {
+            if (event.data && event.data.type === 'pushsubscriptionchange') refreshPushToggle();
+        });
     }
 
     async function togglePush() {
@@ -2767,11 +2779,17 @@
     /**
      * Debounced read cursor update — coalesces rapid calls (scroll events,
      * multiple renders during load) into a single POST after 500ms of quiet.
+     *
+     * Only a focused, visible window advances the cursor. A tab left open in
+     * a background window still renders arriving messages, and reporting
+     * them read would cancel their push. When the window regains focus,
+     * `refreshOnForeground` re-renders the room, which lands back here.
      */
     function debouncedUpdateReadCursor() {
         if (roomReadCursorTimer) clearTimeout(roomReadCursorTimer);
         roomReadCursorTimer = setTimeout(() => {
             roomReadCursorTimer = null;
+            if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
             const realMessages = roomMessages.filter(m => !m.pending);
             if (realMessages.length > 0 && currentRoomId) {
                 const lastMid = realMessages[realMessages.length - 1].mid;
