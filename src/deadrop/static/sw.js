@@ -238,6 +238,30 @@ self.addEventListener('push', (event) => {
   );
 });
 
+// The push service can expire or rotate a subscription. Re-subscribe with the
+// same VAPID key, then tell open windows: the server-side registration needs
+// the identity's credentials, which live in the page, not here. With no window
+// open, the next launch registers it (refreshPushToggle in app.html).
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(
+    (async () => {
+      if (!event.newSubscription) {
+        let key = event.oldSubscription && event.oldSubscription.options.applicationServerKey;
+        if (!key) {
+          const config = await (await fetch('/push/vapid-public-key')).json();
+          key = config.public_key;
+        }
+        await self.registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: key,
+        });
+      }
+      const windows = await self.clients.matchAll({ type: 'window' });
+      for (const client of windows) client.postMessage({ type: 'pushsubscriptionchange' });
+    })(),
+  );
+});
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 

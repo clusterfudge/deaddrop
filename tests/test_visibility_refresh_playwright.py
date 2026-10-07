@@ -41,6 +41,9 @@ PAGE_SIZE = 20
 _messages_lock = threading.Lock()
 _all_messages: list[dict] = []
 
+# Read-cursor POSTs the client made, as last_read_mid values, in order
+_read_cursor_posts: list[str] = []
+
 
 def _seed_messages() -> None:
     """Reset message store to 20 seeded messages."""
@@ -167,8 +170,9 @@ class MockAPIHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         # Accept subscribe poll + read cursor + anything else
         length = int(self.headers.get("Content-Length", "0") or "0")
-        if length:
-            self.rfile.read(length)
+        raw = self.rfile.read(length) if length else b""
+        if re.match(r"^/[^/]+/rooms/[^/]+/read$", self.path.split("?")[0]):
+            _read_cursor_posts.append(json.loads(raw)["last_read_mid"])
         # Default: empty poll response (no events)
         self._respond(200, b'{"events": {}, "timeout": true}', "application/json")
 
@@ -519,6 +523,68 @@ class TestVisibilityRefresh:
             assert "Focus-path message" in joined, (
                 f"window.focus did not trigger refresh; new message missing.\n"
                 f"Have {len(body_texts)} messages:\n{joined[:500]}"
+            )
+
+            browser.close()
+
+    def test_unfocused_window_does_not_advance_read_cursor(self, servers):
+        """
+        A tab that stays visible in an unfocused window (another app in
+        front) still renders arriving messages. It must not report them
+        read: the server cancels a pending push for a read message. When
+        the window regains focus, the cursor advances.
+        """
+        _seed_messages()
+        _read_cursor_posts.clear()
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(viewport={"width": 1024, "height": 768})
+            page = context.new_page()
+
+            page.goto(servers["app"])
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(300)
+
+            page.evaluate(INJECT_JS)
+            page.evaluate(PATCH_API_JS)
+            page.evaluate("window._focused = false; document.hasFocus = () => window._focused;")
+
+            page.wait_for_function("typeof openRoom === 'function'", timeout=10000)
+
+            page.evaluate("""
+                const slug = 'test-slug';
+                const roomId = 'room-test';
+                credentials = CredentialStore.getCredentials(slug);
+                currentSlug = slug;
+                currentRoomId = roomId;
+                openRoom(roomId);
+            """)
+
+            page.locator("#room-message-list").wait_for(state="visible", timeout=10000)
+            page.wait_for_function(
+                "document.querySelectorAll('.room-message').length > 0",
+                timeout=10000,
+            )
+
+            # A message arrives and renders while the window is unfocused.
+            _append_message("m024", "Arrived while unattended")
+            page.evaluate("loadRoomMessages()")
+            page.wait_for_function(
+                "[...document.querySelectorAll('.room-message')]"
+                ".some(el => el.textContent.includes('Arrived while unattended'))",
+                timeout=5000,
+            )
+            page.wait_for_timeout(1000)
+            assert _read_cursor_posts == [], (
+                f"unfocused window advanced the read cursor: {_read_cursor_posts}"
+            )
+
+            # The reader comes back.
+            page.evaluate("window._focused = true; window.dispatchEvent(new Event('focus'));")
+            page.wait_for_timeout(1500)
+            assert _read_cursor_posts and _read_cursor_posts[-1] == "m024", (
+                f"focus did not advance the read cursor: {_read_cursor_posts}"
             )
 
             browser.close()
