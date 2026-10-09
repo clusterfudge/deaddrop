@@ -18,6 +18,7 @@ pip install deaddrop[turso]
 - **Message**: A blob sent from one identity to another within a namespace. Uses UUIDv7 (timestamp-sortable).
 - **Room**: A shared space for multi-user group messaging. Any member can read/write. See [docs/ROOMS.md](docs/ROOMS.md).
 - **Question**: A room message an agent posts as `application/x-question`, rendered by the web UI as tappable answer buttons. A tap posts an ordinary reply, so agents read answers from the normal message stream. See [docs/QUESTIONS.md](docs/QUESTIONS.md).
+- **Player**: A room message posted as `application/x-player` with a JSON playlist of audio URLs or attached audio files, rendered by the web UI as an audio player. See [docs/PLAYER.md](docs/PLAYER.md).
 - **Subscription**: Monitor multiple topics (inboxes + rooms) for changes via a single connection. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
 
 ## Auth Model

@@ -7,6 +7,7 @@ milliseconds.
 """
 
 import asyncio
+import json
 import uuid
 
 import pytest
@@ -121,6 +122,22 @@ class TestPreview:
 
     def test_empty_body_gets_a_placeholder(self):
         assert notifier._preview("", "text/plain") == "New message"
+
+    def test_player_card_previews_as_its_title_and_track_count(self):
+        body = json.dumps(
+            {
+                "title": "Doof samples",
+                "tracks": [{"src": "https://a/1.mp3"}, {"attachment": "2.mp3"}],
+            }
+        )
+        assert notifier._preview(body, "application/x-player") == "🎵 Doof samples · 2 tracks"
+
+    def test_untitled_player_previews_as_playlist(self):
+        body = json.dumps({"tracks": [{"src": "https://a/1.mp3"}]})
+        assert notifier._preview(body, "application/x-player") == "🎵 Playlist · 1 track"
+
+    def test_malformed_player_body_previews_as_text(self):
+        assert notifier._preview("not json", "application/x-player") == "not json"
 
 
 @pytest.mark.asyncio
