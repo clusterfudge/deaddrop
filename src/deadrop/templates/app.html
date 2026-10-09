@@ -535,6 +535,11 @@
             // the JSON.
             return escapeHtml(questionFallbackText(body)).replace(/\n/g, '<br>');
         }
+
+        if (contentType === PLAYER_CONTENT_TYPE) {
+            // Same for a player: the title and a link per track.
+            return playerFallbackHtml(body);
+        }
         
         // text/plain or no content_type: escape and convert newlines
         return escapeHtml(body).replace(/\n/g, '<br>');
@@ -1663,7 +1668,9 @@
         // A question's body is JSON; the quote gets its prompt.
         const source = msg.content_type === QUESTION_CONTENT_TYPE
             ? questionFallbackText(msg.body).split('\n')[0]
-            : (msg.body || '');
+            : msg.content_type === PLAYER_CONTENT_TYPE
+                ? playerSnippet(msg.body)
+                : (msg.body || '');
         const text = source
             .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')   // links → link text
             .replace(/[*_`~#>]/g, '')
@@ -2686,6 +2693,307 @@
         card.querySelectorAll('button, input').forEach(el => { el.disabled = busy; });
     }
 
+    // ==================== MEDIA PLAYER ====================
+
+    // A player is a room message with this content_type and a JSON body:
+    // {title?, tracks: [{src | attachment, title?, subtitle?, duration?}]}.
+    // `src` is an http(s) URL; `attachment` names a file attached to the same
+    // message, by filename or attachment id. Like a question, the card is
+    // built client-side and the server stores the body verbatim.
+    const PLAYER_CONTENT_TYPE = 'application/x-player';
+    const PLAYER_MAX_TRACKS = 50;
+
+    // mid -> {body, card}. A room re-render rebuilds every message element;
+    // handing back the same card moves its <audio> within one task, so it
+    // never leaves the document long enough to pause, and a new message
+    // arriving does not stop playback.
+    const playerCards = new Map();
+
+    function playerUrl(value) {
+        if (typeof value !== 'string' || !value.trim()) return null;
+        let url;
+        try {
+            url = new URL(value.trim());
+        } catch (e) {
+            return null;
+        }
+        return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+    }
+
+    function playerNameFromUrl(src) {
+        try {
+            const seg = new URL(src).pathname.split('/').filter(Boolean).pop() || '';
+            return decodeURIComponent(seg);
+        } catch (e) {
+            return '';
+        }
+    }
+
+    /**
+     * {title, tracks: [{title, subtitle, duration, src | attachmentId}]} for a
+     * well-formed body, else null. One bad track rejects the whole payload,
+     * matching questions: a playlist silently missing an entry reads as
+     * complete when it is not.
+     */
+    function parsePlayer(body, attachments) {
+        let data;
+        try {
+            data = JSON.parse(body);
+        } catch (e) {
+            return null;
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+        if (!Array.isArray(data.tracks) || data.tracks.length === 0) return null;
+        if (data.tracks.length > PLAYER_MAX_TRACKS) return null;
+
+        const tracks = [];
+        for (const raw of data.tracks) {
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+            const track = {
+                subtitle: typeof raw.subtitle === 'string' ? raw.subtitle.trim() : '',
+                duration: Number.isFinite(raw.duration) && raw.duration > 0 ? raw.duration : null,
+            };
+            let fallbackName;
+            if (raw.src !== undefined) {
+                track.src = playerUrl(raw.src);
+                if (!track.src) return null;
+                fallbackName = playerNameFromUrl(track.src);
+            } else if (typeof raw.attachment === 'string' && raw.attachment) {
+                const atts = attachments || [];
+                const att = atts.find(a => a.id === raw.attachment)
+                    || atts.find(a => a.filename === raw.attachment);
+                if (!att || !(att.content_type || '').startsWith('audio/')) return null;
+                track.attachmentId = att.id;
+                fallbackName = att.filename || '';
+            } else {
+                return null;
+            }
+            track.title = (typeof raw.title === 'string' && raw.title.trim())
+                || fallbackName || `Track ${tracks.length + 1}`;
+            tracks.push(track);
+        }
+        const title = typeof data.title === 'string' ? data.title.trim() : '';
+        return { title, tracks };
+    }
+
+    /**
+     * Readable HTML for a player body that is not drawn as a card: the title,
+     * then one line per track, linked when the track has an http(s) URL.
+     */
+    function playerFallbackHtml(body) {
+        let data;
+        try {
+            data = JSON.parse(body);
+        } catch (e) {
+            data = null;
+        }
+        if (!data || typeof data !== 'object' || !Array.isArray(data.tracks)) {
+            return escapeHtml(body || '').replace(/\n/g, '<br>');
+        }
+        const lines = [];
+        if (typeof data.title === 'string' && data.title.trim()) {
+            lines.push(`<strong>${escapeHtml(data.title.trim())}</strong>`);
+        }
+        data.tracks.forEach((t, i) => {
+            if (!t || typeof t !== 'object') return;
+            const href = playerUrl(t.src);
+            const name = (typeof t.title === 'string' && t.title.trim())
+                || (typeof t.attachment === 'string' && t.attachment)
+                || (href && playerNameFromUrl(href)) || `Track ${i + 1}`;
+            lines.push(href
+                ? `${ANSWER_BULLET} <a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(name)}</a>`
+                : `${ANSWER_BULLET} ${escapeHtml(name)}`);
+        });
+        return lines.length ? lines.join('<br>') : escapeHtml(body || '');
+    }
+
+    /** One line for a reply quote: the title, else the first track's. */
+    function playerSnippet(body) {
+        try {
+            const data = JSON.parse(body);
+            if (typeof data.title === 'string' && data.title.trim()) return data.title.trim();
+            const first = data.tracks[0];
+            if (typeof first.title === 'string' && first.title.trim()) return first.title.trim();
+        } catch (e) {
+            // fall through
+        }
+        return 'Playlist';
+    }
+
+    function formatPlayerTime(seconds) {
+        if (!Number.isFinite(seconds) || seconds < 0) return '';
+        const s = Math.floor(seconds);
+        return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    }
+
+    function playerCardFor(msg, payload) {
+        const cached = playerCards.get(msg.mid);
+        if (cached && cached.body === msg.body) return cached.card;
+        const card = renderPlayerCard(payload);
+        playerCards.set(msg.mid, { body: msg.body, card });
+        return card;
+    }
+
+    /**
+     * A playlist card around one native <audio controls>, which supplies
+     * play/pause, the seek bar and the clock. The card adds the track list,
+     * previous/next, the current-track highlight and auto-advance. Every
+     * payload string lands via textContent.
+     */
+    function renderPlayerCard(payload) {
+        const card = document.createElement('div');
+        card.className = 'player-card';
+
+        if (payload.title) {
+            const title = document.createElement('div');
+            title.className = 'player-title';
+            title.textContent = payload.title;
+            card.appendChild(title);
+        }
+
+        const now = document.createElement('div');
+        now.className = 'player-now';
+        now.setAttribute('aria-live', 'polite');
+        const nowTitle = document.createElement('span');
+        nowTitle.className = 'player-now-title';
+        const nowSub = document.createElement('span');
+        nowSub.className = 'player-now-sub';
+        now.append(nowTitle, nowSub);
+        card.appendChild(now);
+
+        const audio = document.createElement('audio');
+        audio.className = 'player-audio';
+        audio.controls = true;
+        audio.preload = 'none';
+        card.appendChild(audio);
+
+        const nav = document.createElement('div');
+        nav.className = 'player-nav';
+        const prev = document.createElement('button');
+        prev.type = 'button';
+        prev.className = 'player-prev';
+        prev.textContent = '\u23ee Prev';
+        prev.setAttribute('aria-label', 'Previous track');
+        const next = document.createElement('button');
+        next.type = 'button';
+        next.className = 'player-next';
+        next.textContent = 'Next \u23ed';
+        next.setAttribute('aria-label', 'Next track');
+        nav.append(prev, next);
+        if (payload.tracks.length > 1) card.appendChild(nav);
+
+        const list = document.createElement('ol');
+        list.className = 'player-tracks';
+        payload.tracks.forEach((track, i) => {
+            const li = document.createElement('li');
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'player-track';
+            btn.dataset.index = String(i);
+            const num = document.createElement('span');
+            num.className = 'player-track-num';
+            num.textContent = String(i + 1);
+            const text = document.createElement('span');
+            text.className = 'player-track-text';
+            const title = document.createElement('span');
+            title.className = 'player-track-title';
+            title.textContent = track.title;
+            text.appendChild(title);
+            if (track.subtitle) {
+                const sub = document.createElement('span');
+                sub.className = 'player-track-sub';
+                sub.textContent = track.subtitle;
+                text.appendChild(sub);
+            }
+            const dur = document.createElement('span');
+            dur.className = 'player-track-dur';
+            dur.textContent = formatPlayerTime(track.duration);
+            btn.append(num, text, dur);
+            btn.addEventListener('click', () => selectPlayerTrack(state, i, true));
+            li.appendChild(btn);
+            list.appendChild(li);
+        });
+        card.appendChild(list);
+
+        // resolved: index -> playable URL, filled synchronously for URL tracks
+        // and when an attachment's bytes arrive, so a tap on a resolved track
+        // calls play() inside the gesture (iOS requires it).
+        const state = { payload, audio, card, nowTitle, nowSub, prev, next, index: 0, resolved: new Map() };
+        payload.tracks.forEach((t, i) => { if (t.src) state.resolved.set(i, t.src); });
+
+        prev.addEventListener('click', () => selectPlayerTrack(state, state.index - 1, true));
+        next.addEventListener('click', () => selectPlayerTrack(state, state.index + 1, true));
+        audio.addEventListener('ended', () => {
+            if (state.index + 1 < payload.tracks.length) selectPlayerTrack(state, state.index + 1, true);
+        });
+        audio.addEventListener('play', () => {
+            card.classList.add('playing');
+            // One player at a time across the room.
+            for (const { card: other } of playerCards.values()) {
+                const a = other.querySelector('audio');
+                if (a !== audio && !a.paused) a.pause();
+            }
+            // Fetch the rest of an attachment playlist once it is in use, so
+            // later taps and auto-advance start without waiting.
+            payload.tracks.forEach((_, i) => resolvePlayerTrack(state, i).catch(() => {}));
+        });
+        audio.addEventListener('pause', () => card.classList.remove('playing'));
+        audio.addEventListener('error', () => {
+            card.classList.add('player-error');
+            nowSub.textContent = 'Could not load this track';
+        });
+        audio.addEventListener('loadedmetadata', () => {
+            const dur = list.querySelectorAll('.player-track-dur')[state.index];
+            if (dur && !payload.tracks[state.index].duration) {
+                dur.textContent = formatPlayerTime(audio.duration);
+            }
+        });
+
+        selectPlayerTrack(state, 0, false);
+        return card;
+    }
+
+    async function resolvePlayerTrack(state, index) {
+        if (state.resolved.has(index)) return state.resolved.get(index);
+        const url = await attachmentObjectUrl(state.payload.tracks[index].attachmentId);
+        state.resolved.set(index, url);
+        return url;
+    }
+
+    async function selectPlayerTrack(state, index, play) {
+        const { payload, audio, card } = state;
+        if (index < 0 || index >= payload.tracks.length) return;
+        state.index = index;
+        const track = payload.tracks[index];
+        card.dataset.track = String(index);
+        card.querySelectorAll('.player-track').forEach((btn, i) => {
+            btn.classList.toggle('current', i === index);
+            if (i === index) btn.setAttribute('aria-current', 'true');
+            else btn.removeAttribute('aria-current');
+        });
+        state.prev.disabled = index === 0;
+        state.next.disabled = index === payload.tracks.length - 1;
+        state.nowTitle.textContent = track.title;
+        state.nowSub.textContent = track.subtitle;
+        card.classList.remove('player-error');
+
+        let src = state.resolved.get(index);
+        if (!src) {
+            try {
+                src = await resolvePlayerTrack(state, index);
+            } catch (e) {
+                if (state.index !== index) return;
+                card.classList.add('player-error');
+                state.nowSub.textContent = 'Could not load this track';
+                return;
+            }
+            // A later selection won the race.
+            if (state.index !== index) return;
+        }
+        if (audio.getAttribute('src') !== src) audio.src = src;
+        if (play) audio.play().catch(() => {});
+    }
+
     /**
      * Render a single room message into an HTMLElement.
      * Shared by the full-render and incremental-prepend paths.
@@ -2695,9 +3003,16 @@
         const isPending = msg.pending;
         const question = msg.content_type === QUESTION_CONTENT_TYPE
             ? parseQuestion(msg.body) : null;
-        // A question's body is drawn as a card and an answer's is machine
-        // plumbing the card reads back; neither renders as message text.
-        const bodyIsRendered = !question && !isAnswerMessage(msg, answerMap);
+        const player = msg.content_type === PLAYER_CONTENT_TYPE
+            ? parsePlayer(msg.body, msg.attachments) : null;
+        // A question's or player's body is drawn as a card and an answer's is
+        // machine plumbing the card reads back; none renders as message text.
+        const bodyIsRendered = !question && !player && !isAnswerMessage(msg, answerMap);
+        // A player's own audio files are its tracks, not separate chips.
+        const attachmentsMsg = player
+            ? { ...msg, attachments: (msg.attachments || []).filter(
+                a => !player.tracks.some(t => t.attachmentId === a.id)) }
+            : msg;
         const el = document.createElement('div');
         el.className = `room-message${isMe ? ' from-me' : ''}${isPending ? ' pending' : ''}`;
         el.dataset.mid = msg.mid;
@@ -2705,13 +3020,16 @@
             <div class="sender-name">${getMemberName(msg.from_id)}</div>
             ${renderReplyQuote(msg, answerMap)}
             <div class="message-body markdown-body">${bodyIsRendered ? renderMessageBody(msg.body, msg.content_type) : ''}</div>
-            ${renderAttachments(msg)}
+            ${renderAttachments(attachmentsMsg)}
             ${renderReactionBadges(msg.mid, reactionMap)}
             <div class="message-time" title="${isPending ? '' : formatAbsolute(msg.created_at)}">${isPending ? 'Sending...' : formatTime(msg.created_at)}</div>
         `;
         if (question) {
             el.querySelector('.message-body')
               .appendChild(renderQuestionCard(msg, question, answerMap));
+        }
+        if (player) {
+            el.querySelector('.message-body').appendChild(playerCardFor(msg, player));
         }
         return el;
     }
@@ -2752,6 +3070,13 @@
 
         list.innerHTML = '';
         list.appendChild(fragment);
+
+        // A cached player card that is no longer drawn (another room, an
+        // expired message) is out of the document and already paused.
+        const drawn = new Set(visible.map(m => m.mid));
+        for (const mid of playerCards.keys()) {
+            if (!drawn.has(mid)) playerCards.delete(mid);
+        }
         
         // Apply syntax highlighting to code blocks
         highlightCodeBlocks(list);

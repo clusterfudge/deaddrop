@@ -100,6 +100,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import re
 import time
@@ -134,10 +135,30 @@ def is_caught_up(cursor: str | None, mid: str) -> bool:
     return cursor >= mid
 
 
+# A player card's body is JSON; its preview is the playlist title.
+_PLAYER_CONTENT_TYPE = "application/x-player"
+
+
+def _player_preview(body: str) -> str:
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return body
+    title = data.get("title")
+    label = title.strip() if isinstance(title, str) and title.strip() else "Playlist"
+    tracks = data.get("tracks")
+    count = len(tracks) if isinstance(tracks, list) else 0
+    return f"🎵 {label} · {count} track{'' if count == 1 else 's'}"
+
+
 def _preview(body: str, content_type: str | None) -> str:
     """One-line lock-screen preview of a message body."""
     if content_type and content_type.startswith("image/"):
         return "📎 Attachment"
+    if content_type == _PLAYER_CONTENT_TYPE:
+        body = _player_preview(body)
     text = " ".join((body or "").split())
     if not text:
         return "New message"
