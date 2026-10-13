@@ -1,15 +1,18 @@
 """
-Playwright test: PWA last-route restore.
+Playwright test: PWA last-route restore and room-route publication.
 
 An installed PWA always relaunches at the manifest `start_url` (`/app`), so the
 app has to resume the last route itself. These tests drive a real uvicorn server
-with a real database, exercising three behaviors:
+with a real database, exercising five behaviors:
 
 1. A bare launch at `/app` with a saved route resumes that route.
 2. A launch carrying an explicit route is never overridden by the saved one
    (deep links, invites, and notification taps must win).
 3. A saved route pointing at a room that 404s/403s falls back to the room list
    instead of leaving the room view stuck on its loading state.
+4. A launch carrying a room route that 404s/403s does the same.
+5. Opening a room that fails validation publishes no history entry for it, so a
+   reload cannot resolve to it.
 """
 
 import json
@@ -254,6 +257,49 @@ def test_stale_saved_room_falls_back_to_room_list(launch, live_server, fixture_d
         "() => !document.getElementById('view-inbox').classList.contains('hidden')"
     )
 
+    assert _visible_view(page) == "inbox"
+    assert page.url == f"{live_server}/app/{slug}"
+
+
+def test_dead_deep_link_room_falls_back_to_room_list(launch, live_server, fixture_data):
+    """A launch straight into a room that 404s lands on the room list."""
+    slug = fixture_data["slug"]
+    dead = "0198e39d-0000-7000-8000-0000000000ff"
+
+    page = launch(f"/app/{slug}/room/{dead}")
+    page.wait_for_function(
+        "() => !document.getElementById('view-inbox').classList.contains('hidden')"
+    )
+
+    assert _visible_view(page) == "inbox"
+    assert page.url == f"{live_server}/app/{slug}"
+    assert page.evaluate("() => localStorage.getItem('deadrop_last_route')") == f"/app/{slug}"
+
+
+def test_room_url_is_published_only_after_validation(launch, live_server, fixture_data):
+    """A room that fails validation contributes no history entry to reload into."""
+    slug, alpha = fixture_data["slug"], fixture_data["alpha"]
+    dead = "0198e39d-0000-7000-8000-0000000000ee"
+
+    page = launch(f"/app/{slug}/room/{alpha}")
+    page.wait_for_function(
+        "() => document.getElementById('room-chat-title').textContent === 'Room Alpha'"
+    )
+
+    # Record every URL the app publishes from here on.
+    page.evaluate(
+        """() => {
+            window.__pushed = [];
+            const push = history.pushState.bind(history);
+            history.pushState = (state, title, url) => {
+                window.__pushed.push(url);
+                return push(state, title, url);
+            };
+        }"""
+    )
+
+    assert page.evaluate(f"() => openRoom('{dead}', true)") is False
+    assert page.evaluate("() => window.__pushed") == [f"/app/{slug}"]
     assert _visible_view(page) == "inbox"
     assert page.url == f"{live_server}/app/{slug}"
 
