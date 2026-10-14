@@ -1195,6 +1195,7 @@
                     preview: preview,
                     time: lastTime,
                     memberCount: room.member_count,
+                    hasUnread: room.unread_count > 0,
                 });
             });
             
@@ -1226,7 +1227,8 @@
                     `;
                 } else {
                     return `
-                        <div class="thread-item" onclick="openRoom('${thread.id}')">
+                        <div class="thread-item ${thread.hasUnread ? 'unread' : ''}" onclick="openRoom('${thread.id}')">
+                            ${thread.hasUnread ? '<div class="unread-dot"></div>' : ''}
                             <div class="thread-avatar thread-avatar-room">💬</div>
                             <div class="thread-content">
                                 <div class="thread-header">
@@ -3744,8 +3746,9 @@
                 // If we're viewing this room, fetch new messages
                 if (currentRoomId === roomId) {
                     await fetchNewRoomMessages(roomId);
+                } else if (!document.getElementById('view-inbox').classList.contains('hidden')) {
+                    loadUnifiedInbox();
                 }
-                // Could show badge on rooms tab
             }
         };
         
@@ -3891,6 +3894,7 @@
         roomLoadingOlder = false;
         navigate(`/app/${currentSlug}`);
         showView('inbox');
+        loadUnifiedInbox();
     });
     
     // Thread panel: attachments + search, shared by rooms and 1:1 threads.

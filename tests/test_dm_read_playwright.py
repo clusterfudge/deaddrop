@@ -7,6 +7,7 @@ state the server holds after each interaction:
 
 1. Rendering the thread list leaves every message unread.
 2. Opening one conversation marks only that peer's messages read.
+3. A room row is marked unread until the room is opened.
 """
 
 import json
@@ -246,3 +247,48 @@ def test_opening_a_conversation_marks_only_that_peer(launch, live_server, fixtur
     page.wait_for_function("() => document.querySelectorAll('.thread-item.unread').length === 1")
 
     assert page.locator(".thread-item.unread").count() == 1
+
+
+def test_room_row_is_unread_until_opened(launch, live_server, fixture_data):
+    ns, owner, alice = fixture_data["ns"], fixture_data["owner"], fixture_data["alice"]
+    room = _post(
+        f"{live_server}/{ns}/rooms",
+        {"display_name": "Lounge"},
+        {"X-Inbox-Secret": alice["secret"]},
+    )
+    _post(
+        f"{live_server}/{ns}/rooms/{room['room_id']}/members",
+        {"identity_id": owner["id"]},
+        {"X-Inbox-Secret": alice["secret"]},
+    )
+    _post(
+        f"{live_server}/{ns}/rooms/{room['room_id']}/messages",
+        {"body": "hello room"},
+        {"X-Inbox-Secret": alice["secret"]},
+    )
+
+    page = launch(f"/app/{fixture_data['slug']}")
+    room_row = page.locator(".thread-item", has_text="Lounge")
+    room_row.wait_for()
+    assert "unread" in room_row.get_attribute("class")
+    assert room_row.locator(".unread-dot").count() == 1
+
+    room_row.click()
+    page.wait_for_function(
+        "() => document.getElementById('room-chat-title').textContent === 'Lounge'"
+    )
+    page.wait_for_selector(".room-message")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        unread = _get(
+            f"{live_server}/{ns}/rooms/{room['room_id']}/unread",
+            {"X-Inbox-Secret": owner["secret"]},
+        )["unread_count"]
+        if unread == 0:
+            break
+        time.sleep(0.1)
+    assert unread == 0
+
+    page.locator("#room-chat-back").click()
+    page.wait_for_function("() => document.querySelectorAll('.thread-item').length === 3")
+    assert page.locator(".thread-item", has_text="Lounge").locator(".unread-dot").count() == 0
