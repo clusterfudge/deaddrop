@@ -2847,7 +2847,9 @@ def list_rooms_for_identity(
         conn: Optional database connection
 
     Returns:
-        List of room info dicts with member info
+        List of room info dicts with member info. ``unread_count`` follows
+        the room half of ``BADGE_UNREAD_SQL``: messages after the caller's
+        read cursor, with an unset or non-UUIDv7 cursor counting the room.
     """
     conn = _get_conn(conn)
     cursor = conn.execute(
@@ -2872,7 +2874,15 @@ def list_rooms_for_identity(
                    LEFT JOIN identities i ON i.id = rm5.from_id AND i.ns = r.ns
                    WHERE rm5.room_id = r.room_id
                      AND rm5.content_type != 'reaction'
-                   ORDER BY rm5.mid DESC LIMIT 1) AS last_message_from_name
+                   ORDER BY rm5.mid DESC LIMIT 1) AS last_message_from_name,
+                  (SELECT COUNT(*) FROM room_messages rm6
+                   WHERE rm6.room_id = r.room_id
+                     AND rm6.mid > CASE
+                         WHEN m.last_read_mid IS NULL OR m.last_read_mid = '' THEN ''
+                         WHEN length(m.last_read_mid) >= 15
+                              AND substr(m.last_read_mid, 15, 1) != '7' THEN ''
+                         ELSE m.last_read_mid
+                     END) AS unread_count
            FROM rooms r
            JOIN room_members m ON r.room_id = m.room_id
            WHERE r.ns = ? AND m.identity_id = ?
