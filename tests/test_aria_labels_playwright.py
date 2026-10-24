@@ -217,5 +217,5 @@ class TestRoomControlAccessibleNames:
         picker = page.locator("#reaction-picker .reaction-picker-btn")
         assert picker.count() == offered
 
-        for word in ("Thumbs up", "Heart", "Laugh", "Party", "Eyes", "Thanks"):
+        for word in ("Thumbs up", "Heart", "Laugh", "Party", "Eyes", "Thanks", "Stop"):
             assert page.get_by_role("button", name=f"React with {word}", exact=True).count() == 1
