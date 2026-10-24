@@ -153,12 +153,49 @@ def _player_preview(body: str) -> str:
     return f"🎵 {label} · {count} track{'' if count == 1 else 's'}"
 
 
+# A question card's body is JSON (docs/QUESTIONS.md); its preview is the
+# card's heading — the title, else the first prompt — as the reply quote is.
+_QUESTION_CONTENT_TYPE = "application/x-question"
+
+
+def _question_preview(body: str) -> str:
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return "❓ Question"
+    questions = data.get("questions")
+    first = questions[0] if isinstance(questions, list) and questions else data
+    label = data.get("title")
+    if not (isinstance(label, str) and label.strip()) and isinstance(first, dict):
+        label = first.get("prompt")
+    label = label.strip() if isinstance(label, str) and label.strip() else "Question"
+    count = len(questions) if isinstance(questions, list) else 1
+    return f"❓ {label} · {count} questions" if count > 1 else f"❓ {label}"
+
+
+# An answer's machine line (docs/QUESTIONS.md § 1) is for the asking agent;
+# the bullet lines above it are the human half.
+_ANSWER_LINE_RE = re.compile(r"^answer:[^\s:]+:\S*$")
+
+
+def _strip_answer_lines(body: str) -> str:
+    lines = (body or "").splitlines()
+    human = [line for line in lines if not _ANSWER_LINE_RE.match(line.strip())]
+    return "\n".join(human) if any(line.strip() for line in human) else body
+
+
 def _preview(body: str, content_type: str | None) -> str:
     """One-line lock-screen preview of a message body."""
     if content_type and content_type.startswith("image/"):
         return "📎 Attachment"
     if content_type == _PLAYER_CONTENT_TYPE:
         body = _player_preview(body)
+    elif content_type == _QUESTION_CONTENT_TYPE:
+        body = _question_preview(body)
+    else:
+        body = _strip_answer_lines(body)
     text = " ".join((body or "").split())
     if not text:
         return "New message"
