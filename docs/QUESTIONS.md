@@ -39,6 +39,11 @@ A body that fails this validation is not rendered as a card. It degrades to
 the prompt plus the option labels as plain text, so a malformed payload — or a
 client that has never heard of the type — never shows raw JSON to a reader.
 
+A push notification for a question reads `❓ <title or prompt>`, with
+` · N questions` for a form of more than one; a body that does not parse reads
+`❓ Question`. An answer's push carries its `▸ ` lines and drops the
+`answer:` machine lines.
+
 ### The form: several questions, one submit
 
 The same `content_type` carries a **form** when the body has a `questions`

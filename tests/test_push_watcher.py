@@ -140,6 +140,109 @@ class TestPreview:
         assert notifier._preview("not json", "application/x-player") == "not json"
 
 
+def _option(oid):
+    return {"id": oid, "label": oid.title()}
+
+
+class TestQuestionPreview:
+    """A question card previews as its heading, never as its JSON."""
+
+    CT = "application/x-question"
+
+    def test_single_question_previews_as_its_prompt(self):
+        body = json.dumps(
+            {"qid": "q-when", "prompt": "Tonight or Monday?", "options": [_option("tonight")]}
+        )
+        assert notifier._preview(body, self.CT) == "❓ Tonight or Monday?"
+
+    def test_titled_single_question_previews_as_its_title(self):
+        body = json.dumps(
+            {
+                "qid": "q-label",
+                "prompt": "What should it show?",
+                "title": "Boot screen label",
+                "options": [_option("home")],
+            }
+        )
+        assert notifier._preview(body, self.CT) == "❓ Boot screen label"
+
+    def test_titled_form_previews_as_its_title_and_question_count(self):
+        body = json.dumps(
+            {
+                "title": "Badgie deploy: scope and sudo",
+                "questions": [
+                    {"qid": "scope", "prompt": "Scope?", "options": [_option("full")]},
+                    {"qid": "sudo", "prompt": "Sudo?", "options": [_option("yes")]},
+                ],
+            }
+        )
+        assert notifier._preview(body, self.CT) == "❓ Badgie deploy: scope and sudo · 2 questions"
+
+    def test_untitled_form_previews_as_its_first_prompt(self):
+        body = json.dumps(
+            {
+                "questions": [
+                    {"qid": f"q{i}", "prompt": f"Question {i}?", "options": [_option("a")]}
+                    for i in range(1, 4)
+                ]
+            }
+        )
+        assert notifier._preview(body, self.CT) == "❓ Question 1? · 3 questions"
+
+    def test_one_question_form_previews_as_its_prompt(self):
+        body = json.dumps({"questions": [{"qid": "q", "prompt": "Only one?", "options": []}]})
+        assert notifier._preview(body, self.CT) == "❓ Only one?"
+
+    def test_preview_never_carries_options_or_json(self):
+        body = json.dumps({"qid": "q", "prompt": "Pick", "options": [_option("secret-option-id")]})
+        out = notifier._preview(body, self.CT)
+        assert "{" not in out
+        assert "Secret-Option-Id" not in out
+        assert "secret-option-id" not in out
+
+    @pytest.mark.parametrize(
+        "body",
+        ["not json", '{"questions": [', "[1, 2]", '"a string"', "{}", '{"prompt": 7}', ""],
+    )
+    def test_malformed_question_previews_as_a_generic_label(self, body):
+        assert notifier._preview(body, self.CT) == "❓ Question"
+
+    def test_long_prompt_is_truncated_at_the_body_limit(self):
+        body = json.dumps({"qid": "q", "prompt": "why " * 100, "options": [_option("a")]})
+        out = notifier._preview(body, self.CT)
+        assert len(out) == notifier._BODY_LIMIT
+        assert out.startswith("❓ why why")
+        assert out.endswith("…")
+
+
+class TestAnswerPreview:
+    """An answer previews as its human lines; the machine lines are dropped."""
+
+    def test_single_answer_drops_its_machine_line(self):
+        body = "▸ Monday morning\nanswer:q-deploy-window:monday"
+        assert notifier._preview(body, "text/markdown") == "▸ Monday morning"
+
+    def test_form_answer_drops_every_machine_line(self):
+        body = (
+            "▸ Deploy when? — Monday morning\n"
+            "▸ Who reviews? — Sean, Fritz\n"
+            "answer:q-when:monday\n"
+            "answer:q-who:sean,fritz"
+        )
+        assert (
+            notifier._preview(body, "text/markdown")
+            == "▸ Deploy when? — Monday morning ▸ Who reviews? — Sean, Fritz"
+        )
+
+    def test_a_bare_machine_line_is_kept(self):
+        # Nothing else to show; a typed `answer:x:y` stays visible.
+        assert notifier._preview("answer:x:y", "text/markdown") == "answer:x:y"
+
+    def test_ordinary_text_is_unchanged(self):
+        body = "the answer: is 42\nanswer the door"
+        assert notifier._preview(body, "text/markdown") == "the answer: is 42 answer the door"
+
+
 @pytest.mark.asyncio
 class TestWatcherFires:
     async def test_push_sent_after_the_unread_window(self, room):
@@ -159,6 +262,32 @@ class TestWatcherFires:
         assert notification["body"] == "PR is green"
         assert notification["navigate"] == f"/app/twin/room/{room['room_id']}"
         assert notification["tag"] == f"room:{room['room_id']}"
+
+    async def test_question_card_push_reads_as_its_heading(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+        body = json.dumps(
+            {
+                "title": "Ship checklist",
+                "questions": [
+                    {"qid": "q-when", "prompt": "Deploy when?", "options": [_option("now")]},
+                    {"qid": "q-who", "prompt": "Who reviews?", "options": [_option("sean")]},
+                ],
+            }
+        )
+        message = db.send_room_message(
+            room_id=room["room_id"],
+            from_id=room["alice"],
+            body=body,
+            content_type="application/x-question",
+        )
+
+        await watcher.on_room_message(room["ns"], room["room_id"], message, room["alice"], "twin")
+        await asyncio.sleep(0.2)
+
+        assert len(sender.sent) == 1
+        assert sender.sent[0][1]["notification"]["body"] == "❓ Ship checklist · 2 questions"
 
     async def test_sender_does_not_notify_itself(self, room):
         _subscribe(room, room["alice"], "https://push.example.com/sub/alice")
