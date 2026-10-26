@@ -49,3 +49,6 @@ src/deadrop/_version.py
 .agent-scratchpad/
 .agent/
 .agent-scratchpad
+
+# h1 session data
+.harness1/

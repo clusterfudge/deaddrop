@@ -423,7 +423,9 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     # Turso: one shared, thread-safe HTTP client (see turso_http). Building
     # it does no I/O, so this can never block.
     if os.environ.get("TURSO_URL", "").startswith("libsql://"):
-        return cast(sqlite3.Connection, InstrumentedConnection(_get_turso_connection()))
+        # TursoConnection provides the subset of sqlite3.Connection deadrop uses.
+        turso = cast(sqlite3.Connection, _get_turso_connection())
+        return cast(sqlite3.Connection, InstrumentedConnection(turso))
 
     # Thread-local connection for SQLite
     # Each thread gets its own connection to avoid concurrency issues
