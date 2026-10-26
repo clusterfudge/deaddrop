@@ -331,13 +331,6 @@ def schedule_cache_warming() -> None:
         except asyncio.TimeoutError:
             logger.error(f"Initial cache warming timed out after {CACHE_WARMING_TIMEOUT}s")
             print(f"ERROR:    Initial cache warming timed out after {CACHE_WARMING_TIMEOUT}s")
-            from . import db as _db
-
-            try:
-                _db._replace_db_executor()
-                _db._reset_libsql_connection()
-            except Exception:
-                pass
         except Exception as e:
             logger.error(f"Initial cache warming failed: {e}")
             print(f"ERROR:    Initial cache warming failed: {e}")

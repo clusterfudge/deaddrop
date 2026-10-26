@@ -19,7 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-turso = ["libsql>=0.1.11"]
+# Kept so `deaddrop[turso]` still resolves; Turso now needs only httpx.
+turso = []
 
 [project.scripts]
 deadrop = "deadrop.cli:app"

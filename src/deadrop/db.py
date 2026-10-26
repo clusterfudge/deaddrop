@@ -4,7 +4,7 @@ This module provides database operations for deaddrop with support for:
 - Global singleton connection (backward compatible)
 - Custom connection paths for local backends
 - In-memory databases for testing
-- Turso (libsql) for production
+- Turso (Hrana over HTTP, see turso_http) for production
 
 Connection Management:
     # Global singleton (existing behavior)
@@ -39,6 +39,7 @@ from uuid_extensions import uuid7 as make_uuid7
 
 from .auth import derive_id, generate_secret, hash_secret
 from .metrics import InstrumentedConnection, metrics, timed_query
+from .turso_http import TursoConnection, TursoUnavailableError
 
 # Deduplication window in seconds — messages with the same sender,
 # destination, and content hash within this window are considered
@@ -68,26 +69,18 @@ _is_libsql: bool = False
 
 
 def is_using_libsql() -> bool:
-    """Check if the database backend is libsql/Turso.
-
-    This is used by the API layer to determine whether DB operations need
-    to be serialized (libsql uses a single shared connection).
-    """
+    """Check if the database backend is Turso (a ``libsql://`` TURSO_URL)."""
     return _is_libsql or os.environ.get("TURSO_URL", "").startswith("libsql://")
 
 
-# Lock for thread-safe libsql reconnection
-_libsql_lock = threading.Lock()
+# Process-wide Turso client (thread-safe; see turso_http).
+_turso_conn: TursoConnection | None = None
+_turso_conn_lock = threading.Lock()
 
-# Timeout for libsql connection operations (seconds)
-LIBSQL_CONNECT_TIMEOUT = 10.0
-LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
+# Per-request Turso timeouts (seconds). A statement normally takes ~50ms.
+TURSO_CONNECT_TIMEOUT = float(os.environ.get("DEADROP_TURSO_CONNECT_TIMEOUT", "5"))
+TURSO_READ_TIMEOUT = float(os.environ.get("DEADROP_TURSO_READ_TIMEOUT", "10"))
 
-# Active health ping configuration — prevents Turso connections from
-# silently going stale while idle (NAT / LB / firewall kills TCP sessions
-# after ~5min of inactivity; without this, the first request after idle
-# hangs for the full TCP timeout, pile up workers, and Sean hits a 503
-# cascade).
 # DNS/TCP reachability monitor — detects the scenario where Turso's NLB
 # returns an IP in DNS but that IP is TCP-dead. Observed 2026-05-08:
 # `3.212.35.170` was in DNS but refused connections on :443; half of new
@@ -96,23 +89,6 @@ LIBSQL_HEALTH_CHECK_TIMEOUT = 5.0
 # WARNING log BEFORE users see 503s.
 TURSO_DNS_MONITOR_INTERVAL = 15.0  # seconds between DNS/TCP sweeps
 TURSO_DNS_TCP_TIMEOUT = 3.0  # seconds per IP TCP-connect probe
-# Maximum age of a libsql connection before it is proactively recycled.
-#
-# Max-age recycle was set to 240s in PR #68. Observed post-deploy: every
-# ~4min, every pooled connection got force-recycled. Writes that landed
-# in the cold-start window paid 2-3s (TCP + TLS + Hrana stream init)
-# instead of the normal ~50ms. The ping-every-15s sweep already catches
-# broken connections, so nothing recycles on age today; the setting stays
-# so it can be re-enabled with a saner value if a silent-stale scenario
-# the ping misses turns up.
-MAX_CONNECTION_AGE_SECONDS = float(os.environ.get("DEADROP_MAX_LIBSQL_AGE", "300"))
-
-# How often the background health-ping fires against each worker.
-HEALTH_PING_INTERVAL_SECONDS = float(os.environ.get("DEADROP_HEALTH_PING_INTERVAL", "15"))
-
-# Per-connection ping timeout. If a trivial SELECT 1 doesn't return in
-# this window, the connection is considered stale and recycled.
-HEALTH_PING_TIMEOUT_SECONDS = float(os.environ.get("DEADROP_HEALTH_PING_TIMEOUT", "2"))
 
 # Separate read and write executor pools.
 #
@@ -120,9 +96,9 @@ HEALTH_PING_TIMEOUT_SECONDS = float(os.environ.get("DEADROP_HEALTH_PING_TIMEOUT"
 # different thread pools so that a slow read (e.g. a large attachment blob
 # fetch) cannot starve write threads and cause write latency spikes.
 #
-# Each thread in each pool has its own libsql connection via thread-local
-# storage.  For local SQLite the executors are None and FastAPI's default
-# thread pool is used instead.
+# For Turso the pools share one HTTP client and bound how many statements
+# are in flight. For local SQLite the executors are None and FastAPI's
+# default thread pool is used instead.
 _read_executor = None
 _write_executor = None
 _executor_lock = threading.Lock()
@@ -130,19 +106,12 @@ _executor_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Runtime diagnostics state (issue #51)
 #
-# Pure instrumentation: counters + timestamps that let us watch the
-# every-30-60-min hang unfold in Grafana / the /debug/db endpoint. These are
-# incremented alongside the existing behavior; they change no control flow.
-# Guarded by their own lock so the /debug/db snapshot is internally consistent
-# without contending on _executor_lock.
+# Pure instrumentation for the /debug/db endpoint; changes no control flow.
+# Guarded by its own lock so the snapshot is internally consistent without
+# contending on _executor_lock.
 # ---------------------------------------------------------------------------
 _diag_lock = threading.Lock()
-_executor_replace_count = 0
-_last_executor_replace_at: float = 0.0
-_hrana_stream_errors = 0
-_health_check_runs = 0
-_health_check_failures = 0
-_libsql_connect_count = 0
+_turso_read_retries = 0
 
 
 def _executor_thread_count(executor) -> int:
@@ -162,43 +131,17 @@ def _executor_thread_count(executor) -> int:
 
 
 def get_db_debug_state() -> dict:
-    """Return a diagnostics snapshot of the DB layer (issue #51).
-
-    Instrumentation only — reads the counters/timestamps maintained by the
-    executor-replace, health-ping, hrana-retry, and connect paths. Powers the
-    ``/debug/db`` admin endpoint so the every-30-60-min hang (#49) can be
-    watched unfolding without attaching a debugger.
-    """
-    import time as _time
-
+    """Return a diagnostics snapshot of the DB layer for ``/debug/db``."""
     with _diag_lock:
-        replace_count = _executor_replace_count
-        last_replace_at = _last_executor_replace_at
-        hrana_errors = _hrana_stream_errors
-        health_runs = _health_check_runs
-        health_failures = _health_check_failures
-        connect_count = _libsql_connect_count
+        read_retries = _turso_read_retries
 
-    last_replace_age = (_time.time() - last_replace_at) if last_replace_at else None
     return {
-        "backend": "libsql" if is_using_libsql() else "sqlite",
+        "backend": "turso" if is_using_libsql() else "sqlite",
         "read_pool_threads": _executor_thread_count(_read_executor),
         "write_pool_threads": _executor_thread_count(_write_executor),
         "read_pool_size": READ_POOL_SIZE,
         "write_pool_size": WRITE_POOL_SIZE,
-        "executor_replace_count_total": replace_count,
-        "last_executor_replace_at": (
-            _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(last_replace_at))
-            if last_replace_at
-            else None
-        ),
-        "last_executor_replace_age_seconds": (
-            round(last_replace_age, 1) if last_replace_age is not None else None
-        ),
-        "hrana_stream_errors_total": hrana_errors,
-        "libsql_connect_count_total": connect_count,
-        "health_check_runs_total": health_runs,
-        "health_check_failures_total": health_failures,
+        "turso_read_retries_total": read_retries,
     }
 
 
@@ -214,8 +157,7 @@ def get_read_executor():
     """Get the executor for read (SELECT-only) database operations.
 
     For libsql/Turso: uses a thread pool with READ_POOL_SIZE workers (default 6).
-    Each worker thread gets its own libsql connection via thread-local storage,
-    enabling concurrent reads without blocking the write pool.
+    Keeps reads from queuing behind writes.
 
     For local SQLite: returns None to use FastAPI's default thread pool with
     thread-local connections.
@@ -248,7 +190,6 @@ def get_write_executor():
     """Get the executor for write (INSERT/UPDATE/DELETE) database operations.
 
     For libsql/Turso: uses a thread pool with WRITE_POOL_SIZE workers (default 4).
-    Each worker thread gets its own libsql connection via thread-local storage.
     Keeping write threads isolated ensures that slow reads never block writes.
 
     For local SQLite: returns None to use FastAPI's default thread pool with
@@ -285,243 +226,6 @@ def get_db_executor():
     New code should prefer get_read_executor() or get_write_executor().
     """
     return get_write_executor()
-
-
-def _replace_db_executor():
-    """Replace the DB executor pools with fresh ones.
-
-    Called when an executor thread is stuck on a hung Turso operation.
-    Old executors (and their stuck threads) are abandoned — threads are daemons
-    so they won't prevent process exit.  Old executors are intentionally NOT
-    shut down (that would block waiting for the stuck threads to finish).
-    """
-    global _read_executor, _write_executor
-    global _executor_replace_count, _last_executor_replace_at
-
-    if not is_using_libsql():
-        return  # Only relevant for libsql
-
-    import time as _time
-
-    now = _time.time()
-    with _diag_lock:
-        _executor_replace_count += 1
-        prev_at = _last_executor_replace_at
-        _last_executor_replace_at = now
-        replace_count = _executor_replace_count
-    since_prev = (now - prev_at) if prev_at else None
-
-    with _executor_lock:
-        from concurrent.futures import ThreadPoolExecutor
-
-        import logging
-
-        _read_executor = ThreadPoolExecutor(
-            max_workers=READ_POOL_SIZE, thread_name_prefix="db-read"
-        )
-        _write_executor = ThreadPoolExecutor(
-            max_workers=WRITE_POOL_SIZE, thread_name_prefix="db-write"
-        )
-        log = logging.getLogger(__name__)
-        log.warning(
-            "Replaced stuck DB executors with fresh ones (old threads abandoned) "
-            "[replace_count=%d, since_prev=%s]",
-            replace_count,
-            f"{since_prev:.1f}s" if since_prev is not None else "n/a",
-        )
-        # A tight replace loop (< 60s between replacements) is the signature of
-        # the cascading pool-exhaustion hang in #49 — surface it loudly.
-        if since_prev is not None and since_prev < 60:
-            log.warning(
-                "DB executor replaced again after only %.1fs — possible "
-                "cascading pool exhaustion (#49)",
-                since_prev,
-            )
-
-    metrics.incr("db.executor.replace_count")
-
-
-def _ping_all_workers_in_executor(executor, pool_size: int) -> list[tuple[str, bool, str]]:
-    """Ping every worker thread in the given executor.
-
-    Uses a ``threading.Barrier`` to force one ping task to be scheduled on
-    each worker: each task parks on the barrier until all ``pool_size``
-    tasks are in flight, which requires every worker to be occupied.
-    Only once the barrier releases does each task run the actual ping.
-
-    Returns a list of ``(thread_name, ok, detail)`` results.
-    """
-    import concurrent.futures
-
-    if executor is None or pool_size <= 0:
-        return []
-
-    barrier = threading.Barrier(pool_size, timeout=HEALTH_PING_TIMEOUT_SECONDS * 2)
-
-    def _task():
-        try:
-            barrier.wait()
-        except threading.BrokenBarrierError:
-            # Pool was busy; fall through and ping anyway so at least the
-            # workers that landed this task get checked.
-            pass
-        return _ping_worker_connection()
-
-    futures = [executor.submit(_task) for _ in range(pool_size)]
-    results: list[tuple[str, bool, str]] = []
-    for fut in concurrent.futures.as_completed(futures, timeout=HEALTH_PING_TIMEOUT_SECONDS * 4):
-        try:
-            results.append(fut.result(timeout=HEALTH_PING_TIMEOUT_SECONDS * 2))
-        except Exception as e:
-            results.append(("unknown", False, f"future-error: {e}"))
-    return results
-
-
-def _ping_worker_connection() -> tuple[str, bool, str]:
-    """Health-ping the calling thread's libsql connection.
-
-    Intended to be submitted onto the DB executors by the background
-    health-ping loop. Runs a trivial ``SELECT 1`` against the thread-local
-    libsql connection with a short timeout. On failure, closes and clears
-    the connection so the next query on this worker creates a fresh one.
-
-    Returns a tuple ``(thread_name, ok, detail)`` so the caller can log
-    a compact summary.
-    """
-    thread_name = threading.current_thread().name
-    conn = getattr(_local, "libsql_conn", None)
-    if conn is None:
-        return (thread_name, True, "no-conn")
-
-    try:
-        _run_with_timeout(
-            lambda: conn.execute("SELECT 1"),
-            timeout=HEALTH_PING_TIMEOUT_SECONDS,
-            description="health_ping SELECT 1",
-        )
-        return (thread_name, True, "ok")
-    except Exception as e:
-        # Close + clear the stale connection. Next query on this worker
-        # will lazily create a fresh one.
-        try:
-            _run_with_timeout(
-                lambda: conn.close(),
-                timeout=2.0,
-                description="conn.close()",
-            )
-        except Exception:
-            pass
-        _local.libsql_conn = None
-        _local.libsql_connected_at = 0.0
-        return (thread_name, False, f"{type(e).__name__}: {e}")
-
-
-async def health_ping_loop(stop_event=None) -> None:
-    """Background loop that actively probes libsql connections in the pool.
-
-    Every ``HEALTH_PING_INTERVAL_SECONDS``, submits a ``SELECT 1`` to every
-    worker in both the read and write executors. Stale connections are
-    closed + cleared so the next real query creates a fresh one —
-    pre-empting the multi-second hang observed when intermediaries silently
-    reap idle TCP to Turso.
-
-    Runs on the asyncio event loop; the actual DB work is offloaded to the
-    executor pools. Cancellation-safe: the task catches ``CancelledError``
-    and exits cleanly.
-    """
-    import asyncio
-    import logging
-
-    log = logging.getLogger(__name__)
-
-    if not is_using_libsql():
-        log.info("health_ping_loop: not using libsql, exiting")
-        return
-
-    log.info(
-        f"health_ping_loop: starting "
-        f"(interval={HEALTH_PING_INTERVAL_SECONDS}s, "
-        f"ping_timeout={HEALTH_PING_TIMEOUT_SECONDS}s, "
-        f"max_age={MAX_CONNECTION_AGE_SECONDS}s)"
-    )
-
-    loop = asyncio.get_event_loop()
-    try:
-        while True:
-            try:
-                read_exec = get_read_executor()
-                write_exec = get_write_executor()
-
-                # Offload the ping orchestration itself (which blocks on
-                # barriers/futures) to a thread so we don't sit on the
-                # event loop.
-                read_results = await loop.run_in_executor(
-                    None,
-                    _ping_all_workers_in_executor,
-                    read_exec,
-                    READ_POOL_SIZE,
-                )
-                write_results = await loop.run_in_executor(
-                    None,
-                    _ping_all_workers_in_executor,
-                    write_exec,
-                    WRITE_POOL_SIZE,
-                )
-
-                failures = [r for r in read_results + write_results if not r[1]]
-
-                # Diagnostics (issue #51): count every health-check run and the
-                # per-run failure total, and publish live pool thread-count
-                # gauges on the same interval the loop already fires on.
-                global _health_check_runs, _health_check_failures
-                with _diag_lock:
-                    _health_check_runs += 1
-                    _health_check_failures += len(failures)
-                metrics.incr("db.health_check.count")
-                if failures:
-                    metrics.incr("db.health_check.failures", len(failures))
-                metrics.gauge("db.executor.read_thread_count", _executor_thread_count(read_exec))
-                metrics.gauge("db.executor.write_thread_count", _executor_thread_count(write_exec))
-
-                if failures:
-                    log.warning(
-                        "health_ping: recycled %d stale connection(s): %s",
-                        len(failures),
-                        ", ".join(f"{t}={d}" for t, _, d in failures),
-                    )
-                else:
-                    log.debug(
-                        "health_ping: ok read=%d write=%d",
-                        len(read_results),
-                        len(write_results),
-                    )
-            except Exception:
-                log.warning("health_ping: iteration failed", exc_info=True)
-
-            await asyncio.sleep(HEALTH_PING_INTERVAL_SECONDS)
-    except asyncio.CancelledError:
-        log.info("health_ping_loop: cancelled, exiting")
-        raise
-
-
-def _reset_libsql_connection() -> None:
-    """Reset the thread-local libsql connection.
-
-    Called when the connection is detected as stale (e.g., Hrana stream expired).
-    Only affects the calling thread's connection.
-    """
-    conn = getattr(_local, "libsql_conn", None)
-    if conn is not None:
-        try:
-            _run_with_timeout(
-                lambda: conn.close(),
-                timeout=2.0,
-                description="conn.close()",
-            )
-        except Exception:
-            pass  # Abandon the stale connection
-        _local.libsql_conn = None
-        _local.libsql_connected_at = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -664,79 +368,23 @@ def stop_turso_dns_monitor() -> None:
     _turso_dns_monitor_stop.set()
 
 
-def _is_hrana_stream_error(error: Exception) -> bool:
-    """Check if an exception indicates a stale Hrana stream.
+def _get_turso_connection() -> TursoConnection:
+    """Return the process-wide Turso client, creating it on first use."""
+    global _turso_conn, _is_libsql
 
-    Turso/libsql uses HTTP/2 streams that can expire or disconnect.
-    When this happens, we need to reconnect.
-    """
-    error_str = str(error).lower()
-    return (
-        "stream not found" in error_str
-        or "hrana" in error_str
-        or "connection" in error_str
-        and "closed" in error_str
-    )
-
-
-def _run_with_timeout(fn, timeout: float, description: str = "operation"):
-    """Run a blocking function in a daemon thread with a timeout.
-
-    This is used to wrap operations that may hang indefinitely on network
-    I/O (e.g. ``libsql.connect()``, ``conn.execute("SELECT 1")``).
-
-    Args:
-        fn: A zero-argument callable to run.
-        timeout: Maximum seconds to wait.
-        description: Human-readable label for error messages.
-
-    Returns:
-        The return value of ``fn()``.
-
-    Raises:
-        TimeoutError: If the function does not complete in time.
-        Exception: Any exception raised by ``fn``.
-    """
-    result: list[Any] = [None]
-    error: list[BaseException | None] = [None]
-
-    def _wrapper():
-        try:
-            result[0] = fn()
-        except BaseException as e:
-            error[0] = e
-
-    t = threading.Thread(target=_wrapper, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-
-    if t.is_alive():
-        raise TimeoutError(f"{description} timed out after {timeout}s")
-
-    if error[0] is not None:
-        raise error[0]
-
-    return result[0]
-
-
-def _health_check_conn(
-    conn: sqlite3.Connection, timeout: float = LIBSQL_HEALTH_CHECK_TIMEOUT
-) -> None:
-    """Run a health check query with a timeout.
-
-    Executes ``SELECT 1`` in a daemon thread so that a hung TCP connection
-    (e.g. an expired Hrana stream that never errors but never responds)
-    cannot block the caller indefinitely.
-
-    Args:
-        conn: The database connection to check.
-        timeout: Maximum seconds to wait for the health check.
-
-    Raises:
-        TimeoutError: If the health check does not complete in time.
-        Exception: Any exception raised by the underlying ``execute``.
-    """
-    _run_with_timeout(lambda: conn.execute("SELECT 1"), timeout, "Database health check")
+    if _turso_conn is not None:
+        return _turso_conn
+    with _turso_conn_lock:
+        if _turso_conn is None:
+            _turso_conn = TursoConnection(
+                os.environ["TURSO_URL"],
+                os.environ.get("TURSO_AUTH_TOKEN", ""),
+                connect_timeout=TURSO_CONNECT_TIMEOUT,
+                read_timeout=TURSO_READ_TIMEOUT,
+                max_connections=READ_POOL_SIZE + WRITE_POOL_SIZE + 4,
+            )
+            _is_libsql = True
+        return _turso_conn
 
 
 # --- Connection Management ---
@@ -755,10 +403,6 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
     Returns:
         SQLite connection with row_factory set to sqlite3.Row.
-
-    Raises:
-        TimeoutError: If unable to acquire connection lock within timeout.
-        RuntimeError: If libsql connection fails after retries.
     """
     global _conn, _is_libsql, _db_config
 
@@ -776,100 +420,12 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         return cast(sqlite3.Connection, InstrumentedConnection(conn))
 
-    # Check for Turso/libsql — each thread gets its own connection via
-    # thread-local storage, enabling concurrent Turso requests from the
-    # DB executor pool.
-    db_url = os.environ.get("TURSO_URL", "")
-    if db_url.startswith("libsql://"):
-        # Check thread-local connection.
-        #
-        # Earlier versions had a proactive max-age recycle here that closed
-        # any connection older than DEADROP_MAX_LIBSQL_AGE (default 300s)
-        # on the next hot-path use. Observed post-PR #68 deploy: every
-        # connection got force-recycled roughly every 5 min, and writes
-        # that landed in the cold-start window paid 2-3s (TCP + TLS +
-        # Hrana stream init) instead of the usual ~50ms.
-        #
-        # The active health-pinger (runs every 15s in the background) is
-        # sufficient to detect broken connections and recycle them
-        # off-path. No need to pre-empt on the hot path.
-        #
-        # To re-enable (if a silent-stale scenario the ping misses shows
-        # up): uncomment, set DEADROP_MAX_LIBSQL_AGE to something long
-        # like 1800 so routine writes don't pay cold-start.
-
-        if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
-            # Health check existing connection
-            try:
-                _health_check_conn(_local.libsql_conn, timeout=LIBSQL_HEALTH_CHECK_TIMEOUT)
-                return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
-            except (TimeoutError, Exception) as e:
-                is_timeout = isinstance(e, TimeoutError)
-                is_hrana = not is_timeout and _is_hrana_stream_error(e)
-
-                if is_timeout or is_hrana:
-                    import logging
-
-                    reason = "timed out" if is_timeout else "stale"
-                    logging.warning(
-                        f"Libsql connection {reason} on {threading.current_thread().name}, "
-                        f"reconnecting: {e}"
-                    )
-                    stale_conn = _local.libsql_conn
-                    try:
-                        _run_with_timeout(
-                            lambda: stale_conn.close(),
-                            timeout=2.0,
-                            description="conn.close()",
-                        )
-                    except Exception:
-                        pass
-                    _local.libsql_conn = None
-                    # Fall through to create new connection
-                else:
-                    raise
-
-        # Create new thread-local connection
-        import libsql  # type: ignore[import-not-found]
-        import logging
-
-        thread_name = threading.current_thread().name
-        auth_token = os.environ.get("TURSO_AUTH_TOKEN", "")
-
-        logging.info(f"Creating libsql connection on {thread_name} to {db_url[:50]}...")
-        try:
-            import time as _time
-
-            _connect_started = _time.perf_counter()
-            _local.libsql_conn = _run_with_timeout(
-                lambda: libsql.connect(
-                    db_url,
-                    auth_token=auth_token,
-                    isolation_level=None,  # autocommit: eliminates commit roundtrip
-                ),
-                timeout=LIBSQL_CONNECT_TIMEOUT,
-                description=f"libsql.connect() on {thread_name}",
-            )
-            _local.libsql_connected_at = _time.time()
-            _is_libsql = True
-
-            global _libsql_connect_count
-            _connect_ms = (_time.perf_counter() - _connect_started) * 1000
-            with _diag_lock:
-                _libsql_connect_count += 1
-            metrics.incr("db.libsql_connect.count")
-            metrics.gauge("db.libsql_connect.duration_ms", _connect_ms)
-
-        except TimeoutError:
-            logging.error(f"libsql.connect() timed out after {LIBSQL_CONNECT_TIMEOUT}s")
-            raise RuntimeError(
-                f"Timed out connecting to Turso database after {LIBSQL_CONNECT_TIMEOUT}s"
-            )
-        except Exception as e:
-            logging.error(f"Failed to connect to libsql: {e}")
-            raise RuntimeError(f"Failed to connect to Turso database: {e}") from e
-
-        return cast(sqlite3.Connection, InstrumentedConnection(_local.libsql_conn))
+    # Turso: one shared, thread-safe HTTP client (see turso_http). Building
+    # it does no I/O, so this can never block.
+    if os.environ.get("TURSO_URL", "").startswith("libsql://"):
+        # TursoConnection provides the subset of sqlite3.Connection deadrop uses.
+        turso = cast(sqlite3.Connection, _get_turso_connection())
+        return cast(sqlite3.Connection, InstrumentedConnection(turso))
 
     # Thread-local connection for SQLite
     # Each thread gets its own connection to avoid concurrency issues
@@ -931,21 +487,20 @@ def scoped_connection(db_path: str | Path) -> Iterator[sqlite3.Connection]:
 def close_db():
     """Close database connections.
 
-    Closes thread-local connections (SQLite and libsql).
-    For libsql with a thread pool, each worker thread's connection is
-    cleaned up when the executor shuts down.
+    Closes the calling thread's SQLite connection and the shared Turso client.
     """
-    global _conn, _is_libsql
+    global _conn, _is_libsql, _turso_conn
 
     # Close thread-local SQLite connection
     if hasattr(_local, "conn") and _local.conn is not None:
         _local.conn.close()
         _local.conn = None
 
-    # Close thread-local libsql connection
-    if hasattr(_local, "libsql_conn") and _local.libsql_conn is not None:
-        _local.libsql_conn.close()
-        _local.libsql_conn = None
+    # Close the shared Turso client
+    with _turso_conn_lock:
+        if _turso_conn is not None:
+            _turso_conn.close()
+            _turso_conn = None
 
     # Close legacy global connection (if any)
     if _conn:
@@ -984,54 +539,35 @@ def _get_conn(
 def _execute_with_retry(
     operation: Callable[[], Any],
     max_retries: int = 2,
+    *,
+    idempotent: bool = False,
 ) -> Any:
-    """Execute a database operation with automatic reconnection for libsql.
+    """Run a database operation, retrying Turso outages when that is safe.
 
-    If the operation fails due to a stale Hrana stream, resets the connection
-    and retries the operation.
-
-    Args:
-        operation: A callable that performs the database operation
-        max_retries: Maximum number of retry attempts (default: 2)
-
-    Returns:
-        The result of the operation
+    The Turso client already retries failures where the request never
+    reached the server. What is left — a timeout or dropped connection after
+    the request was sent — may have applied the statement, so it is retried
+    only for ``idempotent`` operations (reads).
 
     Raises:
-        The original exception if all retries fail
+        The last error once retries are exhausted or the error isn't retryable.
     """
-    global _is_libsql
-
-    last_error: Exception | None = None
-
     for attempt in range(max_retries + 1):
         try:
             return operation()
-        except Exception as e:
-            last_error = e
+        except TursoUnavailableError as e:
+            if not idempotent or attempt == max_retries:
+                raise
+            import logging
 
-            # Only retry for libsql Hrana stream errors
-            if _is_libsql and _is_hrana_stream_error(e) and attempt < max_retries:
-                import logging
-
-                global _hrana_stream_errors
-                with _diag_lock:
-                    _hrana_stream_errors += 1
-                metrics.incr("db.hrana_stream_error")
-
-                logging.warning(
-                    f"Libsql connection error (attempt {attempt + 1}/{max_retries + 1}), reconnecting: {e}"
-                )
-                _reset_libsql_connection()
-                # The next get_connection() call will create a fresh connection
-                continue
-
-            # For non-libsql or non-retryable errors, raise immediately
-            raise
-
-    # Should not reach here, but just in case
-    if last_error:
-        raise last_error
+            global _turso_read_retries
+            with _diag_lock:
+                _turso_read_retries += 1
+            metrics.incr("db.turso.read_retry")
+            logging.warning(
+                f"Turso unavailable (attempt {attempt + 1}/{max_retries + 1}), retrying read: {e}"
+            )
+    raise AssertionError("unreachable")
 
 
 def _row_to_dict(cursor_description: Any, row: tuple | sqlite3.Row | None) -> dict | None:

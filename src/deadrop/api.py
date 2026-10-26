@@ -12,12 +12,19 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from . import cache, db, instrument, push
+from .turso_http import TursoUnavailableError
 from .auth import derive_id
 from .auth_provider import (
     extract_bearer_token,
@@ -132,15 +139,6 @@ async def lifespan(app: FastAPI):
     # never surface to callers.
     asyncio.create_task(asyncio.to_thread(_post_deploy_annotation))
 
-    # Active libsql health-ping: submits SELECT 1 into every read/write
-    # pool worker every ~15s. The ping has to run *on* the worker, because
-    # a libsql connection lives in that thread's thread-local and may only
-    # be used from there. Exercising the connection keeps the Hrana stream
-    # warm, so the cold-start cost (TCP + TLS + stream init, 0.4-1.5s
-    # measured) is not charged to the first request after an idle gap.
-    # No-ops for local SQLite.
-    health_ping_task = asyncio.create_task(db.health_ping_loop())
-
     push_cfg = push.load_config()
     if push_cfg.configured:
         logger.info("Web Push enabled (cooldown=%ss)", push_cfg.debounce_seconds)
@@ -164,7 +162,6 @@ async def lifespan(app: FastAPI):
 
     # Stop background cache refresh
     stop_cache_warming()
-    health_ping_task.cancel()
     db.stop_turso_dns_monitor()
     db.close_db()
 
@@ -211,6 +208,13 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(TursoUnavailableError)
+async def _turso_unavailable(request: Request, exc: TursoUnavailableError):
+    """Turso didn't answer in time: tell the client to retry, not that we broke."""
+    logging.getLogger(__name__).error(f"Turso unavailable on {request.url.path}: {exc}")
+    return JSONResponse({"detail": "Database unavailable — please retry"}, status_code=503)
 
 
 # --- Request Timing Middleware ---
@@ -654,9 +658,10 @@ def require_active_namespace(ns: str) -> None:
 # they keep using the sync versions above directly.
 
 
-# Maximum time a single DB operation can take before we assume the connection
-# is stale and needs to be reset.  This prevents a hung Turso query from
-# blocking the single-threaded executor indefinitely.
+# Backstop on a whole DB operation (which may run several statements). Each
+# Turso statement is already bounded by the client's own timeouts, so the
+# worker thread always finishes on its own; this only stops the request
+# from waiting on it.
 DB_OPERATION_TIMEOUT = float(os.environ.get("DEADROP_DB_OPERATION_TIMEOUT", "15"))
 
 
@@ -669,17 +674,15 @@ async def _run_read(fn, *args):
     ContextVar propagation: captures the current context so that the per-request
     query buffer (metrics.py) is visible to timed_query decorators in the thread.
 
-    Hrana 404 retry: transient `stream not found` errors from Turso's Hrana
-    protocol are retried silently via db._execute_with_retry(). These happen
-    when a connection's stream id expires; reconnecting resolves it.
+    Turso outages are retried via db._execute_with_retry(), which is safe
+    here because the operation only reads.
     """
     loop = asyncio.get_event_loop()
     executor = db.get_read_executor()
     ctx = contextvars.copy_context()
 
-    # Wrap fn in retry logic for Hrana stream errors
     def _wrapped():
-        return db._execute_with_retry(lambda: fn(*args))
+        return db._execute_with_retry(lambda: fn(*args), idempotent=True)
 
     try:
         return await asyncio.wait_for(
@@ -687,21 +690,7 @@ async def _run_read(fn, *args):
             timeout=DB_OPERATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        import logging
-
-        logging.error(
-            f"DB read operation timed out after {DB_OPERATION_TIMEOUT}s, "
-            "replacing executors and resetting connection"
-        )
-        db._replace_db_executor()
-        new_executor = db.get_read_executor()
-        try:
-            await asyncio.wait_for(
-                loop.run_in_executor(new_executor, db._reset_libsql_connection),
-                timeout=5.0,
-            )
-        except Exception:
-            pass
+        logger.error(f"DB read operation timed out after {DB_OPERATION_TIMEOUT}s")
         raise HTTPException(503, "Database operation timed out — please retry")
 
 
@@ -714,37 +703,20 @@ async def _run_write(fn, *args):
     ContextVar propagation: captures the current context so that the per-request
     query buffer (metrics.py) is visible to timed_query decorators in the thread.
 
-    Hrana 404 retry: see _run_read. Same silent-retry behavior for writes.
+    Writes are not retried after a Turso timeout: the statement may have
+    applied. Failures that never reached Turso are retried by the client.
     """
     loop = asyncio.get_event_loop()
     executor = db.get_write_executor()
     ctx = contextvars.copy_context()
 
-    # Wrap fn in retry logic for Hrana stream errors
-    def _wrapped():
-        return db._execute_with_retry(lambda: fn(*args))
-
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(executor, ctx.run, _wrapped),
+            loop.run_in_executor(executor, ctx.run, fn, *args),
             timeout=DB_OPERATION_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        import logging
-
-        logging.error(
-            f"DB write operation timed out after {DB_OPERATION_TIMEOUT}s, "
-            "replacing executors and resetting connection"
-        )
-        db._replace_db_executor()
-        new_executor = db.get_write_executor()
-        try:
-            await asyncio.wait_for(
-                loop.run_in_executor(new_executor, db._reset_libsql_connection),
-                timeout=5.0,
-            )
-        except Exception:
-            pass
+        logger.error(f"DB write operation timed out after {DB_OPERATION_TIMEOUT}s")
         raise HTTPException(503, "Database operation timed out — please retry")
 
 
