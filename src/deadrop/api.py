@@ -1654,7 +1654,7 @@ class RoomWithMemberInfo(BaseModel):
     last_message_body: str | None = None
     last_message_from: str | None = None
     last_message_from_name: str | None = None
-    unread_count: int = 0
+    has_unread: bool = False
 
 
 class AddRoomMemberRequest(BaseModel):

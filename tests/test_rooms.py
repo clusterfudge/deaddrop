@@ -119,26 +119,28 @@ class TestRoomRetrieval:
         assert len(bob_rooms) == 1
         assert bob_rooms[0]["room_id"] == room2["room_id"]
 
-    def test_list_rooms_for_identity_unread_count(self):
-        """Each room carries the caller's unread count past their read cursor."""
+    def test_list_rooms_for_identity_has_unread(self):
+        """Each room flags whether the caller has messages past their read cursor."""
         ns = db.create_namespace()
         alice = db.create_identity(ns["ns"])
         bob = db.create_identity(ns["ns"])
         room = db.create_room(ns["ns"], alice["id"])
         db.add_room_member(room["room_id"], bob["id"])
 
-        def unread(identity_id):
+        def has_unread(identity_id):
             [r] = db.list_rooms_for_identity(ns["ns"], identity_id)
-            assert r["unread_count"] == db.get_room_unread_count(room["room_id"], identity_id)
-            return r["unread_count"]
+            assert bool(r["has_unread"]) == (
+                db.get_room_unread_count(room["room_id"], identity_id) > 0
+            )
+            return bool(r["has_unread"])
 
-        assert unread(bob["id"]) == 0
-        first = db.send_room_message(room["room_id"], alice["id"], "one")
-        db.send_room_message(room["room_id"], alice["id"], "two")
-        assert unread(bob["id"]) == 2
+        assert not has_unread(bob["id"])
+        db.send_room_message(room["room_id"], alice["id"], "one")
+        second = db.send_room_message(room["room_id"], alice["id"], "two")
+        assert has_unread(bob["id"])
 
-        db.update_room_read_cursor(room["room_id"], bob["id"], first["mid"])
-        assert unread(bob["id"]) == 1
+        db.update_room_read_cursor(room["room_id"], bob["id"], second["mid"])
+        assert not has_unread(bob["id"])
 
 
 class TestRoomUpdate:
