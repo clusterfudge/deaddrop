@@ -35,14 +35,5 @@
       "type": "image/png",
       "purpose": "maskable"
     }
-  ],
-  "shortcuts": [
-    {
-      "name": "Fritz twin inbox",
-      "short_name": "fritz",
-      "description": "Open the fritz twin namespace",
-      "url": "/app/fritz",
-      "icons": [{ "src": "/static/icons/icon-192.png", "sizes": "192x192" }]
-    }
   ]
 }
