@@ -27,6 +27,7 @@ def reset_database():
     # Temporarily disable foreign keys to allow dropping in any order
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.executescript("""
+        DROP TABLE IF EXISTS push_mutes;
         DROP TABLE IF EXISTS push_prefs;
         DROP TABLE IF EXISTS push_subscriptions;
         DROP TABLE IF EXISTS attachments;

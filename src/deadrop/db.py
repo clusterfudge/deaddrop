@@ -50,7 +50,7 @@ DEDUP_WINDOW_SECONDS = 60
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -860,6 +860,31 @@ def _migrate_008_add_push_prefs(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_009_add_push_mutes(conn: sqlite3.Connection) -> None:
+    """Migration 009: Add push_mutes — per-member push mutes for a room.
+
+    A row mutes push to ``identity_id`` for messages in ``room_id``; an empty
+    ``sender_id`` mutes the whole room, otherwise only that sender. Messages
+    are still delivered and counted as unread — only the push is skipped.
+    Keyed to the membership row, so leaving a room drops its mutes.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS push_mutes (
+            room_id TEXT NOT NULL,
+            identity_id TEXT NOT NULL,
+            sender_id TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (room_id, identity_id, sender_id),
+            FOREIGN KEY (room_id, identity_id)
+                REFERENCES room_members(room_id, identity_id) ON DELETE CASCADE
+        )
+    """,
+        name="migrate.009.create_push_mutes",
+    )
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
@@ -870,6 +895,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (6, "Add attachments table for binary content on messages", _migrate_006_add_attachments),
     (7, "Add push_subscriptions table for Web Push", _migrate_007_add_push_subscriptions),
     (8, "Add push_prefs table for per-identity push on/off", _migrate_008_add_push_prefs),
+    (9, "Add push_mutes table for per-room and per-sender mutes", _migrate_009_add_push_mutes),
 ]
 
 
@@ -1029,6 +1055,7 @@ def reset_db(conn: sqlite3.Connection | None = None):
     """Reset database (for testing)."""
     conn = _get_conn(conn)
     conn.executescript("""
+        DROP TABLE IF EXISTS push_mutes;
         DROP TABLE IF EXISTS push_prefs;
         DROP TABLE IF EXISTS push_subscriptions;
         DROP TABLE IF EXISTS attachments;
@@ -3835,6 +3862,75 @@ def set_push_enabled(
     )
     conn.commit()
     return bool(enabled)
+
+
+# --- Web Push Mutes ---
+
+
+@timed_query("set_push_mute")
+def set_push_mute(
+    room_id: str,
+    identity_id: str,
+    sender_id: str | None,
+    muted: bool,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Mute or unmute push for a room member. ``sender_id=None`` is the whole room.
+
+    Returns the stored state.
+    """
+    conn = _get_conn(conn)
+    if muted:
+        conn.execute(
+            """INSERT INTO push_mutes (room_id, identity_id, sender_id)
+               VALUES (?, ?, ?)
+               ON CONFLICT(room_id, identity_id, sender_id) DO NOTHING""",
+            (room_id, identity_id, sender_id or ""),
+            name="set_push_mute.insert",
+        )
+    else:
+        conn.execute(
+            "DELETE FROM push_mutes WHERE room_id = ? AND identity_id = ? AND sender_id = ?",
+            (room_id, identity_id, sender_id or ""),
+            name="set_push_mute.delete",
+        )
+    conn.commit()
+    return bool(muted)
+
+
+@timed_query("get_push_mutes")
+def get_push_mutes(
+    room_id: str,
+    identity_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
+    """A member's mutes in one room: ``{"room": bool, "senders": [ids]}``."""
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT sender_id FROM push_mutes
+           WHERE room_id = ? AND identity_id = ? ORDER BY sender_id""",
+        (room_id, identity_id),
+        name="get_push_mutes",
+    )
+    senders = [row[0] for row in cursor.fetchall()]
+    return {"room": "" in senders, "senders": [s for s in senders if s]}
+
+
+@timed_query("list_push_muted_recipients")
+def list_push_muted_recipients(
+    room_id: str,
+    sender_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> set[str]:
+    """Members who have muted ``room_id`` outright or muted ``sender_id`` in it."""
+    conn = _get_conn(conn)
+    cursor = conn.execute(
+        """SELECT DISTINCT identity_id FROM push_mutes
+           WHERE room_id = ? AND sender_id IN ('', ?)""",
+        (room_id, sender_id),
+        name="list_push_muted_recipients",
+    )
+    return {row[0] for row in cursor.fetchall()}
 
 
 BADGE_UNREAD_SQL = """SELECT

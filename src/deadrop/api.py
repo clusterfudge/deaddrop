@@ -1816,6 +1816,13 @@ class PushPrefsRequest(BaseModel):
     enabled: bool
 
 
+class PushMuteRequest(BaseModel):
+    """Mute push for one room, or for one sender in it when ``sender_id`` is set."""
+
+    muted: bool
+    sender_id: str | None = Field(default=None, max_length=64)
+
+
 # --- Room Helper Functions ---
 
 
@@ -2610,6 +2617,43 @@ async def set_push_prefs(
         functools.partial(db.set_push_enabled, ns, identity_id, request.enabled)
     )
     return {"ok": True, "enabled": enabled}
+
+
+@app.get("/{ns}/rooms/{room_id}/push/mutes")
+async def get_room_push_mutes(
+    ns: str,
+    room_id: str,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Read the calling member's push mutes for this room."""
+    room, identity_id = await _require_room_member(room_id, x_inbox_secret)
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+    return await _run_read(db.get_push_mutes, room_id, identity_id)
+
+
+@app.put("/{ns}/rooms/{room_id}/push/mutes")
+async def set_room_push_mute(
+    ns: str,
+    room_id: str,
+    request: PushMuteRequest,
+    x_inbox_secret: Annotated[str | None, Header()] = None,
+):
+    """Mute or unmute push for the calling member, on every device.
+
+    Without ``sender_id`` the whole room is muted; with it, only that sender's
+    messages. Muted messages are still delivered and still count as unread.
+    """
+    import functools
+
+    room, identity_id = await _require_room_member(room_id, x_inbox_secret)
+    if room["ns"] != ns:
+        raise HTTPException(404, "Room not found in this namespace")
+    await _run_write(
+        functools.partial(db.set_push_mute, room_id, identity_id, request.sender_id, request.muted)
+    )
+    mutes = await _run_read(db.get_push_mutes, room_id, identity_id)
+    return {"ok": True, **mutes}
 
 
 @app.post("/{ns}/push/test")

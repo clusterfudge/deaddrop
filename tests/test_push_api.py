@@ -687,3 +687,79 @@ class TestSubscribeDoesNotSuppressPush:
             assert len(stub_sender.calls) == 1
         finally:
             notifier.set_watcher(None)
+
+
+class TestMuteRoute:
+    @pytest.fixture
+    def shared_room(self, client, identities):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        alice_headers = {"X-Inbox-Secret": alice["secret"]}
+        room = client.post(
+            f"/{ns}/rooms", headers=alice_headers, json={"display_name": "twin"}
+        ).json()
+        client.post(
+            f"/{ns}/rooms/{room['room_id']}/members",
+            headers=alice_headers,
+            json={"identity_id": bob["id"]},
+        )
+        return room["room_id"]
+
+    def test_defaults_to_unmuted(self, client, identities, shared_room):
+        ns, bob = identities["ns"], identities["bob"]
+        body = client.get(
+            f"/{ns}/rooms/{shared_room}/push/mutes", headers={"X-Inbox-Secret": bob["secret"]}
+        ).json()
+        assert body == {"room": False, "senders": []}
+
+    def test_room_and_sender_mutes_round_trip(self, client, identities, shared_room):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        headers = {"X-Inbox-Secret": bob["secret"]}
+        url = f"/{ns}/rooms/{shared_room}/push/mutes"
+
+        put = client.put(url, headers=headers, json={"muted": True, "sender_id": alice["id"]})
+        assert put.json() == {"ok": True, "room": False, "senders": [alice["id"]]}
+
+        put = client.put(url, headers=headers, json={"muted": True})
+        assert put.json() == {"ok": True, "room": True, "senders": [alice["id"]]}
+
+        client.put(url, headers=headers, json={"muted": False})
+        client.put(url, headers=headers, json={"muted": False, "sender_id": alice["id"]})
+        assert client.get(url, headers=headers).json() == {"room": False, "senders": []}
+
+    def test_mute_is_per_member(self, client, identities, shared_room):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        url = f"/{ns}/rooms/{shared_room}/push/mutes"
+        client.put(url, headers={"X-Inbox-Secret": bob["secret"]}, json={"muted": True})
+
+        alice_view = client.get(url, headers={"X-Inbox-Secret": alice["secret"]}).json()
+        assert alice_view["room"] is False
+
+    def test_requires_membership(self, client, identities, admin_headers):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        room = client.post(
+            f"/{ns}/rooms",
+            headers={"X-Inbox-Secret": alice["secret"]},
+            json={"display_name": "private"},
+        ).json()
+        url = f"/{ns}/rooms/{room['room_id']}/push/mutes"
+
+        assert client.get(url).status_code == 401
+        outsider = client.put(url, headers={"X-Inbox-Secret": bob["secret"]}, json={"muted": True})
+        assert outsider.status_code == 403
+
+    def test_a_muted_room_still_receives_and_counts_messages(self, client, identities, shared_room):
+        ns, alice, bob = identities["ns"], identities["alice"], identities["bob"]
+        bob_headers = {"X-Inbox-Secret": bob["secret"]}
+        client.put(
+            f"/{ns}/rooms/{shared_room}/push/mutes", headers=bob_headers, json={"muted": True}
+        )
+
+        client.post(
+            f"/{ns}/rooms/{shared_room}/messages",
+            headers={"X-Inbox-Secret": alice["secret"]},
+            json={"body": "still here"},
+        )
+
+        messages = client.get(f"/{ns}/rooms/{shared_room}/messages", headers=bob_headers).json()
+        assert [m["body"] for m in messages["messages"]] == ["still here"]
+        assert client.get(f"/{ns}/push/prefs", headers=bob_headers).json()["badge"] == 1

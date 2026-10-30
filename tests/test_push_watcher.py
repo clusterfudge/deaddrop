@@ -1334,3 +1334,121 @@ class TestBadgeCountsDirectMessages:
         db.archive_message(room["ns"], room["bob"], message["mid"])
 
         assert db.count_unread_for_identity(room["ns"], room["bob"]) == 0
+
+
+@pytest.mark.asyncio
+class TestMutes:
+    """A muted room, or a muted sender in it, never stages a push for that member."""
+
+    async def test_a_muted_room_sends_nothing(self, room):
+        _subscribe(room, room["bob"])
+        db.set_push_mute(room["room_id"], room["bob"], None, True)
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"], "twin"
+        )
+        await asyncio.sleep(0.2)
+
+        assert sender.sent == []
+        assert watcher.pending_keys == set()
+        assert watcher.cooldown_keys == set()
+
+    async def test_a_muted_sender_is_skipped_and_others_still_push(self, room):
+        carol = db.create_identity(room["ns"], metadata={"display_name": "Carol"})["id"]
+        db.add_room_member(room["room_id"], carol)
+        _subscribe(room, room["bob"])
+        db.set_push_mute(room["room_id"], room["bob"], room["alice"], True)
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"], "bot noise"), room["alice"]
+        )
+        await asyncio.sleep(0.1)
+        assert sender.sent == []
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, carol, "real news"), carol, "twin"
+        )
+        await asyncio.sleep(0.2)
+
+        assert len(sender.sent) == 1
+        notification = sender.sent[0][1]["notification"]
+        assert notification["title"] == "Carol in twin"
+        assert notification["body"] == "real news"
+
+    async def test_muted_messages_do_not_inflate_the_follow_up_count(self, room):
+        carol = db.create_identity(room["ns"], metadata={"display_name": "Carol"})["id"]
+        db.add_room_member(room["room_id"], carol)
+        _subscribe(room, room["bob"])
+        db.set_push_mute(room["room_id"], room["bob"], room["alice"], True)
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg(debounce=0.3))
+
+        await watcher.on_room_message(room["ns"], room["room_id"], _send(room, carol, "a"), carol)
+        await asyncio.sleep(0.1)
+        await watcher.on_room_message(room["ns"], room["room_id"], _send(room, carol, "b"), carol)
+        for _ in range(3):
+            await watcher.on_room_message(
+                room["ns"], room["room_id"], _send(room, room["alice"], "noise"), room["alice"]
+            )
+        await asyncio.sleep(0.5)
+
+        assert [p["notification"]["body"] for _, p in sender.sent] == ["a", "b"]
+
+    async def test_a_mute_is_per_member(self, room):
+        carol = db.create_identity(room["ns"], metadata={"display_name": "Carol"})["id"]
+        db.add_room_member(room["room_id"], carol)
+        _subscribe(room, room["bob"])
+        _subscribe(room, carol, endpoint="https://push.example.com/sub/carol")
+        db.set_push_mute(room["room_id"], room["bob"], None, True)
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
+        )
+        await asyncio.sleep(0.2)
+
+        assert [sub["identity_id"] for sub, _ in sender.sent] == [carol]
+
+    async def test_unmuting_restores_push(self, room):
+        _subscribe(room, room["bob"])
+        db.set_push_mute(room["room_id"], room["bob"], None, True)
+        db.set_push_mute(room["room_id"], room["bob"], None, False)
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+
+        await watcher.on_room_message(
+            room["ns"], room["room_id"], _send(room, room["alice"]), room["alice"]
+        )
+        await asyncio.sleep(0.2)
+
+        assert len(sender.sent) == 1
+
+
+class TestMuteStorage:
+    def test_get_reports_room_and_sender_mutes(self, room):
+        db.set_push_mute(room["room_id"], room["bob"], None, True)
+        db.set_push_mute(room["room_id"], room["bob"], room["alice"], True)
+        db.set_push_mute(room["room_id"], room["bob"], room["alice"], True)
+
+        assert db.get_push_mutes(room["room_id"], room["bob"]) == {
+            "room": True,
+            "senders": [room["alice"]],
+        }
+
+    def test_muted_recipients_matches_room_or_sender(self, room):
+        db.set_push_mute(room["room_id"], room["bob"], room["alice"], True)
+
+        assert db.list_push_muted_recipients(room["room_id"], room["alice"]) == {room["bob"]}
+        assert db.list_push_muted_recipients(room["room_id"], "someone-else") == set()
+
+    def test_leaving_the_room_drops_its_mutes(self, room):
+        db.set_push_mute(room["room_id"], room["bob"], None, True)
+        db.remove_room_member(room["room_id"], room["bob"])
+        db.add_room_member(room["room_id"], room["bob"])
+
+        assert db.get_push_mutes(room["room_id"], room["bob"]) == {"room": False, "senders": []}
