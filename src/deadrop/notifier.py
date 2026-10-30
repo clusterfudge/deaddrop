@@ -88,6 +88,11 @@ Three independent reasons not to send, checked at each delivery:
 * the recipient has been active inside the presence window,
 * the identity has turned push off (``push_prefs``).
 
+A fourth is checked once, at fan-out rather than delivery: a member who has
+muted the room, or the sender within it (``push_mutes``), is never staged.
+Keeping muted messages out of the throttle means they neither open a window
+nor inflate the "+N more" count of an unmuted sender's push.
+
 The first two can flip on the next message, so neither opens a cooldown:
 suppressing closes the window and the next message is judged afresh.
 
@@ -433,6 +438,7 @@ class UnreadWatcher:
             return
         try:
             members = await _read(db.list_room_members, room_id)
+            muted = await _read(db.list_push_muted_recipients, room_id, sender_id)
         except Exception:
             logger.warning("push fan-out could not list members of %s", room_id, exc_info=True)
             return
@@ -449,6 +455,9 @@ class UnreadWatcher:
         for member in members:
             identity_id = member["identity_id"]
             if identity_id == sender_id:
+                continue
+            if identity_id in muted:
+                instrument.sink.counter("push.suppressed.muted")
                 continue
             if is_caught_up(member.get("last_read_mid"), mid):
                 # Cursor is already past this message (or unusable) — the

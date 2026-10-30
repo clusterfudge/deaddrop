@@ -74,6 +74,21 @@ const DeadropPush = {
         });
     },
 
+    /** This member's push mutes for one room: `{ room, senders }`. */
+    async roomMutes(credentials, roomId) {
+        return DeadropAPI.request('GET', `/${credentials.ns}/rooms/${roomId}/push/mutes`, {
+            credentials,
+        });
+    },
+
+    /** Mute or unmute push for a room, or for one sender in it. */
+    async setRoomMute(credentials, roomId, muted, senderId = null) {
+        return DeadropAPI.request('PUT', `/${credentials.ns}/rooms/${roomId}/push/mutes`, {
+            credentials,
+            body: { muted, sender_id: senderId },
+        });
+    },
+
     /**
      * Mirror the server's unread total onto the app icon.
      *

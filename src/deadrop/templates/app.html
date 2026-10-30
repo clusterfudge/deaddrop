@@ -110,6 +110,7 @@
                     <span class="spinner" aria-hidden="true"></span>
                     <span>Catching up…</span>
                 </div>
+                <button id="room-mute-btn" class="btn btn-icon hidden" onclick="toggleRoomMute()" title="Mute notifications for this room" aria-label="Mute notifications for this room" aria-pressed="false">🔔</button>
                 <button id="room-panel-btn" class="btn btn-icon" title="Attachments and search" aria-label="Attachments and search">🗂</button>
                 <button class="theme-toggle" id="theme-toggle-btn-room-chat" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle color theme">🌙</button>
                 <button id="room-refresh-btn" class="btn btn-icon" title="Refresh messages" aria-label="Refresh messages">🔄</button>
@@ -1092,6 +1093,43 @@
         }
     }
 
+    // Per-room mute: the room still delivers and counts unread, only push is
+    // skipped. Hidden until the server answers, so a failed read shows nothing.
+    function renderRoomMute(muted) {
+        const btn = document.getElementById('room-mute-btn');
+        btn.textContent = muted ? '\u{1F515}' : '\u{1F514}';
+        btn.title = muted ? 'Room muted — tap to unmute notifications' : 'Mute notifications for this room';
+        btn.setAttribute('aria-label', btn.title);
+        btn.setAttribute('aria-pressed', muted ? 'true' : 'false');
+        btn.classList.remove('hidden');
+    }
+
+    async function refreshRoomMute(roomId) {
+        document.getElementById('room-mute-btn').classList.add('hidden');
+        try {
+            const mutes = await DeadropPush.roomMutes(credentials, roomId);
+            if (currentRoomId === roomId) renderRoomMute(mutes.room);
+        } catch (e) {
+            // Leave the button hidden.
+        }
+    }
+
+    async function toggleRoomMute() {
+        const roomId = currentRoomId;
+        if (!credentials || !roomId) return;
+        const btn = document.getElementById('room-mute-btn');
+        btn.disabled = true;
+        try {
+            const muted = btn.getAttribute('aria-pressed') !== 'true';
+            const mutes = await DeadropPush.setRoomMute(credentials, roomId, muted);
+            if (currentRoomId === roomId) renderRoomMute(mutes.room);
+        } catch (e) {
+            alert(e.message);
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
     // ==================== OPEN NAMESPACE ====================
     
     async function openNamespace(slug) {
@@ -1389,6 +1427,8 @@
         showView('roomChat');
         document.getElementById('room-message-list').innerHTML =
             '<div class="loading"><div class="spinner"></div></div>';
+
+        refreshRoomMute(roomId);
 
         // Fetch room details, members, AND messages in parallel
         try {
