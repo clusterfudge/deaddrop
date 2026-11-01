@@ -243,6 +243,65 @@ class TestAnswerPreview:
         assert notifier._preview(body, "text/markdown") == "the answer: is 42 answer the door"
 
 
+class TestLinkElision:
+    """Links spend no body space on URLs; the room message is untouched."""
+
+    def test_markdown_link_keeps_its_text(self):
+        body = "see [PR #125](https://github.com/clusterfudge/deaddrop/pull/125) now"
+        assert notifier._elide_links(body) == "see PR #125 now"
+
+    def test_multiple_links(self):
+        body = "[a](https://a.com/x) and [b](https://b.org/y?z=1)"
+        assert notifier._elide_links(body) == "a and b"
+
+    def test_bare_url_becomes_its_host(self):
+        body = "look https://github.com/clusterfudge/deaddrop/pull/125."
+        assert notifier._elide_links(body) == "look github.com."
+
+    def test_url_in_parens_keeps_the_closing_paren(self):
+        assert notifier._elide_links("(see https://example.com/a/b)") == "(see example.com)"
+
+    def test_balanced_parens_stay_in_the_url(self):
+        body = "[wiki](https://en.wikipedia.org/wiki/Foo_(bar)) ok"
+        assert notifier._elide_links(body) == "wiki ok"
+
+    def test_image_keeps_its_alt_text(self):
+        assert notifier._elide_links("![diagram](https://x.com/d.png)") == "diagram"
+
+    def test_image_without_alt_text_reads_as_an_attachment(self):
+        assert notifier._elide_links("![](https://x.com/d.png)") == "📎 Attachment"
+
+    def test_code_spans_are_left_alone(self):
+        body = "run `curl https://x.com/a` and `[x](y)`"
+        assert notifier._elide_links(body) == body
+
+    def test_message_that_is_only_a_url(self):
+        assert notifier._elide_links("https://www.github.com/foo/bar") == "github.com"
+
+    def test_link_without_text_falls_back_to_the_host(self):
+        assert notifier._elide_links("[](https://docs.python.org/3/)") == "docs.python.org"
+
+    def test_nested_brackets_in_link_text(self):
+        body = "[see [PR] #12](https://github.com/x)"
+        assert notifier._elide_links(body) == "see [PR] #12"
+
+    def test_non_link_brackets_are_preserved(self):
+        body = "- [x] done [ ] todo [note] (later)"
+        assert notifier._elide_links(body) == body
+
+    def test_link_title_and_autolink(self):
+        assert notifier._elide_links('[t](https://a.com "Title")') == "t"
+        assert notifier._elide_links("<https://example.com/z>") == "example.com"
+
+    def test_unparseable_url_is_kept(self):
+        assert notifier._elide_links("http://[bad") == "http://[bad"
+
+    def test_elision_runs_before_truncation(self):
+        words = "w" * 80
+        url = "https://github.com/clusterfudge/deaddrop/pull/125/files#diff-0123456789"
+        assert notifier._preview(f"{words} {url}", "text/markdown") == f"{words} github.com"
+
+
 @pytest.mark.asyncio
 class TestWatcherFires:
     async def test_push_sent_after_the_unread_window(self, room):
@@ -262,6 +321,24 @@ class TestWatcherFires:
         assert notification["body"] == "PR is green"
         assert notification["navigate"] == f"/app/twin/room/{room['room_id']}"
         assert notification["tag"] == f"room:{room['room_id']}"
+
+    async def test_push_body_elides_links_but_the_message_keeps_them(self, room):
+        _subscribe(room, room["bob"])
+        sender = RecordingSender()
+        watcher = notifier.UnreadWatcher(sender=sender, config=_cfg())
+        body = (
+            "PR [#125](https://github.com/clusterfudge/deaddrop/pull/125) is green; "
+            "diff at https://github.com/clusterfudge/deaddrop/pull/125/files"
+        )
+        message = _send(room, room["alice"], body)
+
+        await watcher.on_room_message(room["ns"], room["room_id"], message, room["alice"], "twin")
+        await asyncio.sleep(0.2)
+
+        assert len(sender.sent) == 1
+        assert sender.sent[0][1]["notification"]["body"] == "PR #125 is green; diff at github.com"
+        stored = db.get_room_messages(room["room_id"])
+        assert [m["body"] for m in stored] == [body]
 
     async def test_question_card_push_reads_as_its_heading(self, room):
         _subscribe(room, room["bob"])
