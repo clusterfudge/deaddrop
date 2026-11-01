@@ -111,6 +111,7 @@ import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from . import db, instrument, push
 
@@ -191,6 +192,63 @@ def _strip_answer_lines(body: str) -> str:
     return "\n".join(human) if any(line.strip() for line in human) else body
 
 
+# Links are elided so the body limit is spent on words: a markdown link
+# keeps its text, an image keeps its alt text, and a bare URL is reduced to
+# its host. Code spans are matched first and left verbatim.
+_CODE_SPAN_RE = re.compile(r"(`+).+?\1", re.S)
+_MD_LINK_RE = re.compile(
+    r"(!?)\[((?:[^\[\]]|\[[^\[\]]*\])*)\]"  # [text], one level of nested brackets
+    r"\(\s*<?([^\s()<>]*(?:\([^\s()]*\)[^\s()<>]*)*)>?"  # (dest, balanced parens
+    r"(?:\s+\"[^\"]*\")?\s*\)"  # optional "title")
+)
+_BARE_URL_RE = re.compile(r"<?https?://[^\s<>]+>?")
+_URL_TRAILING = ".,;:!?'\""
+
+
+def _host(url: str) -> str:
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+    return host.removeprefix("www.")
+
+
+def _shorten_url(match: re.Match) -> str:
+    url = match.group(0).strip("<>")
+    tail = ""
+    while url and (
+        url[-1] in _URL_TRAILING or (url[-1] == ")" and url.count(")") > url.count("("))
+    ):
+        url, tail = url[:-1], url[-1] + tail
+    return (_host(url) or url) + tail
+
+
+def _replace_link(match: re.Match) -> str:
+    is_image, text, dest = match.groups()
+    if text.strip():
+        return text
+    if is_image:
+        return "📎 Attachment"
+    return _host(dest)
+
+
+def _elide_links_in_prose(text: str) -> str:
+    text = _MD_LINK_RE.sub(_replace_link, text)
+    return _BARE_URL_RE.sub(_shorten_url, text)
+
+
+def _elide_links(text: str) -> str:
+    """Replace markdown links, images and bare URLs with their short form."""
+    out: list[str] = []
+    pos = 0
+    for span in _CODE_SPAN_RE.finditer(text):
+        out.append(_elide_links_in_prose(text[pos : span.start()]))
+        out.append(span.group(0))
+        pos = span.end()
+    out.append(_elide_links_in_prose(text[pos:]))
+    return "".join(out)
+
+
 def _preview(body: str, content_type: str | None) -> str:
     """One-line lock-screen preview of a message body."""
     if content_type and content_type.startswith("image/"):
@@ -201,7 +259,7 @@ def _preview(body: str, content_type: str | None) -> str:
         body = _question_preview(body)
     else:
         body = _strip_answer_lines(body)
-    text = " ".join((body or "").split())
+    text = " ".join(_elide_links(body or "").split())
     if not text:
         return "New message"
     if len(text) > _BODY_LIMIT:
