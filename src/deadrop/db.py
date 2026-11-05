@@ -1609,10 +1609,63 @@ def _insert_secret_version(
     )
 
 
+# Pre-versioning code authenticates from ``identities.secret_hash`` (and only
+# the original secret, since it derives the id from it). Keep that column
+# equal to version 1's hash while v1 is live and unmatchable once v1 is
+# burned, so a code rollback cannot bring a burned secret back.
+_V1_LEGACY_HASH = (
+    "CASE WHEN s.status = 'burned' THEN 'retired:' || s.secret_hash ELSE s.secret_hash END"
+)
+
+
 def _bump_auth_generation(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE auth_generation SET gen = gen + 1 WHERE id = 1", name="auth_generation.bump"
     )
+    conn.execute(
+        f"""UPDATE identities SET secret_hash = (
+               SELECT {_V1_LEGACY_HASH} FROM identity_secrets s
+               WHERE s.ns = identities.ns AND s.identity_id = identities.id AND s.version = 1)
+           WHERE EXISTS (
+               SELECT 1 FROM identity_secrets s
+               WHERE s.ns = identities.ns AND s.identity_id = identities.id AND s.version = 1
+               AND identities.secret_hash IS NOT {_V1_LEGACY_HASH})""",
+        name="identities.mirror_v1_hash",
+    )
+
+
+_UNVERSIONED_IDENTITIES = """FROM identities i
+    WHERE NOT EXISTS (
+        SELECT 1 FROM identity_secrets s WHERE s.ns = i.ns AND s.identity_id = i.id)
+    AND NOT EXISTS (SELECT 1 FROM identity_secrets s WHERE s.secret_hash = i.secret_hash)"""
+
+
+def seed_unversioned_identities(conn: sqlite3.Connection | None = None) -> int:
+    """Give a version-1 row to every identity that has no secret versions.
+
+    Pre-versioning code inserts into ``identities`` only, so an identity it
+    creates after migration 010 (during a deploy overlap, or while rolled
+    back) would otherwise never authenticate here. Its id is
+    ``sha256(secret)[:16]`` and its ``secret_hash`` is current, so this is
+    the same seeding migration 010 did. One read when there is nothing to do.
+    """
+    c = _get_conn(conn)
+    row = c.execute(
+        f"SELECT COUNT(*) {_UNVERSIONED_IDENTITIES}", name="identity_secrets.count_unversioned"
+    ).fetchone()
+    if not row or not row[0]:
+        return 0
+    c.execute(
+        f"""INSERT OR IGNORE INTO identity_secrets
+            (secret_hash, ns, identity_id, version, status, created_at)
+            SELECT i.secret_hash, i.ns, i.id, 1, 'active',
+                   COALESCE(i.created_at, CURRENT_TIMESTAMP)
+            {_UNVERSIONED_IDENTITIES}""",
+        name="identity_secrets.seed_unversioned",
+    )
+    _bump_auth_generation(c)
+    c.commit()
+    return int(row[0])
 
 
 def get_auth_generation(conn: sqlite3.Connection | None = None) -> int | None:
@@ -1814,12 +1867,15 @@ def flush_secret_activity(conn: sqlite3.Connection | None = None) -> None:
     """
     from .cache import secret_map
 
+    c = _get_conn(conn)
+    seeded = seed_unversioned_identities(c)
     burned, seen = secret_map.take_activity()
     now = time.time()
     due_grace = secret_map.has_due_grace(now)
     if not burned and not seen and not due_grace:
+        if seeded:
+            refresh_secret_map()
         return
-    c = _get_conn(conn)
     for secret_hash, (count, ts) in burned.items():
         c.execute(
             """UPDATE identity_secrets SET burned_attempts = burned_attempts + ?,
@@ -1843,7 +1899,7 @@ def flush_secret_activity(conn: sqlite3.Connection | None = None) -> None:
         )
         _bump_auth_generation(c)
     c.commit()
-    if due_grace:
+    if due_grace or seeded:
         refresh_secret_map()
 
 

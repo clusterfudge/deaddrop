@@ -403,6 +403,47 @@ def test_new_identity_from_another_process_is_found_on_miss(world):
     assert db.authenticate_secret(secret, world["ns"]) == ("feedfacefeedface", None)
 
 
+def test_identity_written_by_pre_versioning_code_is_seeded(client, world):
+    """Old code (deploy overlap, rollback) inserts into identities only."""
+    db.load_secret_map()
+    legacy = generate_secret()
+    c = _raw_conn()
+    c.execute(
+        "INSERT INTO identities (id, ns, secret_hash) VALUES (?, ?, ?)",
+        (derive_id(legacy), world["ns"], hash_secret(legacy)),
+        name="test",
+    )
+    c.commit()
+    inbox = f"/{world['ns']}/inbox/{derive_id(legacy)}"
+    assert client.get(inbox, headers={"X-Inbox-Secret": legacy}).status_code == 403
+
+    db.flush_secret_activity()  # the refresh tick
+    assert client.get(inbox, headers={"X-Inbox-Secret": legacy}).status_code == 200
+    assert db.seed_unversioned_identities() == 0  # nothing left: one read, no write
+
+
+def test_burned_v1_is_unmatchable_in_the_legacy_column(client, world):
+    """A code rollback authenticates from identities.secret_hash; burned must stay burned."""
+    w, sid = world, world["sean"]["id"]
+
+    def legacy_column():
+        row = _raw_conn().execute(
+            "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
+            (w["ns"], sid),
+            name="test",
+        )
+        return row.fetchone()[0]
+
+    v1_hash = hash_secret(w["sean"]["secret"])
+    new = _rekey(client, w, sid)
+    assert legacy_column() == v1_hash  # v1 still live until v2's first use
+    assert _msgs(client, w, new["secret"]).status_code == 200
+    assert legacy_column() == "retired:" + v1_hash
+    resp = client.post(f"/{w['ns']}/identities/{sid}/secrets/1/rollback", headers=w["nsh"])
+    assert resp.status_code == 200, resp.text
+    assert legacy_column() == v1_hash
+
+
 # --- recovery invites and PIN ------------------------------------------------------
 
 
