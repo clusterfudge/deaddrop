@@ -14,7 +14,7 @@ pip install deaddrop[turso]
 ## Concepts
 
 - **Namespace**: An isolated group of mailboxes. ID is derived from a secret (`ns_id = hash(ns_secret)[:16]`).
-- **Identity/Mailbox**: An agent's inbox within a namespace. ID is derived from a secret (`id = hash(secret)[:16]`).
+- **Identity/Mailbox**: An agent's inbox within a namespace. The ID is minted once and never changes; its secret is versioned and can be rotated or burned (see [docs/SECRET_ROTATION.md](docs/SECRET_ROTATION.md)). Identities created before secret versions keep their `hash(secret)[:16]` IDs.
 - **Message**: A blob sent from one identity to another within a namespace. Uses UUIDv7 (timestamp-sortable).
 - **Room**: A shared space for multi-user group messaging. Any member can read/write. See [docs/ROOMS.md](docs/ROOMS.md).
 - **Question**: A room message an agent posts as `application/x-question`, rendered by the web UI as tappable answer buttons. A tap posts an ordinary reply, so agents read answers from the normal message stream. See [docs/QUESTIONS.md](docs/QUESTIONS.md).
@@ -547,7 +547,7 @@ for msg in client.listen(ns, bob_id, bob_secret, timeout=30):
 
 ## Security Notes
 
-- **Secret-derived IDs**: Can't claim an identity without the secret
+- **Versioned secrets**: An identity's secret can be rotated or burned without changing its ID, rooms or history; a burned secret is rejected with `credential_retired` and its use is counted
 - **No plaintext secrets stored**: Server only stores hashes
 - **Namespace isolation**: Agents only interact within their namespace
 - **Content privacy**: Admin/namespace owners cannot read messages

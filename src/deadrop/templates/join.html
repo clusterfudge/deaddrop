@@ -30,6 +30,12 @@
                 </div>
             </div>
             
+            <div id="pin-row" class="hidden" style="margin-bottom: 12px;">
+                <label for="pin-input" class="invite-detail-label">Recovery PIN</label>
+                <input id="pin-input" type="password" inputmode="numeric" autocomplete="off"
+                       style="width: 100%;">
+            </div>
+
             <button id="accept-btn" class="btn btn-primary" style="width: 100%;">
                 Accept Invitation
             </button>
@@ -72,6 +78,10 @@
             document.getElementById('ttl-info').textContent = 
                 info.namespace_ttl_hours === 0 ? 'Persistent' : `${info.namespace_ttl_hours}h after read`;
             
+            if (info.requires_pin) {
+                document.getElementById('pin-row').classList.remove('hidden');
+            }
+
             loading.classList.add('hidden');
             inviteInfo.classList.remove('hidden');
         } catch (e) {
@@ -104,7 +114,8 @@
         
         try {
             // Claim the invite
-            const result = await DeadropAPI.claimInvite(inviteId);
+            const pin = document.getElementById('pin-input').value || null;
+            const result = await DeadropAPI.claimInvite(inviteId, pin);
             
             // Decrypt the secret using key from URL fragment
             const secret = await DeadropCrypto.decryptInviteSecret(
