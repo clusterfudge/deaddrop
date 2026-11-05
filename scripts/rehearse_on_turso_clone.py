@@ -182,12 +182,12 @@ def cmd_verify() -> None:
 
 
 def cmd_migrate() -> None:
-    """Exactly what the lifespan hook runs before serving: init_db + seeding."""
+    """What the lifespan hook runs before serving (init_db), then the v1 check."""
     code = (
         "import time; from deadrop import db; t = time.monotonic(); db.init_db();"
-        " n = db.seed_unversioned_identities();"
+        " n = len(db.identities_without_v1());"
         " print(f'migrated to v{db.get_schema_version()} in {time.monotonic() - t:.1f}s;'"
-        " f' late-seeded {n}')"
+        " f' identities without a v1 row: {n}')"
     )
     sys.exit(
         subprocess.call(

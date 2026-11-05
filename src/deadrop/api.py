@@ -105,7 +105,6 @@ async def lifespan(app: FastAPI):
     configure_logging()
 
     db.init_db()
-    db.seed_unversioned_identities()
 
     # Background monitor: resolves Turso hostname and TCP-probes each IP
     # every 15s. Surfaces the "DNS returns a dead IP" scenario (2026-05-08

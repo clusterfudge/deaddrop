@@ -36,6 +36,23 @@ deadrop rekey recovery <ns> <id> [--email ADDR] [--clear-email] [--set-pin]
 deadrop rekey unlock <ns> <id>                 # clear a PIN lockout
 ```
 
+## Deploy overlap and rollback
+
+Code from before secret versions writes `identities` only. An identity it
+creates after migration 010 (an old container still serving during a deploy
+overlap, or a code rollback) has no version 1 and gets 403 on the new code
+until seeded by hand; nothing seeds it automatically. On the server host
+(it reads `DEADROP_DB` / `TURSO_URL` directly):
+
+```bash
+deadrop rekey verify            # lists such identities; exit 1 if any
+deadrop rekey seed <ns> <id>    # its current secret becomes version 1
+```
+
+Old code authenticates from `identities.secret_hash`. That column mirrors
+version 1 (unmatchable once burned), so a rollback cannot revive a burned
+secret.
+
 `rekey` mints version N+1. Older versions keep working until N+1 first
 authenticates; then they are burned (or move to `grace` for `--grace`
 seconds). `--revoke-now` burns them at mint time. Only a request that hashes

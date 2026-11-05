@@ -403,23 +403,37 @@ def test_new_identity_from_another_process_is_found_on_miss(world):
     assert db.authenticate_secret(secret, world["ns"]) == ("feedfacefeedface", None)
 
 
-def test_identity_written_by_pre_versioning_code_is_seeded(client, world):
+def test_identity_written_by_pre_versioning_code_stays_locked_out_until_seeded(
+    client, world, capsys
+):
     """Old code (deploy overlap, rollback) inserts into identities only."""
+    from deadrop import cli
+
     db.load_secret_map()
     legacy = generate_secret()
+    lid = derive_id(legacy)
     c = _raw_conn()
     c.execute(
         "INSERT INTO identities (id, ns, secret_hash) VALUES (?, ?, ?)",
-        (derive_id(legacy), world["ns"], hash_secret(legacy)),
+        (lid, world["ns"], hash_secret(legacy)),
         name="test",
     )
     c.commit()
-    inbox = f"/{world['ns']}/inbox/{derive_id(legacy)}"
+    inbox = f"/{world['ns']}/inbox/{lid}"
+    db.flush_secret_activity()  # the refresh tick does not seed
     assert client.get(inbox, headers={"X-Inbox-Secret": legacy}).status_code == 403
 
-    db.flush_secret_activity()  # the refresh tick
+    with pytest.raises(SystemExit) as exc:
+        cli.rekey_verify_cmd()
+    assert exc.value.code == 1
+    assert f"{world['ns']}  {lid}" in capsys.readouterr().out
+
+    cli.rekey_seed_cmd(world["ns"], lid)
+    db.refresh_secret_map()
     assert client.get(inbox, headers={"X-Inbox-Secret": legacy}).status_code == 200
-    assert db.seed_unversioned_identities() == 0  # nothing left: one read, no write
+    assert (world["ns"], lid) not in db.identities_without_v1()
+    assert not db.seed_v1(world["ns"], lid)  # already seeded
+    assert not db.seed_v1(world["ns"], "0000000000000000")  # no such identity
 
 
 def test_burned_v1_is_unmatchable_in_the_legacy_column(client, world):

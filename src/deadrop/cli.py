@@ -2238,6 +2238,34 @@ def rekey_status_cmd(ns: str):
     print(f"{len(rows)} identities")
 
 
+@rekey_app.command(name="verify")
+def rekey_verify_cmd():
+    """List identities with no version-1 secret (they cannot authenticate). Exit 1 if any.
+
+    Reads the database directly (DEADROP_DB / TURSO_URL), so run it where the server runs.
+    Pre-versioning code creates such identities after migration 010; fix with `rekey seed`.
+    """
+    from . import db
+
+    missing = db.identities_without_v1()
+    for ns, identity_id in missing:
+        print(f"{ns}  {identity_id}")
+    print(f"{len(missing)} identities without a v1 secret")
+    if missing:
+        sys.exit(1)
+
+
+@rekey_app.command(name="seed")
+def rekey_seed_cmd(ns: str, identity_id: str):
+    """Give one identity listed by `rekey verify` its current secret as version 1."""
+    from . import db
+
+    if not db.seed_v1(ns, identity_id):
+        print(f"{identity_id}  not found, or already has a v1 secret", file=sys.stderr)
+        sys.exit(1)
+    print(f"{identity_id}  seeded v1")
+
+
 @rekey_app.command(name="invite")
 def rekey_invite_cmd(
     ns: str,

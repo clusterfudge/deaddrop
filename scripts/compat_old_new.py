@@ -12,11 +12,14 @@ database instead (a rehearsal clone, never production).
 Scenarios:
   A  old server writes the DB (v9), new server starts (runs migration 010):
      old identities authenticate, ids unchanged, rooms/history readable.
-  B  overlap: both servers up; identities created on the OLD server after the
-     migration authenticate on the NEW server (and survive its restart).
+  B  overlap: both servers up; an identity created on the OLD server after the
+     migration reads on the old server and is REJECTED (403) on the new one,
+     also after a restart. Accepted: it stays locked out until seeded by hand.
   C  rollback: new server stopped, old server against the v10 DB: old
      identities work; identities created by new code (random ids) do not.
   D  rollback after a rekey: the burned v1 secret on the old server.
+  E  `deadrop rekey verify` lists exactly the identities old code created after
+     the migration; `deadrop rekey seed` unlocks them on the new server.
 """
 
 from __future__ import annotations
@@ -140,6 +143,18 @@ def room_roundtrip(
     return code, room
 
 
+def cli(env: dict[str, str], *args: str) -> tuple[int, str]:
+    """Run the NEW tree's `deadrop rekey ...` against the shared database."""
+    p = subprocess.run(
+        [str(NEW_TREE / ".venv/bin/deadrop"), "rekey", *args],
+        env=env,
+        cwd=NEW_TREE / "src",
+        capture_output=True,
+        text=True,
+    )
+    return p.returncode, p.stdout
+
+
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="dd-compat-"))
     env = {k: v for k, v in os.environ.items() if not k.startswith("DEADROP_")}
@@ -182,13 +197,13 @@ def main() -> int:
         check("B1 old: overlap identity reads on old", can_read(old, ns, o3) == 200)
         time.sleep(2.5)
         c = can_read(new, ns, o3)
-        check("B2 new: overlap identity (created by old) authenticates", c == 200, f"{c}")
+        check("B2 new: overlap identity (created by old) rejected [accepted]", c == 403, f"{c}")
         code, _ = room_roundtrip(new, ns, o1, o3)
-        check("B3 new: overlap identity posts to room", code == 200, f"{code}")
+        check("B3 new: overlap identity cannot post [accepted]", code == 403, f"{code}")
         new.stop()
         new.start()
         c = can_read(new, ns, o3)
-        check("B4 new after restart: overlap identity authenticates", c == 200, f"{c}")
+        check("B4 new after restart: overlap identity still rejected", c == 403, f"{c}")
 
         n1 = identity(new, ns, nsec)
         check("B5 new: new identity works on new", can_read(new, ns, n1) == 200)
@@ -230,7 +245,20 @@ def main() -> int:
         # roll forward again: identity o4 made by old code while rolled back
         new.start()
         c = can_read(new, ns, o4)
-        check("C5 re-deploy new: identity created during rollback authenticates", c == 200, f"{c}")
+        check("C5 re-deploy new: identity created during rollback rejected", c == 403, f"{c}")
+
+        # --- E: the manual procedure ---
+        code, out = cli(new_env, "verify")
+        listed = {line.split()[1] for line in out.splitlines() if line.startswith(ns)}
+        check("E1 verify lists exactly the old-code identities", listed == {o3["id"], o4["id"]})
+        check("E2 verify exits 1 while any are listed", code == 1, f"{code}")
+        for ident in (o3, o4):
+            cli(new_env, "seed", ns, ident["id"])
+        time.sleep(2.5)
+        c3, c4 = can_read(new, ns, o3), can_read(new, ns, o4)
+        check("E3 new: seeded identities authenticate", c3 == c4 == 200, f"{c3} {c4}")
+        code, out = cli(new_env, "verify")
+        check("E4 verify after seeding: 0", code == 0 and out.startswith("0 identities"), out)
     finally:
         old.stop()
         new.stop()
