@@ -1914,6 +1914,41 @@ def _ttl_seconds(value: str) -> int:
     return int(value)
 
 
+def _rekey_ns_config(ns: str) -> NamespaceConfig:
+    """Local namespace config by id; else by slug or display name; else by unique id prefix."""
+    exact = NamespaceConfig.load(ns)
+    if exact is not None:
+        return exact
+    configs = [c for c in map(NamespaceConfig.load, sorted(NamespaceConfig.list_all())) if c]
+    key = ns.casefold()
+    named = [
+        c
+        for c in configs
+        if key
+        in {
+            str(n).casefold()
+            for n in (c.metadata.get("slug"), c.display_name, c.metadata.get("display_name"))
+            if n
+        }
+    ]
+    matches = named or [c for c in configs if ns and c.ns.startswith(ns)]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        print(f"Error: namespace {ns!r} is ambiguous; pass one of these ids:", file=sys.stderr)
+    else:
+        print(
+            f"Error: no local namespace matches {ns!r} (id, slug, display name, id prefix).",
+            file=sys.stderr,
+        )
+        if configs:
+            print("Local namespaces:", file=sys.stderr)
+    for c in matches or configs:
+        name = c.display_name or c.metadata.get("display_name") or "-"
+        print(f"  {c.ns}  {name}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def _rekey_http(method: str, path: str, ns_cfg: NamespaceConfig, json_data=None):
     cfg = get_config()
     resp = httpx.request(
@@ -2074,6 +2109,8 @@ def _rekey_one(
     credential_map: dict[str, dict],
     credential_store: str,
     pin: str | None = None,
+    rotated: list[str] | None = None,
+    credential_map_path: str | None = None,
 ) -> dict:
     data = _rekey_http(
         "POST",
@@ -2103,6 +2140,8 @@ def _rekey_one(
         display_name = None
         ns_cfg.add_mailbox(id=identity_id, secret=secret)
     _save_ns_config(ns_cfg)
+    if rotated is not None:
+        rotated.append(identity_id)
 
     burned = ",".join(str(v) for v in data["burned_versions"]) or "-"
     print(f"{identity_id}  v{data['version']} minted  burned={burned}")
@@ -2112,6 +2151,16 @@ def _rekey_one(
         print(
             f"  credential {entry['credential']}.{entry['field']}: {'updated' if ok else 'FAILED'}"
         )
+        if not ok:
+            print(
+                f"Error: {identity_id} is rotated (new secret in {ns_cfg.get_path()}) but"
+                f" credential {entry['credential']} still holds the old one. Fix the store, then"
+                f" run: deadrop rekey identity {ns_cfg.ns} {identity_id}"
+                f" --credential-map {credential_map_path} --credential-store {credential_store}"
+                f"  (or with a PIN on file: deadrop rekey invite {ns_cfg.ns} {identity_id})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     elif invite:
         path = _mint_recovery_invite(
             ns_cfg,
@@ -2151,8 +2200,9 @@ def rekey_identity_cmd(
     Fix-forward: identities in --credential-map get the new secret PATCHed
     into the credential store; the rest get a single-use recovery invite
     written to a 0600 file (and piped to --deliver-cmd's stdin, if given).
+    A failed credential-store update exits 1 with the recovery command.
     """
-    ns_cfg = get_namespace_config(ns)
+    ns_cfg = _rekey_ns_config(ns)
     _rekey_one(
         ns_cfg,
         identity_id,
@@ -2166,6 +2216,7 @@ def rekey_identity_cmd(
         credential_map=_load_credential_map(credential_map),
         credential_store=credential_store,
         pin=_prompt_pin() if set_pin and not dry_run else None,
+        credential_map_path=credential_map,
     )
 
 
@@ -2188,38 +2239,77 @@ def rekey_all_cmd(
 
     --dry-run prints one line per identity (id, version counts, rooms, fix-forward
     route) and changes nothing.
+
+    Unless --no-invite, every target outside --credential-map needs a recovery
+    PIN; if any lacks one, nothing is rotated (dry run included). A failure
+    mid-run, including a failed credential-store update, stops the run and
+    lists which identities were rotated and which were not.
     """
-    ns_cfg = get_namespace_config(ns)
-    identities = _rekey_http("GET", f"/{ns}/identities", ns_cfg).json()
+    ns_cfg = _rekey_ns_config(ns)
+    identities = _rekey_http("GET", f"/{ns_cfg.ns}/identities", ns_cfg).json()
     skip = set(exclude or [])
     targets = [i["id"] for i in identities if i["id"] not in skip]
     cmap = _load_credential_map(credential_map)
     mode = "DRY RUN" if dry_run else ("REVOKE NOW" if revoke_now else f"grace={grace}s")
-    print(f"namespace {ns}: {len(targets)} identities ({len(skip)} excluded)  [{mode}]")
-    done = 0
-    for identity_id in targets:
-        _rekey_one(
-            ns_cfg,
-            identity_id,
-            grace=grace,
-            revoke_now=revoke_now,
-            dry_run=dry_run,
-            invite=invite,
-            invite_ttl=invite_ttl,
-            invite_dir=Path(invite_dir) if invite_dir else _default_invite_dir(),
-            deliver_cmd=deliver_cmd,
-            credential_map=cmap,
-            credential_store=credential_store,
-        )
-        done += 1
-    print(f"{done}/{len(targets)} {'planned' if dry_run else 'rekeyed'}")
+    print(f"namespace {ns_cfg.ns}: {len(targets)} identities ({len(skip)} excluded)  [{mode}]")
+    if invite and any(t not in cmap for t in targets):
+        rows = _rekey_http("GET", f"/{ns_cfg.ns}/rekeys", ns_cfg).json()
+        pin_set = {r["identity_id"]: r["pin_set"] for r in rows}
+        no_pin = [t for t in targets if t not in cmap and not pin_set.get(t)]
+        if no_pin:
+            print(
+                f"Error: {len(no_pin)} identities would get a recovery invite but have no PIN;"
+                " nothing was rotated:",
+                file=sys.stderr,
+            )
+            for identity_id in no_pin:
+                print(f"  {identity_id}", file=sys.stderr)
+            print(
+                "Set a PIN (rekey recovery --set-pin), map them (--credential-map),"
+                " --exclude them, or pass --no-invite.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    rotated: list[str] = []
+    current = ""
+    try:
+        for current in targets:
+            _rekey_one(
+                ns_cfg,
+                current,
+                grace=grace,
+                revoke_now=revoke_now,
+                dry_run=dry_run,
+                invite=invite,
+                invite_ttl=invite_ttl,
+                invite_dir=Path(invite_dir) if invite_dir else _default_invite_dir(),
+                deliver_cmd=deliver_cmd,
+                credential_map=cmap,
+                credential_store=credential_store,
+                rotated=rotated,
+                credential_map_path=credential_map,
+            )
+    except BaseException:
+        if not dry_run:
+            print(f"ABORTED at {current}: {len(rotated)}/{len(targets)} rotated", file=sys.stderr)
+            for identity_id in rotated:
+                note = "  (fix-forward did not finish)" if identity_id == current else ""
+                print(
+                    f"  rotated      {identity_id}  new secret in {ns_cfg.get_path()}{note}",
+                    file=sys.stderr,
+                )
+            for identity_id in targets:
+                if identity_id not in rotated:
+                    print(f"  NOT rotated  {identity_id}", file=sys.stderr)
+        raise
+    print(f"{len(targets)}/{len(targets)} {'planned' if dry_run else 'rekeyed'}")
 
 
 @rekey_app.command(name="status")
 def rekey_status_cmd(ns: str):
     """Per identity: secret versions, stale use of burned ones, PIN, recovery invites."""
-    ns_cfg = get_namespace_config(ns)
-    rows = _rekey_http("GET", f"/{ns}/rekeys", ns_cfg).json()
+    ns_cfg = _rekey_ns_config(ns)
+    rows = _rekey_http("GET", f"/{ns_cfg.ns}/rekeys", ns_cfg).json()
     for r in rows:
         inv = r.get("recovery_invites", {})
         pin = "locked" if r["pin_locked"] else ("set" if r["pin_set"] else "none")
@@ -2281,7 +2371,7 @@ def rekey_invite_cmd(
     The server revokes any earlier unclaimed recovery invite for it. The
     secret comes from the namespace config.
     """
-    ns_cfg = get_namespace_config(ns)
+    ns_cfg = _rekey_ns_config(ns)
     mb = ns_cfg.mailboxes.get(identity_id)
     if mb is None:
         print(f"Error: {identity_id} not in local namespace config", file=sys.stderr)
@@ -2304,10 +2394,10 @@ def rekey_burn_cmd(ns: str, identity_id: str, secret_version: int, *, yes: bool 
 
     The server refuses to burn the identity's last live version without --yes.
     """
-    ns_cfg = get_namespace_config(ns)
+    ns_cfg = _rekey_ns_config(ns)
     data = _rekey_http(
         "POST",
-        f"/{ns}/identities/{identity_id}/secrets/{secret_version}/burn",
+        f"/{ns_cfg.ns}/identities/{identity_id}/secrets/{secret_version}/burn",
         ns_cfg,
         json_data={"confirm_last_version": yes},
     ).json()
@@ -2320,9 +2410,9 @@ def rekey_rollback_cmd(ns: str, identity_id: str, secret_version: int, *, yes: b
     if not yes:
         print("Rollback re-enables a possibly compromised secret. Re-run with --yes.")
         sys.exit(1)
-    ns_cfg = get_namespace_config(ns)
+    ns_cfg = _rekey_ns_config(ns)
     data = _rekey_http(
-        "POST", f"/{ns}/identities/{identity_id}/secrets/{secret_version}/rollback", ns_cfg
+        "POST", f"/{ns_cfg.ns}/identities/{identity_id}/secrets/{secret_version}/rollback", ns_cfg
     ).json()
     print(f"{identity_id}  v{secret_version} active  live_versions={data['live_versions']}")
 
@@ -2337,10 +2427,10 @@ def rekey_recovery_cmd(
     set_pin: bool = False,
 ):
     """Set an identity's recovery email (default invite delivery target) and/or PIN."""
-    ns_cfg = get_namespace_config(ns)
+    ns_cfg = _rekey_ns_config(ns)
     data = _rekey_http(
         "PUT",
-        f"/{ns}/identities/{identity_id}/recovery",
+        f"/{ns_cfg.ns}/identities/{identity_id}/recovery",
         ns_cfg,
         json_data={
             "recovery_email": email,
@@ -2357,6 +2447,6 @@ def rekey_recovery_cmd(
 @rekey_app.command(name="unlock")
 def rekey_unlock_cmd(ns: str, identity_id: str):
     """Clear a recovery-PIN lockout (after too many wrong PINs)."""
-    ns_cfg = get_namespace_config(ns)
-    _rekey_http("POST", f"/{ns}/identities/{identity_id}/pin/unlock", ns_cfg)
+    ns_cfg = _rekey_ns_config(ns)
+    _rekey_http("POST", f"/{ns_cfg.ns}/identities/{identity_id}/pin/unlock", ns_cfg)
     print(f"{identity_id}  pin unlocked")
