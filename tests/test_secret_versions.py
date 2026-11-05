@@ -248,6 +248,10 @@ def test_manual_burn_and_rollback(client, world):
     w, sid = world, world["sean"]["id"]
     base = f"/{w['ns']}/identities/{sid}/secrets"
     resp = client.post(f"{base}/1/burn", headers=w["nsh"])
+    assert resp.status_code == 409 and "last live secret" in resp.json()["detail"]
+    assert _msgs(client, w, w["sean"]["secret"]).status_code == 200  # refused: still live
+    confirm = {"confirm_last_version": True}
+    resp = client.post(f"{base}/1/burn", headers=w["nsh"], json=confirm)
     assert resp.status_code == 200 and resp.json()["live_versions"] == 0
     assert _msgs(client, w, w["sean"]["secret"]).status_code == 403  # write-through, no refresh
     assert client.post(f"{base}/1/burn", headers=w["nsh"]).status_code == 409
@@ -256,6 +260,44 @@ def test_manual_burn_and_rollback(client, world):
 
     assert client.post(f"{base}/1/rollback", headers=w["nsh"]).status_code == 200
     assert _msgs(client, w, w["sean"]["secret"]).status_code == 200
+
+
+def test_burning_a_non_last_version_needs_no_confirm(client, world):
+    w, sid, old = world, world["sean"]["id"], world["sean"]["secret"]
+    new = _rekey(client, w, sid)
+    base = f"/{w['ns']}/identities/{sid}/secrets"
+    resp = client.post(f"{base}/1/burn", headers=w["nsh"])
+    assert resp.status_code == 200 and resp.json()["live_versions"] == 1
+    assert _msgs(client, w, old).status_code == 403
+    assert client.post(f"{base}/2/burn", headers=w["nsh"]).status_code == 409  # now the last
+    assert _msgs(client, w, new["secret"]).status_code == 200
+
+
+def test_expired_grace_does_not_count_as_live(client, world):
+    w, sid = world, world["sean"]["id"]
+    new = _rekey(client, w, sid, grace_seconds=1)
+    assert _msgs(client, w, new["secret"]).status_code == 200  # v1 -> grace
+    time.sleep(1.1)
+    base = f"/{w['ns']}/identities/{sid}/secrets"
+    assert client.post(f"{base}/2/burn", headers=w["nsh"]).status_code == 409
+
+
+def test_cli_burn_sends_confirm_only_with_yes(monkeypatch, capsys):
+    from deadrop import cli
+
+    sent = []
+
+    class Resp:
+        def json(self):
+            return {"live_versions": 0}
+
+    monkeypatch.setattr(cli, "get_namespace_config", lambda ns: object())
+    monkeypatch.setattr(
+        cli, "_rekey_http", lambda *a, json_data=None: sent.append(json_data) or Resp()
+    )
+    cli.rekey_burn_cmd("ns", "ident", 1)
+    cli.rekey_burn_cmd("ns", "ident", 1, yes=True)
+    assert sent == [{"confirm_last_version": False}, {"confirm_last_version": True}]
 
 
 def test_rollback_survives_restart(client, world):

@@ -1222,6 +1222,10 @@ class RekeyRequest(BaseModel):
     pin: str | None = Field(default=None, max_length=128)
 
 
+class BurnRequest(BaseModel):
+    confirm_last_version: bool = False
+
+
 class RecoveryRequest(BaseModel):
     recovery_email: str | None = Field(default=None, max_length=320)
     clear_recovery_email: bool = False
@@ -1267,11 +1271,17 @@ def burn_identity_secret(
     ns: str,
     identity_id: str,
     version: int,
+    request: BurnRequest | None = None,
     x_namespace_secret: Annotated[str | None, Header()] = None,
 ):
-    """Mark one secret version burned. Requires namespace secret."""
+    """Mark one secret version burned. Requires namespace secret.
+
+    Burning the identity's last live version is a 409 unless
+    ``confirm_last_version`` is set.
+    """
     require_namespace_secret(ns, x_namespace_secret)
-    return _rekey_call(rekey.burn, ns, identity_id, version)
+    confirm = bool(request and request.confirm_last_version)
+    return _rekey_call(rekey.burn, ns, identity_id, version, confirm_last=confirm)
 
 
 @app.post("/{ns}/identities/{identity_id}/secrets/{version}/rollback")

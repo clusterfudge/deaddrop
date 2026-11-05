@@ -30,7 +30,7 @@ deadrop rekey identity <ns> <id> [--grace 600 | --revoke-now] [--set-pin] --deli
 deadrop rekey all <ns> --credential-map agents.json --deliver-cmd '<sender>'
 deadrop rekey status <ns>                      # versions, stale use, PIN, invite claims
 deadrop rekey invite <ns> <id> --deliver-cmd '<sender>'   # fresh recovery invite
-deadrop rekey burn <ns> <id> <version>         # burn one version by hand
+deadrop rekey burn <ns> <id> <version> [--yes]  # burn one version; --yes if it is the last live one
 deadrop rekey rollback <ns> <id> <version> --yes
 deadrop rekey recovery <ns> <id> [--email ADDR] [--clear-email] [--set-pin]
 deadrop rekey unlock <ns> <id>                 # clear a PIN lockout

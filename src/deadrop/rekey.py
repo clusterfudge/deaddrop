@@ -184,7 +184,16 @@ def rekey_identity(
     }
 
 
-def _set_status(ns: str, identity_id: str, version: int, status: str) -> dict:
+def _is_live(v: dict, now: str) -> bool:
+    """``active``, or ``grace`` before its deadline (ISO strings compare in order)."""
+    if v["status"] == "grace":
+        return v["grace_until"] is None or v["grace_until"] > now
+    return v["status"] == "active"
+
+
+def _set_status(
+    ns: str, identity_id: str, version: int, status: str, *, confirm_last: bool = False
+) -> dict:
     db = _db()
     c = db.get_connection()
     _identity(c, ns, identity_id)
@@ -193,6 +202,19 @@ def _set_status(ns: str, identity_id: str, version: int, status: str) -> dict:
         raise RekeyError(404, "Secret version not found")
     if rows[version]["status"] == status:
         raise RekeyError(409, f"Version {version} is already {status}")
+    now = _now().isoformat()
+    if (
+        status == "burned"
+        and not confirm_last
+        and _is_live(rows[version], now)
+        and not any(_is_live(v, now) for n, v in rows.items() if n != version)
+    ):
+        raise RekeyError(
+            409,
+            f"Version {version} is the last live secret of {identity_id}; burning it "
+            "leaves the identity with no usable secret. Set confirm_last_version "
+            "(CLI: --yes) to burn it anyway, or rekey first.",
+        )
     if status == "burned":
         c.execute(
             """UPDATE identity_secrets SET status = 'burned', burned_at = ?
@@ -213,9 +235,12 @@ def _set_status(ns: str, identity_id: str, version: int, status: str) -> dict:
     return {"identity_id": identity_id, "version": version, "status": status, "live_versions": live}
 
 
-def burn(ns: str, identity_id: str, version: int) -> dict:
-    """Mark one secret version burned. Takes effect in this process at once."""
-    return _set_status(ns, identity_id, version, "burned")
+def burn(ns: str, identity_id: str, version: int, *, confirm_last: bool = False) -> dict:
+    """Mark one secret version burned. Takes effect in this process at once.
+
+    Burning the identity's last live version is refused unless ``confirm_last``.
+    """
+    return _set_status(ns, identity_id, version, "burned", confirm_last=confirm_last)
 
 
 def rollback(ns: str, identity_id: str, version: int) -> dict:

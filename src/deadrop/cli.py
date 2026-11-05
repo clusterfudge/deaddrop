@@ -2270,11 +2270,17 @@ def rekey_invite_cmd(
 
 
 @rekey_app.command(name="burn")
-def rekey_burn_cmd(ns: str, identity_id: str, secret_version: int):
-    """Mark one secret version burned (rejected everywhere, stale use counted)."""
+def rekey_burn_cmd(ns: str, identity_id: str, secret_version: int, *, yes: bool = False):
+    """Mark one secret version burned (rejected everywhere, stale use counted).
+
+    The server refuses to burn the identity's last live version without --yes.
+    """
     ns_cfg = get_namespace_config(ns)
     data = _rekey_http(
-        "POST", f"/{ns}/identities/{identity_id}/secrets/{secret_version}/burn", ns_cfg
+        "POST",
+        f"/{ns}/identities/{identity_id}/secrets/{secret_version}/burn",
+        ns_cfg,
+        json_data={"confirm_last_version": yes},
     ).json()
     print(f"{identity_id}  v{secret_version} burned  live_versions={data['live_versions']}")
 
