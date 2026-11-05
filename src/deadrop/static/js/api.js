@@ -28,7 +28,14 @@ const DeadropAPI = {
         
         if (!response.ok) {
             const error = await response.json().catch(() => ({ detail: response.statusText }));
-            throw new Error(error.detail || 'Request failed');
+            const detail = error.detail || 'Request failed';
+            if (response.status === 403 && String(detail).startsWith('credential_retired')) {
+                throw new Error(
+                    "This device's credential was retired (its secret was rotated). " +
+                    'Ask for a recovery invite.'
+                );
+            }
+            throw new Error(detail);
         }
         
         return response.json();
@@ -44,8 +51,9 @@ const DeadropAPI = {
     /**
      * Claim an invite.
      */
-    async claimInvite(inviteId) {
-        return this.request('POST', `/api/invites/${inviteId}/claim`);
+    async claimInvite(inviteId, pin = null) {
+        const body = pin ? { pin } : null;
+        return this.request('POST', `/api/invites/${inviteId}/claim`, { body });
     },
 
     /**

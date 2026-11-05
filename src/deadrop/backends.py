@@ -18,7 +18,6 @@ from typing import Any
 import yaml
 
 from . import db
-from .auth import derive_id
 from .discovery import ensure_gitignore, get_deaddrop_init_path
 
 
@@ -547,11 +546,6 @@ class Backend(ABC):
 
     # --- Utility Methods ---
 
-    def verify_identity_secret(self, ns: str, identity_id: str, secret: str) -> bool:
-        """Verify an identity secret is valid."""
-        # Default implementation derives ID from secret
-        return derive_id(secret) == identity_id
-
     def close(self) -> None:
         """Close any resources held by the backend."""
         pass
@@ -592,6 +586,13 @@ class LocalBackend(Backend):
     - config.yaml: Namespace registry with secrets
     - data.db: SQLite database (same schema as server)
     """
+
+    def _caller(self, ns: str, secret: str) -> str:
+        """Resolve the calling identity from its secret (any live version)."""
+        identity_id = db.verify_identity_in_namespace(ns, secret, conn=self._conn)
+        if not identity_id:
+            raise PermissionError("Invalid inbox secret")
+        return identity_id
 
     def __init__(self, path: Path, create_if_missing: bool = False):
         """Initialize local backend.
@@ -888,7 +889,7 @@ class LocalBackend(Backend):
         room_id: str,
         secret: str,
     ) -> dict[str, Any] | None:
-        identity_id = derive_id(secret)
+        identity_id = self._caller(ns, secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
 
@@ -919,7 +920,7 @@ class LocalBackend(Backend):
         identity_id: str,
         secret: str,
     ) -> dict[str, Any]:
-        caller_id = derive_id(secret)
+        caller_id = self._caller(ns, secret)
         if not db.is_room_member(room_id, caller_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
 
@@ -939,7 +940,7 @@ class LocalBackend(Backend):
         identity_id: str,
         secret: str,
     ) -> bool:
-        caller_id = derive_id(secret)
+        caller_id = self._caller(ns, secret)
 
         # Can remove self or must be a member to remove others
         if caller_id != identity_id:
@@ -954,7 +955,7 @@ class LocalBackend(Backend):
         room_id: str,
         secret: str,
     ) -> list[dict[str, Any]]:
-        identity_id = derive_id(secret)
+        identity_id = self._caller(ns, secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
 
@@ -973,7 +974,7 @@ class LocalBackend(Backend):
         content_type: str = "text/plain",
         reference_mid: str | None = None,
     ) -> dict[str, Any]:
-        from_id = derive_id(secret)
+        from_id = self._caller(ns, secret)
         if not db.is_room_member(room_id, from_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
 
@@ -994,7 +995,7 @@ class LocalBackend(Backend):
         before_mid: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        identity_id = derive_id(secret)
+        identity_id = self._caller(ns, secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
 
@@ -1013,7 +1014,7 @@ class LocalBackend(Backend):
         secret: str,
         last_read_mid: str,
     ) -> bool:
-        identity_id = derive_id(secret)
+        identity_id = self._caller(ns, secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
 
@@ -1025,7 +1026,7 @@ class LocalBackend(Backend):
         room_id: str,
         secret: str,
     ) -> int:
-        identity_id = derive_id(secret)
+        identity_id = self._caller(ns, secret)
         if not db.is_room_member(room_id, identity_id, conn=self._conn):
             raise PermissionError("Not a member of this room")
 

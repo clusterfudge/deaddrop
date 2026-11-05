@@ -15,6 +15,10 @@ periodic background refreshes.
 - Writes: API handlers call invalidation helpers after mutations
 - No TTL expiration needed (LRU eviction prevents unbounded memory growth)
 - Admin cache-bust endpoint available for manual recovery
+
+The identity secret table (``secret_map``) is the exception: a burned secret
+must stop working in every process, so it also follows the database's
+``auth_generation`` counter (see ``deadrop.db.refresh_secret_map``).
 """
 
 from __future__ import annotations
@@ -39,7 +43,6 @@ T = TypeVar("T")
 # Cache size limits
 ROOM_CACHE_SIZE = int(os.environ.get("DEADROP_ROOM_CACHE_SIZE", 1000))
 MEMBERSHIP_CACHE_SIZE = int(os.environ.get("DEADROP_MEMBERSHIP_CACHE_SIZE", 10000))
-IDENTITY_CACHE_SIZE = int(os.environ.get("DEADROP_IDENTITY_CACHE_SIZE", 5000))
 
 # Cache warming configuration
 CACHE_WARMING_ENABLED = os.environ.get("DEADROP_CACHE_WARMING", "1").lower() in (
@@ -187,10 +190,136 @@ class TTLCache:
             }
 
 
+@dataclass(frozen=True)
+class SecretEntry:
+    """One version of an identity's secret, as the auth lookup table holds it.
+
+    ``switch_grace`` is set on a version minted by a rekey: its first
+    authenticated use moves every older live version of the identity to
+    ``grace`` for that many seconds (``0`` burns them at once). ``seen`` is
+    whether that use has happened (``last_seen_at`` is set).
+    """
+
+    ns: str
+    identity_id: str
+    version: int
+    status: str  # active | grace | burned
+    grace_until: float | None = None
+    seen: bool = False
+    switch_grace: int | None = None
+
+    def effective_status(self, now: float) -> str:
+        """``grace`` past its deadline is ``burned``, in every process alike."""
+        if self.status == "grace" and self.grace_until is not None and now >= self.grace_until:
+            return "burned"
+        return self.status
+
+
+class SecretMap:
+    """In-process ``sha256(secret) -> SecretEntry`` table for identity auth.
+
+    Loaded whole at startup and refreshed when the ``auth_generation`` row
+    moves (see :func:`deadrop.db.refresh_secret_map`). No LRU: once
+    ``loaded`` it is authoritative, so a hash it does not hold is rejected
+    without a database read (beyond a throttled generation check).
+
+    Activity that is not auth-relevant (stale use of a burned secret, last
+    use of a live one) is buffered here and flushed by the refresh tick, so
+    a flood of stale requests costs no per-request write.
+    """
+
+    SEEN_FLUSH_INTERVAL = 300.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_hash: dict[str, SecretEntry] = {}
+        self.loaded = False
+        self.generation: int | None = None
+        self.last_refresh = 0.0
+        self._burned_hits: dict[str, tuple[int, float]] = {}
+        self._seen: dict[str, float] = {}
+        self._seen_flushed: dict[str, float] = {}
+
+    def get(self, secret_hash: str) -> SecretEntry | None:
+        entry = self._by_hash.get(secret_hash)
+        if entry is None:
+            metrics.record_cache_miss("secret_map")
+        else:
+            metrics.record_cache_hit("secret_map")
+        return entry
+
+    def replace_all(self, entries: dict[str, SecretEntry], generation: int | None) -> None:
+        with self._lock:
+            self._by_hash = dict(entries)
+            self.generation = generation
+            self.loaded = True
+
+    def replace_identity(self, ns: str, identity_id: str, entries: dict[str, SecretEntry]) -> None:
+        with self._lock:
+            by_hash = {
+                h: e
+                for h, e in self._by_hash.items()
+                if not (e.ns == ns and e.identity_id == identity_id)
+            }
+            by_hash.update(entries)
+            self._by_hash = by_hash
+
+    def drop_identity(self, ns: str, identity_id: str) -> None:
+        self.replace_identity(ns, identity_id, {})
+
+    def entries_for(self, ns: str, identity_id: str) -> dict[str, SecretEntry]:
+        return {
+            h: e for h, e in self._by_hash.items() if e.ns == ns and e.identity_id == identity_id
+        }
+
+    def has_due_grace(self, now: float) -> bool:
+        return any(
+            e.status == "grace" and e.grace_until is not None and now >= e.grace_until
+            for e in self._by_hash.values()
+        )
+
+    def note_burned(self, secret_hash: str) -> None:
+        with self._lock:
+            count, _ = self._burned_hits.get(secret_hash, (0, 0.0))
+            self._burned_hits[secret_hash] = (count + 1, time.time())
+
+    def note_seen(self, secret_hash: str) -> None:
+        now = time.time()
+        if now - self._seen_flushed.get(secret_hash, 0.0) < self.SEEN_FLUSH_INTERVAL:
+            return
+        with self._lock:
+            self._seen[secret_hash] = now
+
+    def take_activity(self) -> tuple[dict[str, tuple[int, float]], dict[str, float]]:
+        with self._lock:
+            burned, self._burned_hits = self._burned_hits, {}
+            seen, self._seen = self._seen, {}
+            for h, ts in seen.items():
+                self._seen_flushed[h] = ts
+        return burned, seen
+
+    def clear(self) -> None:
+        with self._lock:
+            self._by_hash = {}
+            self.loaded = False
+            self.generation = None
+            self.last_refresh = 0.0
+            self._burned_hits = {}
+            self._seen = {}
+            self._seen_flushed = {}
+
+    def stats(self) -> dict:
+        return {
+            "size": len(self._by_hash),
+            "loaded": self.loaded,
+            "generation": self.generation,
+        }
+
+
 # Global cache instances
 room_cache = TTLCache(name="room", max_size=ROOM_CACHE_SIZE)
 membership_cache = TTLCache(name="membership", max_size=MEMBERSHIP_CACHE_SIZE)
-identity_hash_cache = TTLCache(name="identity_hash", max_size=IDENTITY_CACHE_SIZE)
+secret_map = SecretMap()
 
 
 # --- Write-through invalidation helpers ---
@@ -216,7 +345,7 @@ def invalidate_identity(ns: str, identity_id: str) -> None:
     This does a broad membership invalidation because an identity's
     memberships span multiple rooms and we don't track which ones.
     """
-    identity_hash_cache.delete(f"identity:{ns}:{identity_id}")
+    secret_map.drop_identity(ns, identity_id)
     membership_cache.invalidate_prefix("member:")
 
 
@@ -224,7 +353,7 @@ def clear_all_caches() -> None:
     """Clear all caches.  Used by the admin cache-bust endpoint and tests."""
     room_cache.clear()
     membership_cache.clear()
-    identity_hash_cache.clear()
+    secret_map.clear()
     logger.info("All caches cleared")
 
 
@@ -278,15 +407,8 @@ async def warm_caches(conn: sqlite3.Connection | None = None) -> dict[str, int]:
             member_items[f"member:{row[0]}:{row[1]}"] = True
         results["memberships"] = membership_cache.set_bulk(member_items)
 
-        # Warm identity hash cache
-        cursor = c.execute(
-            "SELECT ns, id, secret_hash FROM identities", name="cache_warm.identities"
-        )
-        rows = cursor.fetchall()
-        identity_items = {}
-        for row in rows:
-            identity_items[f"identity:{row[0]}:{row[1]}"] = row[2]
-        results["identities"] = identity_hash_cache.set_bulk(identity_items)
+        # Load the identity secret lookup table (secret hash -> identity)
+        results["identities"] = db.load_secret_map(conn)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         msg = (

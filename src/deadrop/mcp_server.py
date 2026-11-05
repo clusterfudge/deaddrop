@@ -5,7 +5,7 @@ The transport is the reference ``StreamableHTTPSessionManager`` in stateless
 JSON mode: one request in, one JSON-RPC response out, no server-side session
 state.
 
-The credential is an ordinary inbox secret, verified against the ``identities``
+The credential is an ordinary inbox secret, verified against the secret lookup
 table exactly as an ``X-Inbox-Secret`` header would be, and the tools act as
 that identity: its namespace, its rooms, its attribution. There is no
 server-side configuration and no fallback identity, so adding a connection is

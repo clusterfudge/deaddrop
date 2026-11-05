@@ -854,10 +854,14 @@ def identity_create(
     ns: str,
     display_name: str | None = None,
     metadata_json: str | None = None,
+    recovery_email: str | None = None,
+    set_pin: bool = False,
 ):
     """Create a new identity (mailbox) in a namespace.
 
     Creates the mailbox on the server and saves credentials to namespace config.
+    --recovery-email is the default delivery target for recovery invites;
+    --set-pin prompts for the recovery PIN.
     """
     ns_cfg = get_namespace_config(ns)
     cfg = get_config()
@@ -872,10 +876,18 @@ def identity_create(
     url = f"{cfg.url}/{ns}/identities"
     headers = {"X-Namespace-Secret": ns_cfg.secret}
 
+    body: dict = {}
+    if metadata:
+        body["metadata"] = metadata
+    if recovery_email:
+        body["recovery_email"] = recovery_email
+    if set_pin:
+        body["pin"] = _prompt_pin()
+
     response = httpx.post(
         url,
         headers=headers,
-        json={"metadata": metadata} if metadata else None,
+        json=body or None,
         timeout=30.0,
     )
 
@@ -1751,6 +1763,7 @@ def serve(
         print("  DEADROP_ADMIN_TOKEN=.. Legacy static token", file=sys.stderr)
         sys.exit(1)
 
+    os.environ.setdefault("DEADROP_MIGRATE_ON_START", "1")
     uvicorn.run(
         "deadrop.api:app",
         host=host,
@@ -1875,3 +1888,475 @@ def room_messages(
         body = msg.get("body", "")
         created = msg.get("created_at", "")[:19]
         print(f"[{created}] {from_id}: {body}")
+
+
+# ============================================================================
+# Secret rotation (rekey), burns and recovery
+# ============================================================================
+#
+# Secrets handled here (new secret versions, invite URLs, PINs) are never
+# printed. They go to the namespace config (where the CLI already keeps
+# mailbox secrets), to the credential store, to a 0600 file, or to
+# --deliver-cmd's stdin; PINs are read with getpass. Output is ids, versions,
+# counts, states and file paths.
+
+rekey_app = cyclopts.App(name="rekey", help="Secret rotation, burns and recovery invites")
+app.command(rekey_app)
+
+DEFAULT_CREDENTIAL_STORE = "http://localhost:9876"
+
+
+def _ttl_seconds(value: str) -> int:
+    value = value.lower().strip()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if value and value[-1] in units:
+        return int(value[:-1]) * units[value[-1]]
+    return int(value)
+
+
+def _rekey_http(method: str, path: str, ns_cfg: NamespaceConfig, json_data=None):
+    cfg = get_config()
+    resp = httpx.request(
+        method,
+        f"{cfg.url}{path}",
+        headers={"X-Namespace-Secret": ns_cfg.secret},
+        json=json_data,
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail")
+        except Exception:
+            detail = None
+        print(f"Error {resp.status_code} on {method} {path}: {detail}", file=sys.stderr)
+        sys.exit(1)
+    return resp
+
+
+def _save_ns_config(ns_cfg: NamespaceConfig) -> None:
+    ns_cfg.save()
+    os.chmod(ns_cfg.get_path(), 0o600)
+
+
+def _write_private(directory: Path, name: str, content: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = directory / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(content + "\n")
+    return path
+
+
+def _default_invite_dir() -> Path:
+    return get_config_dir() / "recovery"
+
+
+def _prompt_pin() -> str:
+    import getpass
+
+    pin = getpass.getpass("Recovery PIN: ")
+    if pin != getpass.getpass("Repeat PIN: "):
+        print("Error: PINs differ", file=sys.stderr)
+        sys.exit(1)
+    return pin
+
+
+def _load_credential_map(path: str | None) -> dict[str, dict]:
+    """``{"<identity id>": {"credential": "<store id>", "field": "<field>"}}``."""
+    if not path:
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    for identity_id, entry in data.items():
+        if not isinstance(entry, dict) or not entry.get("credential") or not entry.get("field"):
+            print(
+                f"Error: credential map entry for {identity_id} needs credential+field",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    return data
+
+
+def _push_credential(store: str, credential: str, field: str, secret: str) -> bool:
+    """Merge the new secret into one field of a credential-store entry (PATCH)."""
+    try:
+        resp = httpx.patch(
+            f"{store}/api/credentials/{credential}",
+            json={"fields": {field: secret}},
+            timeout=10.0,
+        )
+    except httpx.HTTPError as e:
+        print(f"  credential store unreachable ({type(e).__name__})", file=sys.stderr)
+        return False
+    if resp.status_code >= 400:
+        print(f"  credential store returned {resp.status_code} for {credential}", file=sys.stderr)
+        return False
+    return True
+
+
+def _recovery_email(ns_cfg: NamespaceConfig, identity_id: str) -> str | None:
+    rows = _rekey_http("GET", f"/{ns_cfg.ns}/rekeys", ns_cfg).json()
+    for row in rows:
+        if row["identity_id"] == identity_id:
+            return row.get("recovery_email")
+    return None
+
+
+def _mint_recovery_invite(
+    ns_cfg: NamespaceConfig,
+    identity_id: str,
+    secret: str,
+    *,
+    ttl: str,
+    invite_dir: Path,
+    deliver_cmd: str | None,
+    display_name: str | None,
+) -> Path:
+    """Single-use recovery invite; the server revokes the identity's earlier ones.
+
+    ``--deliver-cmd`` gets the URL on stdin and ``DEADROP_INVITE_TO`` set to
+    the identity's recovery email, when it has one.
+    """
+    from datetime import timedelta
+
+    from .crypto import create_invite_secrets
+
+    cfg = get_config()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=_ttl_seconds(ttl))
+    inv_secrets = create_invite_secrets(secret)
+    created = _rekey_http(
+        "POST",
+        f"/{ns_cfg.ns}/invites",
+        ns_cfg,
+        json_data={
+            "identity_id": identity_id,
+            "invite_id": inv_secrets.invite_id,
+            "encrypted_secret": inv_secrets.encrypted_secret_hex,
+            "display_name": display_name,
+            "expires_at": expires_at.isoformat(),
+            "recovery": True,
+        },
+    ).json()
+    url = f"{cfg.url}/join/{inv_secrets.invite_id}#{inv_secrets.key_base64}"
+    path = _write_private(invite_dir, f"{identity_id}-{inv_secrets.invite_id[:8]}.url", url)
+    if deliver_cmd:
+        import shlex
+        import subprocess
+
+        env = dict(
+            os.environ,
+            DEADROP_INVITE_IDENTITY=identity_id,
+            DEADROP_INVITE_EXPIRES=created.get("expires_at") or expires_at.isoformat(),
+        )
+        to = _recovery_email(ns_cfg, identity_id)
+        if to:
+            env["DEADROP_INVITE_TO"] = to
+        result = subprocess.run(
+            shlex.split(deliver_cmd), input=url, text=True, env=env, capture_output=True
+        )
+        status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
+        print(f"  deliver-cmd: {status}")
+    return path
+
+
+def _rekey_one(
+    ns_cfg: NamespaceConfig,
+    identity_id: str,
+    *,
+    grace: int,
+    revoke_now: bool,
+    dry_run: bool,
+    invite: bool,
+    invite_ttl: str,
+    invite_dir: Path,
+    deliver_cmd: str | None,
+    credential_map: dict[str, dict],
+    credential_store: str,
+    pin: str | None = None,
+) -> dict:
+    data = _rekey_http(
+        "POST",
+        f"/{ns_cfg.ns}/identities/{identity_id}/rekey",
+        ns_cfg,
+        json_data={
+            "grace_seconds": grace,
+            "revoke_now": revoke_now,
+            "dry_run": dry_run,
+            "pin": pin,
+        },
+    ).json()
+    plan = data["plan"]
+    versions = ",".join(f"{k}={v}" for k, v in plan["versions"].items())
+    counts = " ".join(f"{k}={v}" for k, v in plan.items() if k != "versions")
+    if dry_run:
+        route = "credential-store" if identity_id in credential_map else "recovery-invite"
+        print(f"{identity_id}  versions[{versions}]  {counts}  fix-forward={route}")
+        return data
+
+    secret = data.pop("secret")
+    mb = ns_cfg.mailboxes.get(identity_id)
+    if mb is not None:
+        mb.secret = secret
+        display_name = mb.display_name
+    else:
+        display_name = None
+        ns_cfg.add_mailbox(id=identity_id, secret=secret)
+    _save_ns_config(ns_cfg)
+
+    burned = ",".join(str(v) for v in data["burned_versions"]) or "-"
+    print(f"{identity_id}  v{data['version']} minted  burned={burned}")
+    entry = credential_map.get(identity_id)
+    if entry:
+        ok = _push_credential(credential_store, entry["credential"], entry["field"], secret)
+        print(
+            f"  credential {entry['credential']}.{entry['field']}: {'updated' if ok else 'FAILED'}"
+        )
+    elif invite:
+        path = _mint_recovery_invite(
+            ns_cfg,
+            identity_id,
+            secret,
+            ttl=invite_ttl,
+            invite_dir=invite_dir,
+            deliver_cmd=deliver_cmd,
+            display_name=display_name,
+        )
+        print(f"  recovery invite ({invite_ttl}, single use, PIN): {path}")
+    return data
+
+
+@rekey_app.command(name="identity")
+def rekey_identity_cmd(
+    ns: str,
+    identity_id: str,
+    *,
+    grace: int = 0,
+    revoke_now: bool = False,
+    dry_run: bool = False,
+    set_pin: bool = False,
+    invite: bool = True,
+    invite_ttl: str = "15m",
+    invite_dir: str | None = None,
+    deliver_cmd: str | None = None,
+    credential_map: str | None = None,
+    credential_store: str = DEFAULT_CREDENTIAL_STORE,
+):
+    """Mint a new secret version for one identity (same id, same rooms).
+
+    Older versions work until the new one first authenticates (plus --grace
+    seconds); --revoke-now burns them immediately. --set-pin prompts for a
+    new recovery PIN.
+
+    Fix-forward: identities in --credential-map get the new secret PATCHed
+    into the credential store; the rest get a single-use recovery invite
+    written to a 0600 file (and piped to --deliver-cmd's stdin, if given).
+    """
+    ns_cfg = get_namespace_config(ns)
+    _rekey_one(
+        ns_cfg,
+        identity_id,
+        grace=grace,
+        revoke_now=revoke_now,
+        dry_run=dry_run,
+        invite=invite,
+        invite_ttl=invite_ttl,
+        invite_dir=Path(invite_dir) if invite_dir else _default_invite_dir(),
+        deliver_cmd=deliver_cmd,
+        credential_map=_load_credential_map(credential_map),
+        credential_store=credential_store,
+        pin=_prompt_pin() if set_pin and not dry_run else None,
+    )
+
+
+@rekey_app.command(name="all")
+def rekey_all_cmd(
+    ns: str,
+    *,
+    exclude: list[str] | None = None,
+    grace: int = 0,
+    revoke_now: bool = False,
+    dry_run: bool = False,
+    invite: bool = True,
+    invite_ttl: str = "15m",
+    invite_dir: str | None = None,
+    deliver_cmd: str | None = None,
+    credential_map: str | None = None,
+    credential_store: str = DEFAULT_CREDENTIAL_STORE,
+):
+    """Emergency runbook: mint a new secret version for every identity.
+
+    --dry-run prints one line per identity (id, version counts, rooms, fix-forward
+    route) and changes nothing.
+    """
+    ns_cfg = get_namespace_config(ns)
+    identities = _rekey_http("GET", f"/{ns}/identities", ns_cfg).json()
+    skip = set(exclude or [])
+    targets = [i["id"] for i in identities if i["id"] not in skip]
+    cmap = _load_credential_map(credential_map)
+    mode = "DRY RUN" if dry_run else ("REVOKE NOW" if revoke_now else f"grace={grace}s")
+    print(f"namespace {ns}: {len(targets)} identities ({len(skip)} excluded)  [{mode}]")
+    done = 0
+    for identity_id in targets:
+        _rekey_one(
+            ns_cfg,
+            identity_id,
+            grace=grace,
+            revoke_now=revoke_now,
+            dry_run=dry_run,
+            invite=invite,
+            invite_ttl=invite_ttl,
+            invite_dir=Path(invite_dir) if invite_dir else _default_invite_dir(),
+            deliver_cmd=deliver_cmd,
+            credential_map=cmap,
+            credential_store=credential_store,
+        )
+        done += 1
+    print(f"{done}/{len(targets)} {'planned' if dry_run else 'rekeyed'}")
+
+
+@rekey_app.command(name="status")
+def rekey_status_cmd(ns: str):
+    """Per identity: secret versions, stale use of burned ones, PIN, recovery invites."""
+    ns_cfg = get_namespace_config(ns)
+    rows = _rekey_http("GET", f"/{ns}/rekeys", ns_cfg).json()
+    for r in rows:
+        inv = r.get("recovery_invites", {})
+        pin = "locked" if r["pin_locked"] else ("set" if r["pin_set"] else "none")
+        print(
+            f"{r['identity_id']}  pin={pin} failures={r['pin_failures']}"
+            f"  recovery_email={'set' if r['recovery_email'] else '-'}"
+            f"  invites live={inv.get('live', 0)} claimed={inv.get('claimed', 0)}"
+            f" last_claim={inv.get('last_claimed_at') or '-'}"
+        )
+        for v in r["versions"]:
+            stale = "  STALE-USE" if v["status"] == "burned" and v["burned_attempts"] else ""
+            print(
+                f"  v{v['version']}  {v['status']:<6}  created={v['created_at']}"
+                f"  last_seen={v['last_seen_at'] or '-'}  burned={v['burned_at'] or '-'}"
+                f"  burned_attempts={v['burned_attempts']}{stale}"
+            )
+    print(f"{len(rows)} identities")
+
+
+@rekey_app.command(name="verify")
+def rekey_verify_cmd():
+    """List identities with no version-1 secret (they cannot authenticate). Exit 1 if any.
+
+    Reads the database directly (DEADROP_DB / TURSO_URL), so run it where the server runs.
+    Pre-versioning code creates such identities after migration 010; fix with `rekey seed`.
+    """
+    from . import db
+
+    missing = db.identities_without_v1()
+    for ns, identity_id in missing:
+        print(f"{ns}  {identity_id}")
+    print(f"{len(missing)} identities without a v1 secret")
+    if missing:
+        sys.exit(1)
+
+
+@rekey_app.command(name="seed")
+def rekey_seed_cmd(ns: str, identity_id: str):
+    """Give one identity listed by `rekey verify` its current secret as version 1."""
+    from . import db
+
+    if not db.seed_v1(ns, identity_id):
+        print(f"{identity_id}  not found, or already has a v1 secret", file=sys.stderr)
+        sys.exit(1)
+    print(f"{identity_id}  seeded v1")
+
+
+@rekey_app.command(name="invite")
+def rekey_invite_cmd(
+    ns: str,
+    identity_id: str,
+    *,
+    ttl: str = "15m",
+    invite_dir: str | None = None,
+    deliver_cmd: str | None = None,
+):
+    """Mint a fresh single-use recovery invite for an identity (needs its PIN to claim).
+
+    The server revokes any earlier unclaimed recovery invite for it. The
+    secret comes from the namespace config.
+    """
+    ns_cfg = get_namespace_config(ns)
+    mb = ns_cfg.mailboxes.get(identity_id)
+    if mb is None:
+        print(f"Error: {identity_id} not in local namespace config", file=sys.stderr)
+        raise SystemExit(1)
+    path = _mint_recovery_invite(
+        ns_cfg,
+        identity_id,
+        mb.secret,
+        ttl=ttl,
+        invite_dir=Path(invite_dir) if invite_dir else _default_invite_dir(),
+        deliver_cmd=deliver_cmd,
+        display_name=mb.display_name,
+    )
+    print(f"recovery invite ({ttl}, single use, PIN): {path}")
+
+
+@rekey_app.command(name="burn")
+def rekey_burn_cmd(ns: str, identity_id: str, secret_version: int, *, yes: bool = False):
+    """Mark one secret version burned (rejected everywhere, stale use counted).
+
+    The server refuses to burn the identity's last live version without --yes.
+    """
+    ns_cfg = get_namespace_config(ns)
+    data = _rekey_http(
+        "POST",
+        f"/{ns}/identities/{identity_id}/secrets/{secret_version}/burn",
+        ns_cfg,
+        json_data={"confirm_last_version": yes},
+    ).json()
+    print(f"{identity_id}  v{secret_version} burned  live_versions={data['live_versions']}")
+
+
+@rekey_app.command(name="rollback")
+def rekey_rollback_cmd(ns: str, identity_id: str, secret_version: int, *, yes: bool = False):
+    """Make a secret version active again. Re-enables a possibly burned secret."""
+    if not yes:
+        print("Rollback re-enables a possibly compromised secret. Re-run with --yes.")
+        sys.exit(1)
+    ns_cfg = get_namespace_config(ns)
+    data = _rekey_http(
+        "POST", f"/{ns}/identities/{identity_id}/secrets/{secret_version}/rollback", ns_cfg
+    ).json()
+    print(f"{identity_id}  v{secret_version} active  live_versions={data['live_versions']}")
+
+
+@rekey_app.command(name="recovery")
+def rekey_recovery_cmd(
+    ns: str,
+    identity_id: str,
+    *,
+    email: str | None = None,
+    clear_email: bool = False,
+    set_pin: bool = False,
+):
+    """Set an identity's recovery email (default invite delivery target) and/or PIN."""
+    ns_cfg = get_namespace_config(ns)
+    data = _rekey_http(
+        "PUT",
+        f"/{ns}/identities/{identity_id}/recovery",
+        ns_cfg,
+        json_data={
+            "recovery_email": email,
+            "clear_recovery_email": clear_email,
+            "pin": _prompt_pin() if set_pin else None,
+        },
+    ).json()
+    print(
+        f"{identity_id}  recovery_email={'set' if data['recovery_email'] else '-'}"
+        f"  pin={'set' if data['pin_set'] else 'none'}"
+    )
+
+
+@rekey_app.command(name="unlock")
+def rekey_unlock_cmd(ns: str, identity_id: str):
+    """Clear a recovery-PIN lockout (after too many wrong PINs)."""
+    ns_cfg = get_namespace_config(ns)
+    _rekey_http("POST", f"/{ns}/identities/{identity_id}/pin/unlock", ns_cfg)
+    print(f"{identity_id}  pin unlocked")

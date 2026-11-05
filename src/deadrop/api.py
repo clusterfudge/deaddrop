@@ -8,6 +8,7 @@ import logging
 import os
 import re as _re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -23,9 +24,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import cache, db, instrument, push
+from . import cache, db, instrument, push, rekey
 from .turso_http import TursoUnavailableError
-from .auth import derive_id
+from .auth import RETIRED_DETAIL, hash_secret
 from .auth_provider import (
     extract_bearer_token,
     get_auth_method_name,
@@ -103,7 +104,14 @@ async def lifespan(app: FastAPI):
 
     configure_logging()
 
-    db.init_db()
+    # Production migrates in the Procfile release task (deadrop.migrate) before
+    # this process exists; here the server only refuses an older schema.
+    # DEADROP_MIGRATE_ON_START=1 keeps the migrate-at-startup path for local
+    # servers (`deadrop serve` sets it) that have no release phase.
+    if os.environ.get("DEADROP_MIGRATE_ON_START", "").lower() in ("1", "true", "yes"):
+        db.init_db()
+    else:
+        db.require_schema()
 
     # Background monitor: resolves Turso hostname and TCP-probes each IP
     # every 15s. Surfaces the "DNS returns a dead IP" scenario (2026-05-08
@@ -127,6 +135,10 @@ async def lifespan(app: FastAPI):
         await warm_caches()
     except Exception:
         logger.warning("Cache warming failed on startup", exc_info=True)
+
+    # Keep the in-memory secret table in step with other processes (burns,
+    # rekeys) and flush its buffered stale-use counters.
+    auth_refresh_task = asyncio.create_task(_auth_refresh_loop())
 
     # Initialise the pluggable metrics sink (reads DEADROP_METRICS_SINK env var)
     instrument.init_sink()
@@ -160,10 +172,29 @@ async def lifespan(app: FastAPI):
 
     await shutdown_watcher()
 
+    auth_refresh_task.cancel()
+
     # Stop background cache refresh
     stop_cache_warming()
     db.stop_turso_dns_monitor()
     db.close_db()
+
+
+async def _auth_refresh_loop() -> None:
+    """Every ``AUTH_REFRESH_SECONDS``: follow ``auth_generation``, flush activity.
+
+    This bounds how long another process's burn can go unnoticed here: one
+    interval plus a generation read and, if it moved, a table reload.
+    """
+    while True:
+        await asyncio.sleep(db.AUTH_REFRESH_SECONDS)
+        try:
+            await _run_read(db.refresh_secret_map)
+            await _run_write(db.flush_secret_activity)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Secret table refresh failed", exc_info=True)
 
 
 _UUID7_RE = _re.compile(
@@ -321,12 +352,9 @@ async def add_timing_middleware(request: Request, call_next):
         secret = request.headers.get("x-inbox-secret")
         identity_id = None
         if secret:
-            try:
-                from .auth import derive_id
-
-                identity_id = derive_id(secret)
-            except Exception:
-                identity_id = None
+            # Memory only: an unknown secret logs no identity.
+            entry = cache.secret_map.get(hash_secret(secret))
+            identity_id = entry.identity_id if entry else None
 
         # Honor X-Forwarded-For when set (we sit behind nginx on dokku);
         # fall back to request.client.host for direct connections.
@@ -469,6 +497,10 @@ class NamespaceInfo(BaseModel):
 
 class CreateIdentityRequest(BaseModel):
     metadata: dict[str, Any] | None = None
+    # Default delivery target for recovery invites (never used to send here).
+    recovery_email: str | None = Field(default=None, max_length=320)
+    # Recovery PIN, stored as a salted scrypt hash; needed to claim a recovery invite.
+    pin: str | None = Field(default=None, max_length=128)
 
 
 class CreateIdentityResponse(BaseModel):
@@ -535,6 +567,7 @@ class InviteInfoResponse(BaseModel):
     created_at: str
     expires_at: str | None = None
     claimed_at: str | None = None
+    requires_pin: bool = False
 
 
 class CreateInviteRequest(BaseModel):
@@ -543,6 +576,12 @@ class CreateInviteRequest(BaseModel):
     encrypted_secret: str
     display_name: str | None = None
     expires_at: str | None = None
+    # Recovery invite: TTL capped, earlier unclaimed ones revoked, PIN to claim.
+    recovery: bool = False
+
+
+class ClaimInviteRequest(BaseModel):
+    pin: str | None = Field(default=None, max_length=128)
 
 
 class CreateInviteResponse(BaseModel):
@@ -626,15 +665,11 @@ def require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str | None) 
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    # Derive ID from secret and verify it matches claimed identity
-    derived_id = derive_id(x_inbox_secret)
-    if derived_id != identity_id:
+    resolved, error = db.authenticate_secret(x_inbox_secret, ns)
+    if resolved is None:
+        raise _auth_error(error, "Invalid inbox secret or identity not in namespace")
+    if resolved != identity_id:
         raise HTTPException(403, "Secret does not match identity")
-
-    # Verify identity exists in namespace
-    if not db.verify_identity_secret(ns, identity_id, x_inbox_secret):
-        raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
-
     return identity_id
 
 
@@ -643,11 +678,26 @@ def require_inbox_secret_any(ns: str, x_inbox_secret: str | None) -> str:
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    identity_id = db.verify_identity_in_namespace(ns, x_inbox_secret)
-    if not identity_id:
-        raise HTTPException(403, "Invalid inbox secret or not in namespace")
-
+    identity_id, error = db.authenticate_secret(x_inbox_secret, ns)
+    if identity_id is None:
+        raise _auth_error(error, "Invalid inbox secret or not in namespace")
     return identity_id
+
+
+def _auth_error(error: str | None, detail: str) -> HTTPException:
+    """403 for a failed secret check; a burned secret gets ``RETIRED_DETAIL``."""
+    if error == db.AUTH_RETIRED:
+        return HTTPException(403, RETIRED_DETAIL)
+    return HTTPException(403, detail)
+
+
+def _create_identity(ns: str, request: CreateIdentityRequest | None) -> dict[str, str]:
+    from .auth import PIN_MIN_LENGTH
+
+    req = request or CreateIdentityRequest()
+    if req.pin is not None and len(req.pin) < PIN_MIN_LENGTH:
+        raise HTTPException(400, f"PIN must be at least {PIN_MIN_LENGTH} characters")
+    return db.create_identity(ns, req.metadata, recovery_email=req.recovery_email, pin=req.pin)
 
 
 def require_active_namespace(ns: str) -> None:
@@ -737,110 +787,89 @@ async def _require_active_namespace(ns: str) -> None:
         raise HTTPException(410, "Namespace is archived")
 
 
-async def _require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str | None) -> str:
-    """Async variant of require_inbox_secret.
+async def _authenticate(secret: str, ns: str | None = None) -> tuple[str | None, str | None]:
+    """Async secret resolution: memory first, an executor only when needed.
 
-    Tries the identity hash cache first (no executor needed).
-    Only falls through to the DB executor on cache miss.
+    The executor is used for a hash the in-memory table misses (throttled
+    refresh) and for a rekeyed version's first use (the switch write).
     """
+    secret_hash = hash_secret(secret)
+    entry = cache.secret_map.get(secret_hash)
+    if entry is None:
+        entry = await _run_read(db.lookup_secret_hash, secret_hash)
+    identity_id, error, needs_switch = db.check_secret_entry(entry, secret_hash, ns)
+    if needs_switch:
+        await _run_write(db.apply_first_use, secret_hash)
+    return identity_id, error
+
+
+async def _require_inbox_secret(ns: str, identity_id: str, x_inbox_secret: str | None) -> str:
+    """Async variant of require_inbox_secret."""
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
-
-    derived_id = derive_id(x_inbox_secret)
-    if derived_id != identity_id:
+    resolved, error = await _authenticate(x_inbox_secret, ns)
+    if resolved is None:
+        raise _auth_error(error, "Invalid inbox secret or identity not in namespace")
+    if resolved != identity_id:
         raise HTTPException(403, "Secret does not match identity")
-
-    from .auth import verify_secret
-    from .cache import identity_hash_cache
-
-    # Fast path: check cache without touching the executor
-    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
-    if cache_hit and cached_hash:
-        if not verify_secret(x_inbox_secret, cached_hash):
-            raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
-        return identity_id
-
-    # Slow path: cache miss, go through executor
-    verified = await _run_read(db.verify_identity_secret, ns, identity_id, x_inbox_secret)
-    if not verified:
-        raise HTTPException(403, "Invalid inbox secret or identity not in namespace")
-
     return identity_id
 
 
 async def _require_inbox_secret_any(ns: str, x_inbox_secret: str | None) -> str:
-    """Async variant of require_inbox_secret_any.
-
-    Tries the identity hash cache first (no executor needed).
-    Only falls through to the DB executor on cache miss.
-    """
+    """Async variant of require_inbox_secret_any."""
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
+    identity_id, error = await _authenticate(x_inbox_secret, ns)
+    if identity_id is None:
+        raise _auth_error(error, "Invalid inbox secret or not in namespace")
+    return identity_id
 
-    from .auth import verify_secret
-    from .cache import identity_hash_cache
 
-    identity_id = derive_id(x_inbox_secret)
-
-    # Fast path: check cache without touching the executor
-    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
-    if cache_hit and cached_hash:
-        if verify_secret(x_inbox_secret, cached_hash):
-            return identity_id
-        raise HTTPException(403, "Invalid inbox secret or not in namespace")
-
-    # Slow path: cache miss, go through executor
-    result = await _run_read(db.verify_identity_in_namespace, ns, x_inbox_secret)
-    if not result:
-        raise HTTPException(403, "Invalid inbox secret or not in namespace")
-
-    return result
+def _room_access_error(error: str | None) -> HTTPException:
+    error_msg = error or "Unknown error"
+    lower = error_msg.lower()
+    if "not found" in lower:
+        return HTTPException(404, error_msg)
+    if (
+        "not a member" in lower
+        or "invalid" in lower
+        or "does not match" in lower
+        or error_msg == RETIRED_DETAIL
+    ):
+        return HTTPException(403, error_msg)
+    return HTTPException(400, error_msg)
 
 
 async def _require_room_member(room_id: str, x_inbox_secret: str | None) -> tuple[dict, str]:
     """Async variant of require_room_member.
 
-    Tries all three caches first (room, membership, identity hash).
-    Only falls through to the DB executor on cache miss.
+    Resolves the secret from memory and, when the room and membership caches
+    also hit, touches no executor. Otherwise one read dispatch.
     """
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    from .auth import verify_secret
-    from .cache import identity_hash_cache, membership_cache, room_cache
+    from .cache import membership_cache, room_cache
 
-    identity_id = derive_id(x_inbox_secret)
+    identity_id, error = await _authenticate(x_inbox_secret)
+    if identity_id is None:
+        if error == db.AUTH_RETIRED:
+            raise HTTPException(403, RETIRED_DETAIL)
+        raise HTTPException(403, "Invalid inbox secret")
 
-    # Fast path: check all caches without touching the executor
     cache_hit, cached_room = room_cache.get(f"room:{room_id}")
     if cache_hit and cached_room:
         membership_hit, is_member = membership_cache.get(f"member:{room_id}:{identity_id}")
-        if membership_hit and is_member:
-            ns = cached_room["ns"]
-            hash_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
-            if hash_hit and cached_hash:
-                if verify_secret(x_inbox_secret, cached_hash):
-                    return cached_room, identity_id
-                raise HTTPException(403, "Invalid inbox secret")
+        if membership_hit and is_member and cached_room["ns"] == db._secret_ns(x_inbox_secret):
+            return cached_room, identity_id
 
-    # Slow path: cache miss, go through executor
     import functools
 
-    room, error = await _run_read(
-        functools.partial(db.verify_room_access, room_id, identity_id, x_inbox_secret)
+    room, identity_id, error = await _run_read(
+        functools.partial(db.verify_room_access, room_id, x_inbox_secret)
     )
-
-    if error or room is None:
-        error_msg = error or "Unknown error"
-        if "not found" in error_msg.lower():
-            raise HTTPException(404, error_msg)
-        elif "not a member" in error_msg.lower():
-            raise HTTPException(403, error_msg)
-        elif "invalid" in error_msg.lower() or "does not match" in error_msg.lower():
-            raise HTTPException(403, error_msg)
-        else:
-            raise HTTPException(400, error_msg)
-
+    if error or room is None or identity_id is None:
+        raise _room_access_error(error)
     return room, identity_id
 
 
@@ -1007,8 +1036,8 @@ def admin_create_identity(
     if not db.get_namespace(ns):
         raise HTTPException(404, "Namespace not found")
 
+    result = _create_identity(ns, request)
     metadata = request.metadata if request else None
-    result = db.create_identity(ns, metadata)
     return CreateIdentityResponse(
         id=result["id"],
         secret=result["secret"],
@@ -1091,8 +1120,8 @@ def create_identity(
     require_namespace_secret(ns, x_namespace_secret)
     require_active_namespace(ns)
 
+    result = _create_identity(ns, request)
     metadata = request.metadata if request else None
-    result = db.create_identity(ns, metadata)
     return CreateIdentityResponse(
         id=result["id"],
         secret=result["secret"],
@@ -1118,9 +1147,7 @@ async def list_identities(
         if not verified:
             raise HTTPException(403, "Invalid namespace secret")
     elif x_inbox_secret:
-        identity_id = await _run_read(db.verify_identity_in_namespace, ns, x_inbox_secret)
-        if not identity_id:
-            raise HTTPException(403, "Invalid inbox secret or not in namespace")
+        await _require_inbox_secret_any(ns, x_inbox_secret)
     else:
         raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
 
@@ -1142,11 +1169,11 @@ def get_identity(
             raise HTTPException(403, "Invalid namespace secret")
     elif x_inbox_secret:
         # Must be this identity's secret
-        derived_id = derive_id(x_inbox_secret)
-        if derived_id != identity_id:
+        resolved, error = db.authenticate_secret(x_inbox_secret, ns)
+        if resolved is None:
+            raise _auth_error(error, "Invalid inbox secret")
+        if resolved != identity_id:
             raise HTTPException(403, "Can only view own identity")
-        if not db.verify_identity_secret(ns, identity_id, x_inbox_secret):
-            raise HTTPException(403, "Invalid inbox secret")
     else:
         raise HTTPException(401, "X-Namespace-Secret or X-Inbox-Secret header required")
 
@@ -1189,6 +1216,131 @@ def delete_identity(
         raise HTTPException(404, "Identity not found")
     cache.invalidate_identity(ns, identity_id)
     return {"ok": True}
+
+
+# --- Secret rotation (rekey), burns, recovery ---
+# Namespace-owner operations; see deadrop.rekey.
+
+
+class RekeyRequest(BaseModel):
+    grace_seconds: int = 0
+    revoke_now: bool = False
+    dry_run: bool = False
+    pin: str | None = Field(default=None, max_length=128)
+
+
+class BurnRequest(BaseModel):
+    confirm_last_version: bool = False
+
+
+class RecoveryRequest(BaseModel):
+    recovery_email: str | None = Field(default=None, max_length=320)
+    clear_recovery_email: bool = False
+    pin: str | None = Field(default=None, max_length=128)
+
+
+def _rekey_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except rekey.RekeyError as e:
+        raise HTTPException(e.status, str(e)) from None
+
+
+@app.post("/{ns}/identities/{identity_id}/rekey")
+def rekey_identity(
+    ns: str,
+    identity_id: str,
+    request: RekeyRequest | None = None,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+):
+    """Mint a new secret version. Requires namespace secret.
+
+    The response carries the new secret (unless ``dry_run``). Older versions
+    keep working until the new one first authenticates (then ``grace_seconds``
+    more), or are burned at once with ``revoke_now``.
+    """
+    require_namespace_secret(ns, x_namespace_secret)
+    require_active_namespace(ns)
+    req = request or RekeyRequest()
+    return _rekey_call(
+        rekey.rekey_identity,
+        ns,
+        identity_id,
+        grace_seconds=req.grace_seconds,
+        revoke_now=req.revoke_now,
+        dry_run=req.dry_run,
+        pin=req.pin,
+    )
+
+
+@app.post("/{ns}/identities/{identity_id}/secrets/{version}/burn")
+def burn_identity_secret(
+    ns: str,
+    identity_id: str,
+    version: int,
+    request: BurnRequest | None = None,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+):
+    """Mark one secret version burned. Requires namespace secret.
+
+    Burning the identity's last live version is a 409 unless
+    ``confirm_last_version`` is set.
+    """
+    require_namespace_secret(ns, x_namespace_secret)
+    confirm = bool(request and request.confirm_last_version)
+    return _rekey_call(rekey.burn, ns, identity_id, version, confirm_last=confirm)
+
+
+@app.post("/{ns}/identities/{identity_id}/secrets/{version}/rollback")
+def rollback_identity_secret(
+    ns: str,
+    identity_id: str,
+    version: int,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+):
+    """Make a secret version active again. Requires namespace secret."""
+    require_namespace_secret(ns, x_namespace_secret)
+    return _rekey_call(rekey.rollback, ns, identity_id, version)
+
+
+@app.put("/{ns}/identities/{identity_id}/recovery")
+def set_identity_recovery(
+    ns: str,
+    identity_id: str,
+    request: RecoveryRequest,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+):
+    """Set an identity's recovery email and/or PIN. Requires namespace secret."""
+    require_namespace_secret(ns, x_namespace_secret)
+    return _rekey_call(
+        rekey.set_recovery,
+        ns,
+        identity_id,
+        recovery_email=request.recovery_email,
+        clear_recovery_email=request.clear_recovery_email,
+        pin=request.pin,
+    )
+
+
+@app.post("/{ns}/identities/{identity_id}/pin/unlock")
+def unlock_identity_pin(
+    ns: str,
+    identity_id: str,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+):
+    """Clear a PIN lockout. Requires namespace secret."""
+    require_namespace_secret(ns, x_namespace_secret)
+    return _rekey_call(rekey.unlock_pin, ns, identity_id)
+
+
+@app.get("/{ns}/rekeys")
+def rekey_status(
+    ns: str,
+    x_namespace_secret: Annotated[str | None, Header()] = None,
+):
+    """Secret versions (no hashes), PIN and recovery-invite state per identity."""
+    require_namespace_secret(ns, x_namespace_secret)
+    return rekey.status(ns)
 
 
 # --- Mailbox Owner Endpoints ---
@@ -1542,6 +1694,10 @@ def create_invite(
     # Client generates this randomly, we just need to ensure uniqueness
     invite_id = req.invite_id
 
+    expires_at = req.expires_at
+    if req.recovery:
+        expires_at = _rekey_call(rekey.prepare_recovery_invite, ns, req.identity_id, expires_at)
+
     # Create the invite
     result = db.create_invite(
         invite_id=invite_id,
@@ -1549,7 +1705,8 @@ def create_invite(
         identity_id=req.identity_id,
         encrypted_secret=req.encrypted_secret,
         display_name=req.display_name,
-        expires_at=req.expires_at,
+        expires_at=expires_at,
+        recovery=req.recovery,
     )
 
     return CreateInviteResponse(**result)
@@ -1569,15 +1726,27 @@ def get_invite_info(invite_id: str):
 
 
 @app.post("/api/invites/{invite_id}/claim", response_model=InviteClaimResponse)
-def claim_invite(invite_id: str, request: Request):
+def claim_invite(invite_id: str, request: Request, body: ClaimInviteRequest | None = None):
     """Claim an invite and receive the encrypted secret.
 
     This is a one-time operation. After claiming, the invite cannot be used again.
     The response includes encrypted_secret which the client decrypts using
-    the key from the URL fragment.
+    the key from the URL fragment. A recovery invite also needs the
+    identity's PIN (``{"pin": ...}``); a wrong PIN does not consume it.
     """
     # Get client IP for logging
     client_ip = request.client.host if request.client else None
+
+    pending = db.get_invite(invite_id)
+    if pending and pending.get("recovery") and not pending.get("claimed_at"):
+        expires = pending.get("expires_at")
+        if not expires or expires > datetime.now(timezone.utc).isoformat():
+            _rekey_call(
+                rekey.check_recovery_pin,
+                pending["ns"],
+                pending["identity_id"],
+                body.pin if body else None,
+            )
 
     invite = db.claim_invite(invite_id, claimed_by=client_ip)
     if not invite:
@@ -1831,33 +2000,13 @@ class PushMuteRequest(BaseModel):
 
 
 def require_room_member(room_id: str, x_inbox_secret: str | None) -> tuple[dict, str]:
-    """Verify caller is a member of the room. Returns (room, identity_id).
-
-    Uses optimized combined query with caching to minimize database round-trips.
-    Previously this made 3 sequential DB calls (~250ms with Turso).
-    Now it makes 1 combined query with caching (~80ms or cache hit).
-    """
+    """Verify caller is a member of the room. Returns (room, identity_id)."""
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    # Derive identity from secret (no DB call needed)
-    identity_id = derive_id(x_inbox_secret)
-
-    # Use optimized combined query with caching
-    room, error = db.verify_room_access(room_id, identity_id, x_inbox_secret)
-
-    if error or room is None:
-        # Map error messages to appropriate HTTP status codes
-        error_msg = error or "Unknown error"
-        if "not found" in error_msg.lower():
-            raise HTTPException(404, error_msg)
-        elif "not a member" in error_msg.lower():
-            raise HTTPException(403, error_msg)
-        elif "invalid" in error_msg.lower() or "does not match" in error_msg.lower():
-            raise HTTPException(403, error_msg)
-        else:
-            raise HTTPException(400, error_msg)
-
+    room, identity_id, error = db.verify_room_access(room_id, x_inbox_secret)
+    if error or room is None or identity_id is None:
+        raise _room_access_error(error)
     return room, identity_id
 
 
@@ -2039,7 +2188,7 @@ def remove_room_member(
     if not room or room["ns"] != ns:
         raise HTTPException(404, "Room not found")
 
-    caller_id = derive_id(x_inbox_secret)
+    caller_id = require_inbox_secret_any(ns, x_inbox_secret)
 
     # Verify caller is either the member being removed or a room member
     if caller_id != identity_id:
@@ -2403,37 +2552,33 @@ async def update_read_cursor(
     # into a single _run_sync to avoid two sequential round-trips.
     import functools
 
-    from .auth import verify_secret
-    from .cache import identity_hash_cache, membership_cache, room_cache
+    from .cache import membership_cache, room_cache
 
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
-    identity_id = derive_id(x_inbox_secret)
-    if not identity_id:
-        raise HTTPException(401, "X-Inbox-Secret header required")
+    identity_id, auth_error = await _authenticate(x_inbox_secret, ns)
+    if identity_id is None:
+        raise _auth_error(auth_error, "Invalid inbox secret")
 
     cache_hit, cached_room = room_cache.get(f"room:{room_id}")
     membership_hit, is_member = membership_cache.get(f"member:{room_id}:{identity_id}")
     if cache_hit and cached_room and membership_hit and is_member:
-        cached_ns = cached_room["ns"]
-        hash_hit, cached_hash = identity_hash_cache.get(f"identity:{cached_ns}:{identity_id}")
-        if hash_hit and cached_hash and verify_secret(x_inbox_secret, cached_hash):
-            # All caches hit — auth is free, just do the write
-            if cached_room["ns"] != ns:
-                raise HTTPException(404, "Room not found in this namespace")
-            result = await _run_write(
-                functools.partial(
-                    db.update_room_read_cursor, room_id, identity_id, request.last_read_mid
-                )
+        # All caches hit — auth is free, just do the write
+        if cached_room["ns"] != ns:
+            raise HTTPException(404, "Room not found in this namespace")
+        result = await _run_write(
+            functools.partial(
+                db.update_room_read_cursor, room_id, identity_id, request.last_read_mid
             )
-            if not result:
-                raise HTTPException(400, "Failed to update read cursor")
-            _disarm_push(room_id, identity_id, request.last_read_mid)
-            return {"ok": True, "last_read_mid": request.last_read_mid}
+        )
+        if not result:
+            raise HTTPException(400, "Failed to update read cursor")
+        _disarm_push(room_id, identity_id, request.last_read_mid)
+        return {"ok": True, "last_read_mid": request.last_read_mid}
 
-    # Cache miss — combine auth + write in a single executor dispatch
+    # Cache miss — combine membership check + write in a single executor dispatch
     def _auth_and_update():
-        room, error = db.verify_room_access(room_id, identity_id, x_inbox_secret)
+        room, _, error = db.verify_room_access(room_id, x_inbox_secret)
         if error or room is None:
             return None, None, error or "Unknown error"
         if room["ns"] != ns:
@@ -2449,7 +2594,7 @@ async def update_read_cursor(
         error_lower = error.lower()
         if "not found" in error_lower:
             raise HTTPException(404, error)
-        elif "not a member" in error_lower or "invalid" in error_lower:
+        elif "not a member" in error_lower or "invalid" in error_lower or error == RETIRED_DETAIL:
             raise HTTPException(403, error)
         else:
             raise HTTPException(400, error)
@@ -2789,7 +2934,7 @@ async def get_attachment(
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    caller_id = derive_id(x_inbox_secret)
+    caller_id = await _require_inbox_secret_any(ns, x_inbox_secret)
 
     def _fetch_and_verify_attachment():
         """Fetch attachment + verify room membership in a single read executor dispatch."""
@@ -2874,7 +3019,7 @@ async def download_attachment(
     if not x_inbox_secret:
         raise HTTPException(401, "X-Inbox-Secret header required")
 
-    caller_id = derive_id(x_inbox_secret)
+    caller_id = await _require_inbox_secret_any(ns, x_inbox_secret)
 
     def _fetch_and_verify_attachment():
         attachment = db.get_attachment(attachment_id, include_data=True)
@@ -3177,9 +3322,9 @@ def get_metrics(
 
     from .cache import (
         CACHE_WARMING_ENABLED,
-        identity_hash_cache,
         membership_cache,
         room_cache,
+        secret_map,
     )
     from .metrics import metrics
 
@@ -3190,7 +3335,7 @@ def get_metrics(
             "strategy": "warm-on-startup + write-through invalidation",
             "room": room_cache.stats(),
             "membership": membership_cache.stats(),
-            "identity_hash": identity_hash_cache.stats(),
+            "secret_map": secret_map.stats(),
         },
     }
 

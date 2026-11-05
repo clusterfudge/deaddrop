@@ -11,7 +11,7 @@ os.environ.pop("HEARE_AUTH_URL", None)
 
 
 import pytest
-from deadrop import db
+from deadrop import cache, db
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -27,6 +27,8 @@ def reset_database():
     # Temporarily disable foreign keys to allow dropping in any order
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.executescript("""
+        DROP TABLE IF EXISTS identity_secrets;
+        DROP TABLE IF EXISTS auth_generation;
         DROP TABLE IF EXISTS push_mutes;
         DROP TABLE IF EXISTS push_prefs;
         DROP TABLE IF EXISTS push_subscriptions;
@@ -47,5 +49,6 @@ def reset_database():
 
     # Now initialize fresh schema
     db.init_db_with_conn(conn)
+    cache.secret_map.clear()
     yield
     db.close_db()  # Cleanup after test

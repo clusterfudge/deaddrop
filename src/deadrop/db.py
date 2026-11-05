@@ -27,8 +27,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets as _secrets_mod
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -37,7 +39,7 @@ from typing import Any, Iterator, cast
 
 from uuid_extensions import uuid7 as make_uuid7
 
-from .auth import derive_id, generate_secret, hash_secret
+from .auth import derive_id, generate_secret, hash_pin, hash_secret
 from .metrics import InstrumentedConnection, metrics, timed_query
 from .turso_http import TursoConnection, TursoUnavailableError
 
@@ -50,7 +52,7 @@ DEDUP_WINDOW_SECONDS = 60
 DEFAULT_TTL_HOURS = 24
 
 # Current schema version (increment when adding migrations)
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Thread-local storage for per-thread connections
 # This ensures each thread gets its own SQLite connection, avoiding
@@ -885,6 +887,79 @@ def _migrate_009_add_push_mutes(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_010_add_identity_secrets(conn: sqlite3.Connection) -> None:
+    """Migration 010: versioned identity secrets, recovery email and PIN.
+
+    ``identity_secrets`` maps a secret hash to the identity it authenticates.
+    An identity's id is minted once and never changes; rotating its secret
+    adds a version. Existing identities are seeded with version 1 ``active``
+    carrying their current hash, so their ids (``sha256(secret)[:16]``) and
+    every client holding the secret keep working.
+
+    ``auth_generation`` is bumped by every auth-relevant write so each server
+    process can tell its in-memory copy of the table is stale.
+
+    ``identities.secret_hash`` is left in place (NOT NULL in the base
+    schema) but is no longer read for authentication.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_secrets (
+            secret_hash TEXT PRIMARY KEY,
+            ns TEXT NOT NULL,
+            identity_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            switch_grace INTEGER,
+            grace_until TEXT,
+            created_at TEXT NOT NULL,
+            burned_at TEXT,
+            last_seen_at TEXT,
+            burned_attempts INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (ns, identity_id, version)
+        )
+    """,
+        name="migrate.010.create_identity_secrets",
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS auth_generation "
+        "(id INTEGER PRIMARY KEY CHECK (id = 1), gen INTEGER NOT NULL)",
+        name="migrate.010.create_auth_generation",
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO auth_generation (id, gen) VALUES (1, 1)",
+        name="migrate.010.seed_auth_generation",
+    )
+    has_identities = _column_exists(conn, "identities", "secret_hash")
+    if has_identities:
+        conn.execute(
+            """INSERT OR IGNORE INTO identity_secrets
+               (secret_hash, ns, identity_id, version, status, created_at)
+               SELECT secret_hash, ns, id, 1, 'active', COALESCE(created_at, CURRENT_TIMESTAMP)
+               FROM identities""",
+            name="migrate.010.seed_identity_secrets",
+        )
+    for column, decl in (
+        ("recovery_email", "TEXT"),
+        ("pin_hash", "TEXT"),
+        ("pin_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("pin_locked_at", "TEXT"),
+    ):
+        if has_identities and not _column_exists(conn, "identities", column):
+            conn.execute(
+                f"ALTER TABLE identities ADD COLUMN {column} {decl}",
+                name=f"migrate.010.add_{column}",
+            )
+    if _column_exists(conn, "invites", "invite_id") and not _column_exists(
+        conn, "invites", "recovery"
+    ):
+        conn.execute(
+            "ALTER TABLE invites ADD COLUMN recovery INTEGER NOT NULL DEFAULT 0",
+            name="migrate.010.add_invites_recovery",
+        )
+    conn.commit()
+
+
 # Migration registry: (version, description, migration_function)
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Add content_type column to messages", _migrate_001_add_content_type),
@@ -896,6 +971,11 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (7, "Add push_subscriptions table for Web Push", _migrate_007_add_push_subscriptions),
     (8, "Add push_prefs table for per-identity push on/off", _migrate_008_add_push_prefs),
     (9, "Add push_mutes table for per-room and per-sender mutes", _migrate_009_add_push_mutes),
+    (
+        10,
+        "Add versioned identity secrets, recovery email and PIN",
+        _migrate_010_add_identity_secrets,
+    ),
 ]
 
 
@@ -1034,27 +1114,59 @@ SCHEMA_SQL = """
 """
 
 
-def init_db_with_conn(conn: sqlite3.Connection) -> None:
+def init_db_with_conn(conn: sqlite3.Connection) -> list[int]:
     """Initialize database schema with an explicit connection.
 
     Args:
         conn: Database connection to initialize.
+
+    Returns:
+        The migration versions applied (empty when already current).
     """
     conn.executescript(SCHEMA_SQL)
     conn.commit()
-    run_migrations(conn)
+    return run_migrations(conn)
 
 
-def init_db():
+def init_db() -> list[int]:
     """Initialize database schema using the global connection."""
     conn = get_connection()
-    init_db_with_conn(conn)
+    return init_db_with_conn(conn)
+
+
+def require_schema(conn: sqlite3.Connection | None = None) -> int:
+    """Return the schema version, raising if it is older than this code needs.
+
+    Read-only: unlike ``get_schema_version`` it does not create
+    ``schema_version``, so a server pointed at an unmigrated database refuses
+    to start without writing to it.
+    """
+    conn = _get_conn(conn)
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+        name="schema.version_table_exists",
+    ).fetchone()
+    version = 0
+    if exists:
+        row = conn.execute(
+            "SELECT MAX(version) FROM schema_version", name="schema.get_version"
+        ).fetchone()
+        version = row[0] if row and row[0] is not None else 0
+    if version < SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema is v{version}, this build needs v{SCHEMA_VERSION}: run"
+            " `python -m deadrop.migrate` (the Procfile release task), or set"
+            " DEADROP_MIGRATE_ON_START=1 to migrate at startup"
+        )
+    return version
 
 
 def reset_db(conn: sqlite3.Connection | None = None):
     """Reset database (for testing)."""
     conn = _get_conn(conn)
     conn.executescript("""
+        DROP TABLE IF EXISTS identity_secrets;
+        DROP TABLE IF EXISTS auth_generation;
         DROP TABLE IF EXISTS push_mutes;
         DROP TABLE IF EXISTS push_prefs;
         DROP TABLE IF EXISTS push_subscriptions;
@@ -1371,21 +1483,42 @@ def create_identity(
     ns: str,
     metadata: dict[str, Any] | None = None,
     conn: sqlite3.Connection | None = None,
+    *,
+    recovery_email: str | None = None,
+    pin: str | None = None,
 ) -> dict[str, str]:
-    """Create a new identity in a namespace. Returns {id, secret}."""
-    conn = _get_conn(conn)
+    """Create a new identity in a namespace. Returns {id, secret}.
+
+    The id is random and independent of the secret, so the secret can be
+    rotated (see :func:`add_identity_secret`) without the id changing.
+    """
+    import secrets as _secrets
+
+    db_conn = _get_conn(conn)
 
     secret = generate_secret()
-    identity_id = derive_id(secret)
+    identity_id = _secrets.token_hex(8)
     secret_hash = hash_secret(secret)
     metadata_json = json.dumps(metadata or {})
 
-    conn.execute(
-        "INSERT INTO identities (id, ns, secret_hash, metadata) VALUES (?, ?, ?, ?)",
-        (identity_id, ns, secret_hash, metadata_json),
+    db_conn.execute(
+        "INSERT INTO identities (id, ns, secret_hash, metadata, recovery_email, pin_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            identity_id,
+            ns,
+            secret_hash,
+            metadata_json,
+            recovery_email,
+            hash_pin(pin) if pin else None,
+        ),
         name="create_identity",
     )
-    conn.commit()
+    _insert_secret_version(db_conn, ns, identity_id, secret_hash, 1, switch_grace=None)
+    _bump_auth_generation(db_conn)
+    db_conn.commit()
+    if conn is None:
+        reload_identity_secrets(ns, identity_id)
 
     return {"id": identity_id, "secret": secret}
 
@@ -1411,22 +1544,6 @@ def get_identity(
             "created_at": row["created_at"],
         }
     return None
-
-
-def get_identity_secret_hash(
-    ns: str,
-    identity_id: str,
-    conn: sqlite3.Connection | None = None,
-) -> str | None:
-    """Get the secret hash for an identity (used for invite creation)."""
-    conn = _get_conn(conn)
-    cursor = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
-        (ns, identity_id),
-        name="get_identity_secret_hash",
-    )
-    row = _row_to_dict(cursor.description, cursor.fetchone())
-    return row["secret_hash"] if row else None
 
 
 def list_identities(ns: str, conn: sqlite3.Connection | None = None) -> list[dict]:
@@ -1455,39 +1572,9 @@ def verify_identity_secret(
     secret: str,
     conn: sqlite3.Connection | None = None,
 ) -> bool:
-    """Verify an identity secret.
-
-    Uses the identity_hash_cache to avoid a Turso round-trip on every request.
-    The cache is populated at startup and kept consistent via write-through
-    invalidation when identities are created or deleted.
-    """
-    if derive_id(secret) != identity_id:
-        return False
-
-    from .auth import verify_secret
-    from .cache import identity_hash_cache
-
-    # Try cache first — avoids a Turso round-trip per request
-    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
-    if cache_hit and cached_hash:
-        return verify_secret(secret, cached_hash)
-
-    # Cache miss — fall through to DB
-    conn = _get_conn(conn)
-    cursor = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
-        (ns, identity_id),
-        name="verify_identity_secret",
-    )
-    row = _row_to_dict(cursor.description, cursor.fetchone())
-
-    if not row:
-        return False
-
-    # Populate cache for next time
-    identity_hash_cache.set(f"identity:{ns}:{identity_id}", row["secret_hash"])
-
-    return verify_secret(secret, row["secret_hash"])
+    """Verify ``secret`` is a live secret of ``identity_id`` in ``ns``."""
+    resolved, _ = authenticate_secret(secret, ns, conn=conn)
+    return resolved is not None and _secrets_mod.compare_digest(resolved, identity_id)
 
 
 def verify_identity_in_namespace(
@@ -1495,40 +1582,359 @@ def verify_identity_in_namespace(
     secret: str,
     conn: sqlite3.Connection | None = None,
 ) -> str | None:
-    """Verify a secret belongs to some identity in the namespace. Returns identity ID or None.
+    """Verify a secret belongs to some identity in the namespace. Returns identity ID or None."""
+    resolved, _ = authenticate_secret(secret, ns, conn=conn)
+    return resolved
 
-    Uses the identity_hash_cache to avoid a Turso round-trip on every request.
-    """
-    identity_id = derive_id(secret)
 
-    from .auth import verify_secret
-    from .cache import identity_hash_cache
+# --- Identity secrets (versions) ---
+#
+# ``identity_secrets`` maps sha256(secret) to (ns, identity_id, version,
+# status). Authentication reads it from ``cache.secret_map``, which is loaded
+# whole at startup; every auth-relevant write commits, bumps
+# ``auth_generation`` and reloads the identity's rows into the map (write
+# through). Other processes notice the bump on their refresh tick
+# (``AUTH_REFRESH_SECONDS``) or on a throttled check when a hash misses.
+#
+# Calls that pass an explicit ``conn`` (local backends, which have their own
+# database file) bypass the map and read ``identity_secrets`` directly.
 
-    # Try cache first
-    cache_hit, cached_hash = identity_hash_cache.get(f"identity:{ns}:{identity_id}")
-    if cache_hit and cached_hash:
-        if verify_secret(secret, cached_hash):
-            return identity_id
+AUTH_REFRESH_SECONDS = float(os.environ.get("DEADROP_AUTH_REFRESH_SECONDS", "5"))
+AUTH_MISS_REFRESH_SECONDS = float(os.environ.get("DEADROP_AUTH_MISS_REFRESH_SECONDS", "1"))
+
+AUTH_UNKNOWN = "unknown"
+AUTH_RETIRED = "retired"
+
+_secret_map_lock = threading.RLock()
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ts(value: str | None) -> float | None:
+    if not value:
         return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
-    # Cache miss — fall through to DB
-    conn = _get_conn(conn)
-    cursor = conn.execute(
-        "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
-        (ns, identity_id),
-        name="verify_identity_in_namespace",
+
+def _insert_secret_version(
+    conn: sqlite3.Connection,
+    ns: str,
+    identity_id: str,
+    secret_hash: str,
+    version: int,
+    *,
+    switch_grace: int | None,
+) -> None:
+    conn.execute(
+        """INSERT INTO identity_secrets
+           (secret_hash, ns, identity_id, version, status, switch_grace, created_at)
+           VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+        (secret_hash, ns, identity_id, version, switch_grace, _iso_now()),
+        name="identity_secrets.insert",
     )
-    row = _row_to_dict(cursor.description, cursor.fetchone())
 
+
+# Pre-versioning code authenticates from ``identities.secret_hash`` (and only
+# the original secret, since it derives the id from it). Keep that column
+# equal to version 1's hash while v1 is live and unmatchable once v1 is
+# burned, so a code rollback cannot bring a burned secret back.
+_V1_LEGACY_HASH = (
+    "CASE WHEN s.status = 'burned' THEN 'retired:' || s.secret_hash ELSE s.secret_hash END"
+)
+
+
+def _bump_auth_generation(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "UPDATE auth_generation SET gen = gen + 1 WHERE id = 1", name="auth_generation.bump"
+    )
+    conn.execute(
+        f"""UPDATE identities SET secret_hash = (
+               SELECT {_V1_LEGACY_HASH} FROM identity_secrets s
+               WHERE s.ns = identities.ns AND s.identity_id = identities.id AND s.version = 1)
+           WHERE EXISTS (
+               SELECT 1 FROM identity_secrets s
+               WHERE s.ns = identities.ns AND s.identity_id = identities.id AND s.version = 1
+               AND identities.secret_hash IS NOT {_V1_LEGACY_HASH})""",
+        name="identities.mirror_v1_hash",
+    )
+
+
+_NO_V1 = """NOT EXISTS (SELECT 1 FROM identity_secrets s
+    WHERE s.ns = i.ns AND s.identity_id = i.id AND s.version = 1)"""
+
+
+def identities_without_v1(conn: sqlite3.Connection | None = None) -> list[tuple[str, str]]:
+    """``(ns, id)`` of every identity with no version-1 secret row.
+
+    Such an identity cannot authenticate. Pre-versioning code inserts into
+    ``identities`` only, so an identity it creates after migration 010 (deploy
+    overlap, or a code rollback) lands here until seeded with ``seed_v1``.
+    """
+    rows = (
+        _get_conn(conn)
+        .execute(
+            f"SELECT i.ns, i.id FROM identities i WHERE {_NO_V1} ORDER BY i.ns, i.id",
+            name="identities.without_v1",
+        )
+        .fetchall()
+    )
+    return [(r[0], r[1]) for r in rows]
+
+
+def seed_v1(ns: str, identity_id: str, conn: sqlite3.Connection | None = None) -> bool:
+    """Make an identity's ``identities.secret_hash`` its version 1, as migration 010 did.
+
+    False when the identity does not exist or already has a version 1.
+    """
+    c = _get_conn(conn)
+    row = c.execute(
+        f"SELECT i.secret_hash FROM identities i WHERE i.ns = ? AND i.id = ? AND {_NO_V1}",
+        (ns, identity_id),
+        name="identities.seed_v1_lookup",
+    ).fetchone()
     if not row:
-        return None
+        return False
+    _insert_secret_version(c, ns, identity_id, row[0], 1, switch_grace=None)
+    _bump_auth_generation(c)
+    c.commit()
+    return True
 
-    # Populate cache
-    identity_hash_cache.set(f"identity:{ns}:{identity_id}", row["secret_hash"])
 
-    if verify_secret(secret, row["secret_hash"]):
-        return identity_id
-    return None
+def get_auth_generation(conn: sqlite3.Connection | None = None) -> int | None:
+    row = (
+        _get_conn(conn)
+        .execute("SELECT gen FROM auth_generation WHERE id = 1", name="auth_generation.get")
+        .fetchone()
+    )
+    return int(row[0]) if row else None
+
+
+_SECRET_COLUMNS = (
+    "secret_hash, ns, identity_id, version, status, grace_until, last_seen_at, switch_grace"
+)
+
+
+def _secret_entries(conn: sqlite3.Connection, where: str = "", params: tuple = ()) -> dict:
+    from .cache import SecretEntry
+
+    cursor = conn.execute(
+        f"SELECT {_SECRET_COLUMNS} FROM identity_secrets {where}",
+        params,
+        name="identity_secrets.select",
+    )
+    return {
+        row[0]: SecretEntry(
+            ns=row[1],
+            identity_id=row[2],
+            version=int(row[3]),
+            status=row[4],
+            grace_until=_ts(row[5]),
+            seen=row[6] is not None,
+            switch_grace=row[7],
+        )
+        for row in cursor.fetchall()
+    }
+
+
+def load_secret_map(conn: sqlite3.Connection | None = None) -> int:
+    """Load the whole secret lookup table into ``cache.secret_map``."""
+    from .cache import secret_map
+
+    c = _get_conn(conn)
+    with _secret_map_lock:
+        generation = get_auth_generation(c)
+        entries = _secret_entries(c)
+        secret_map.replace_all(entries, generation)
+        secret_map.last_refresh = time.monotonic()
+    return len(entries)
+
+
+def refresh_secret_map(conn: sqlite3.Connection | None = None) -> bool:
+    """Reload the table if ``auth_generation`` moved (or it was never loaded).
+
+    One single-row read when nothing changed. Returns whether it reloaded.
+    """
+    from .cache import secret_map
+
+    with _secret_map_lock:
+        if secret_map.loaded:
+            secret_map.last_refresh = time.monotonic()
+            if get_auth_generation(conn) == secret_map.generation:
+                return False
+        load_secret_map(conn)
+        return True
+
+
+def reload_identity_secrets(ns: str, identity_id: str) -> None:
+    """Write-through: replace one identity's rows in ``cache.secret_map``."""
+    from .cache import secret_map
+
+    with _secret_map_lock:
+        entries = _secret_entries(
+            get_connection(), "WHERE ns = ? AND identity_id = ?", (ns, identity_id)
+        )
+        secret_map.replace_identity(ns, identity_id, entries)
+
+
+def lookup_secret_hash(secret_hash: str, conn: sqlite3.Connection | None = None):
+    """Resolve a secret hash to its ``SecretEntry``, or None.
+
+    Served from memory. A hash the map does not hold triggers at most one
+    refresh per ``AUTH_MISS_REFRESH_SECONDS`` across all callers (a
+    generation read, plus a reload only if it moved), so a flood of unknown
+    secrets costs at most one small read per interval.
+    """
+    from .cache import secret_map
+
+    if conn is not None:
+        return _secret_entries(_get_conn(conn), "WHERE secret_hash = ?", (secret_hash,)).get(
+            secret_hash
+        )
+    entry = secret_map.get(secret_hash)
+    if entry is not None:
+        return entry
+    with _secret_map_lock:
+        entry = secret_map.get(secret_hash)
+        if entry is not None:
+            return entry
+        recent = time.monotonic() - secret_map.last_refresh < AUTH_MISS_REFRESH_SECONDS
+        if secret_map.loaded and recent:
+            return None
+        secret_map.last_refresh = time.monotonic()
+        refresh_secret_map()
+        return secret_map.get(secret_hash)
+
+
+def check_secret_entry(entry, secret_hash: str, ns: str | None, *, record: bool = True):
+    """Decide auth for a resolved entry. Memory only.
+
+    Returns ``(identity_id, error, needs_switch)``. ``needs_switch`` means this
+    is the first use of a rekeyed version: call :func:`apply_first_use`
+    before trusting older versions' state.
+    """
+    from .cache import secret_map
+
+    if entry is None or (ns is not None and entry.ns != ns):
+        return None, AUTH_UNKNOWN, False
+    if entry.effective_status(time.time()) == "burned":
+        if record:
+            secret_map.note_burned(secret_hash)
+        return None, AUTH_RETIRED, False
+    needs_switch = entry.status == "active" and not entry.seen and entry.switch_grace is not None
+    if record and not needs_switch:
+        secret_map.note_seen(secret_hash)
+    return entry.identity_id, None, needs_switch
+
+
+def apply_first_use(secret_hash: str, conn: sqlite3.Connection | None = None) -> None:
+    """First authenticated use of a rekeyed version: retire the older ones.
+
+    Older live versions go to ``grace`` for the new version's
+    ``switch_grace`` seconds, or straight to ``burned`` when it is 0. Only a
+    request that hashed to the new version reaches here, so an old or
+    burned secret can neither trigger nor block the switch. Idempotent
+    across processes: the guard is ``last_seen_at IS NULL`` on the new row.
+    """
+    c = _get_conn(conn)
+    row = c.execute(
+        """SELECT ns, identity_id, version, switch_grace FROM identity_secrets
+           WHERE secret_hash = ? AND status = 'active' AND last_seen_at IS NULL""",
+        (secret_hash,),
+        name="identity_secrets.first_use.select",
+    ).fetchone()
+    if row is not None:
+        ns, identity_id, version, grace = row[0], row[1], int(row[2]), int(row[3] or 0)
+        now = datetime.now(timezone.utc)
+        c.execute(
+            "UPDATE identity_secrets SET last_seen_at = ? WHERE secret_hash = ?",
+            (now.isoformat(), secret_hash),
+            name="identity_secrets.first_use.seen",
+        )
+        if grace <= 0:
+            c.execute(
+                """UPDATE identity_secrets SET status = 'burned', burned_at = ?
+                   WHERE ns = ? AND identity_id = ? AND version < ?
+                   AND status IN ('active', 'grace')""",
+                (now.isoformat(), ns, identity_id, version),
+                name="identity_secrets.first_use.burn",
+            )
+        else:
+            until = (now + timedelta(seconds=grace)).isoformat()
+            c.execute(
+                """UPDATE identity_secrets SET status = 'grace', grace_until = ?
+                   WHERE ns = ? AND identity_id = ? AND version < ? AND status = 'active'""",
+                (until, ns, identity_id, version),
+                name="identity_secrets.first_use.grace",
+            )
+        _bump_auth_generation(c)
+        c.commit()
+    if conn is None:
+        entry = lookup_secret_hash(secret_hash)
+        if entry is not None:
+            reload_identity_secrets(entry.ns, entry.identity_id)
+
+
+def authenticate_secret(
+    secret: str, ns: str | None = None, conn: sqlite3.Connection | None = None
+) -> tuple[str | None, str | None]:
+    """Resolve an inbox secret to ``(identity_id, None)`` or ``(None, error)``.
+
+    ``error`` is ``AUTH_RETIRED`` for a burned version (a stale device) and
+    ``AUTH_UNKNOWN`` otherwise. Writes only on a rekeyed version's first use.
+    """
+    secret_hash = hash_secret(secret)
+    entry = lookup_secret_hash(secret_hash, conn)
+    identity_id, error, needs_switch = check_secret_entry(
+        entry, secret_hash, ns, record=conn is None
+    )
+    if needs_switch:
+        apply_first_use(secret_hash, conn)
+    return identity_id, error
+
+
+def flush_secret_activity(conn: sqlite3.Connection | None = None) -> None:
+    """Persist buffered stale-use counters and last-seen times; burn due grace.
+
+    Called from the refresh tick on the write executor.
+    """
+    from .cache import secret_map
+
+    burned, seen = secret_map.take_activity()
+    now = time.time()
+    due_grace = secret_map.has_due_grace(now)
+    if not burned and not seen and not due_grace:
+        return
+    c = _get_conn(conn)
+    for secret_hash, (count, ts) in burned.items():
+        c.execute(
+            """UPDATE identity_secrets SET burned_attempts = burned_attempts + ?,
+               last_seen_at = ? WHERE secret_hash = ?""",
+            (count, datetime.fromtimestamp(ts, timezone.utc).isoformat(), secret_hash),
+            name="identity_secrets.flush_burned",
+        )
+    for secret_hash, ts in seen.items():
+        c.execute(
+            "UPDATE identity_secrets SET last_seen_at = ? WHERE secret_hash = ? "
+            "AND (switch_grace IS NULL OR last_seen_at IS NOT NULL)",
+            (datetime.fromtimestamp(ts, timezone.utc).isoformat(), secret_hash),
+            name="identity_secrets.flush_seen",
+        )
+    if due_grace:
+        c.execute(
+            """UPDATE identity_secrets SET status = 'burned', burned_at = grace_until
+               WHERE status = 'grace' AND grace_until <= ?""",
+            (datetime.fromtimestamp(now, timezone.utc).isoformat(),),
+            name="identity_secrets.burn_due_grace",
+        )
+        _bump_auth_generation(c)
+    c.commit()
+    if due_grace:
+        refresh_secret_map()
 
 
 def delete_identity(
@@ -1536,12 +1942,20 @@ def delete_identity(
     identity_id: str,
     conn: sqlite3.Connection | None = None,
 ) -> bool:
-    """Delete an identity and all its messages."""
-    conn = _get_conn(conn)
-    cursor = conn.execute(
+    """Delete an identity, its messages and its secrets."""
+    db_conn = _get_conn(conn)
+    cursor = db_conn.execute(
         "DELETE FROM identities WHERE ns = ? AND id = ?", (ns, identity_id), name="delete_identity"
     )
-    conn.commit()
+    db_conn.execute(
+        "DELETE FROM identity_secrets WHERE ns = ? AND identity_id = ?",
+        (ns, identity_id),
+        name="delete_identity.secrets",
+    )
+    _bump_auth_generation(db_conn)
+    db_conn.commit()
+    if conn is None:
+        reload_identity_secrets(ns, identity_id)
     return cursor.rowcount > 0
 
 
@@ -1966,16 +2380,28 @@ def create_invite(
     created_by: str | None = None,
     expires_at: str | None = None,
     conn: sqlite3.Connection | None = None,
+    recovery: bool = False,
 ) -> dict:
-    """Create an invite record."""
+    """Create an invite record. ``recovery`` invites need the identity's PIN to claim."""
     conn = _get_conn(conn)
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
-        """INSERT INTO invites 
-           (invite_id, ns, identity_id, encrypted_secret, display_name, created_by, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (invite_id, ns, identity_id, encrypted_secret, display_name, created_by, now, expires_at),
+        """INSERT INTO invites
+           (invite_id, ns, identity_id, encrypted_secret, display_name, created_by, created_at,
+            expires_at, recovery)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            invite_id,
+            ns,
+            identity_id,
+            encrypted_secret,
+            display_name,
+            created_by,
+            now,
+            expires_at,
+            1 if recovery else 0,
+        ),
         name="create_invite",
     )
     conn.commit()
@@ -1995,7 +2421,7 @@ def get_invite(invite_id: str, conn: sqlite3.Connection | None = None) -> dict |
     conn = _get_conn(conn)
     cursor = conn.execute(
         """SELECT invite_id, ns, identity_id, encrypted_secret, display_name,
-                  created_by, created_at, expires_at, claimed_at, claimed_by
+                  created_by, created_at, expires_at, claimed_at, claimed_by, recovery
            FROM invites WHERE invite_id = ?""",
         (invite_id,),
         name="get_invite",
@@ -2008,7 +2434,8 @@ def get_invite_info(invite_id: str, conn: sqlite3.Connection | None = None) -> d
     """Get public invite info (without secrets)."""
     conn = _get_conn(conn)
     cursor = conn.execute(
-        """SELECT invite_id, ns, identity_id, display_name, created_at, expires_at, claimed_at
+        """SELECT invite_id, ns, identity_id, display_name, created_at, expires_at, claimed_at,
+                  recovery
            FROM invites WHERE invite_id = ?""",
         (invite_id,),
         name="get_invite_info",
@@ -2016,6 +2443,7 @@ def get_invite_info(invite_id: str, conn: sqlite3.Connection | None = None) -> d
     row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if row:
+        row["requires_pin"] = bool(row.pop("recovery", 0))
         ns_info = get_namespace(row["ns"], conn=conn)
         if ns_info:
             row["namespace_slug"] = ns_info.get("slug")
@@ -2053,12 +2481,15 @@ def claim_invite(
     if not row:
         return None
 
-    conn.execute(
-        "UPDATE invites SET claimed_at = ?, claimed_by = ? WHERE invite_id = ?",
+    claimed = conn.execute(
+        "UPDATE invites SET claimed_at = ?, claimed_by = ? "
+        "WHERE invite_id = ? AND claimed_at IS NULL",
         (now, claimed_by, invite_id),
         name="claim_invite.update",
     )
     conn.commit()
+    if claimed.rowcount == 0:
+        return None
 
     ns_info = get_namespace(row["ns"], conn=conn)
     if ns_info:
@@ -3091,85 +3522,60 @@ def get_room_member_info(
 
 def verify_room_access(
     room_id: str,
-    identity_id: str,
     secret: str,
     conn: sqlite3.Connection | None = None,
-) -> tuple[dict | None, str | None]:
-    """Verify room access in a single optimized query.
+) -> tuple[dict | None, str | None, str | None]:
+    """Verify room access: resolve the secret, then room + membership.
 
-    This combines:
-    - get_room (room exists check)
-    - is_room_member (membership check)
-    - verify_identity_secret (auth check)
-
-    Into a single database round-trip plus cached hash verification.
-
-    Args:
-        room_id: Room ID to access
-        identity_id: Identity ID (derived from secret)
-        secret: The inbox secret for verification
-        conn: Optional database connection
+    The secret is resolved through the in-memory secret table; room and
+    membership come from their caches, falling back to one combined query.
 
     Returns:
-        (room, error_message) tuple:
-        - If successful: (room_dict, None)
-        - If failed: (None, error_message)
+        ``(room, identity_id, None)`` on success, ``(None, None, error)``
+        otherwise. ``error`` is ``auth.RETIRED_DETAIL`` for a burned secret.
     """
-    from .auth import derive_id, verify_secret
-    from .cache import identity_hash_cache, membership_cache, room_cache
+    from .auth import RETIRED_DETAIL
+    from .cache import membership_cache, room_cache
     from .metrics import timed_db_operation
 
-    # First verify the identity_id matches the secret (no DB needed)
-    if derive_id(secret) != identity_id:
-        return None, "Secret does not match identity"
+    identity_id, auth_error = authenticate_secret(secret, conn=conn)
+    if identity_id is None:
+        if auth_error == AUTH_RETIRED:
+            return None, None, RETIRED_DETAIL
+        return None, None, "Invalid inbox secret"
 
     # Check room cache first
     cache_hit, cached_room = room_cache.get(f"room:{room_id}")
     if cache_hit and cached_room is None:
-        return None, "Room not found"
+        return None, None, "Room not found"
 
-    # Check membership cache
     membership_key = f"member:{room_id}:{identity_id}"
     membership_hit, is_member = membership_cache.get(membership_key)
+    if cache_hit and cached_room and membership_hit and is_member:
+        if cached_room["ns"] != _secret_ns(secret, conn):
+            return None, None, "Invalid inbox secret"
+        return cached_room, identity_id, None
 
-    # Check identity hash cache
-    ns = cached_room["ns"] if cache_hit and cached_room else None
-    identity_key = f"identity:{ns}:{identity_id}" if ns else None
-    hash_hit, cached_hash = identity_hash_cache.get(identity_key) if identity_key else (False, None)
-
-    # If all cache hits, we can skip the database entirely
-    if cache_hit and cached_room and membership_hit and is_member and hash_hit and cached_hash:
-        # Just verify the password hash
-        if verify_secret(secret, cached_hash):
-            return cached_room, None
-        else:
-            return None, "Invalid inbox secret"
-
-    # Need to hit database - use optimized combined query
-    conn = _get_conn(conn)
-
+    db_conn = _get_conn(conn)
     with timed_db_operation("verify_room_access"):
-        cursor = conn.execute(
+        cursor = db_conn.execute(
             """
-            SELECT 
+            SELECT
                 r.room_id, r.ns, r.display_name, r.created_by, r.created_at,
-                m.identity_id as member_id,
-                i.secret_hash
+                m.identity_id as member_id
             FROM rooms r
             LEFT JOIN room_members m ON r.room_id = m.room_id AND m.identity_id = ?
-            LEFT JOIN identities i ON r.ns = i.ns AND i.id = ?
             WHERE r.room_id = ?
             """,
-            (identity_id, identity_id, room_id),
+            (identity_id, room_id),
             name="verify_room_access",
         )
         row = _row_to_dict(cursor.description, cursor.fetchone())
 
     if not row:
         room_cache.set(f"room:{room_id}", None, ttl=60)  # Cache negative result briefly
-        return None, "Room not found"
+        return None, None, "Room not found"
 
-    # Build room dict
     room = {
         "room_id": row["room_id"],
         "ns": row["ns"],
@@ -3177,29 +3583,21 @@ def verify_room_access(
         "created_by": row["created_by"],
         "created_at": row["created_at"],
     }
-
-    # Cache the room
     room_cache.set(f"room:{room_id}", room)
 
-    # Check membership
     if not row.get("member_id"):
         membership_cache.set(membership_key, False)
-        return None, "Not a member of this room"
+        return None, None, "Not a member of this room"
     membership_cache.set(membership_key, True)
 
-    # Check identity exists and verify secret
-    secret_hash = row.get("secret_hash")
-    if not secret_hash:
-        return None, "Identity not found in namespace"
+    if room["ns"] != _secret_ns(secret, conn):
+        return None, None, "Invalid inbox secret"
+    return room, identity_id, None
 
-    # Cache the hash
-    identity_hash_cache.set(f"identity:{room['ns']}:{identity_id}", secret_hash)
 
-    # Verify the secret
-    if not verify_secret(secret, secret_hash):
-        return None, "Invalid inbox secret"
-
-    return room, None
+def _secret_ns(secret: str, conn: sqlite3.Connection | None = None) -> str | None:
+    entry = lookup_secret_hash(hash_secret(secret), conn)
+    return entry.ns if entry else None
 
 
 def get_room_cached(
@@ -3238,44 +3636,6 @@ def get_room_cached(
     # Cache the result (even if None)
     room_cache.set(f"room:{room_id}", row, ttl=60 if row is None else 300)
     return row
-
-
-def get_identity_hash_cached(
-    ns: str,
-    identity_id: str,
-    conn: sqlite3.Connection | None = None,
-) -> str | None:
-    """Get identity secret hash with caching.
-
-    Args:
-        ns: Namespace ID
-        identity_id: Identity ID
-        conn: Optional database connection
-
-    Returns:
-        Secret hash or None if identity not found
-    """
-    from .cache import identity_hash_cache
-    from .metrics import timed_db_operation
-
-    cache_key = f"identity:{ns}:{identity_id}"
-    cache_hit, cached_hash = identity_hash_cache.get(cache_key)
-    if cache_hit:
-        return cached_hash
-
-    conn = _get_conn(conn)
-
-    with timed_db_operation("get_identity_hash_cached"):
-        cursor = conn.execute(
-            "SELECT secret_hash FROM identities WHERE ns = ? AND id = ?",
-            (ns, identity_id),
-            name="get_identity_hash_cached",
-        )
-        row = cursor.fetchone()
-
-    secret_hash = row[0] if row else None
-    identity_hash_cache.set(cache_key, secret_hash)
-    return secret_hash
 
 
 def is_room_member_cached(
