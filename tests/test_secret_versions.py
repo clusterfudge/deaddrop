@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 import time
+import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -291,7 +292,7 @@ def test_cli_burn_sends_confirm_only_with_yes(monkeypatch, capsys):
         def json(self):
             return {"live_versions": 0}
 
-    monkeypatch.setattr(cli, "get_namespace_config", lambda ns: object())
+    monkeypatch.setattr(cli, "_rekey_ns_config", lambda ns: types.SimpleNamespace(ns=ns))
     monkeypatch.setattr(
         cli, "_rekey_http", lambda *a, json_data=None: sent.append(json_data) or Resp()
     )
