@@ -4,7 +4,9 @@
 Boots real uvicorn processes from two checkouts against the same database and
 drives them over HTTP. With no TURSO_URL set it uses a throwaway sqlite file;
 with TURSO_URL/TURSO_AUTH_TOKEN in the environment it runs against that
-database instead (a rehearsal clone, never production).
+database instead (a rehearsal clone, never production). The database must
+be pre-migration (v9) when the script starts: scenario A has the new server
+perform migration 010. On a rehearsal clone, run it before `migrate`.
 
     OLD_TREE=~/src/deaddrop-compat-old NEW_TREE=~/src/deaddrop-compat-audit \
         python scripts/compat_old_new.py

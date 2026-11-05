@@ -6,12 +6,17 @@ which Turso serves from its own storage (point-in-time seed); the source is
 never opened, written or given a token.
 
     python scripts/rehearse_on_turso_clone.py plan       # offline: print the steps
-    python scripts/rehearse_on_turso_clone.py create     # copy deaddrop-east -> clone
+    python scripts/rehearse_on_turso_clone.py create     # copy deaddrop-east -> clone (v9)
     python scripts/rehearse_on_turso_clone.py verify-v9  # read-only checks, pre-migration
+    python scripts/rehearse_on_turso_clone.py run        # old+new servers vs the v9 clone
     python scripts/rehearse_on_turso_clone.py migrate    # new code's startup path on the clone
     python scripts/rehearse_on_turso_clone.py verify     # read-only checks, post-migration
-    python scripts/rehearse_on_turso_clone.py run        # old+new servers vs the clone
     python scripts/rehearse_on_turso_clone.py teardown   # destroy the clone
+
+Order matters: ``run`` executes scripts/compat_old_new.py, which starts from a
+pre-migration (v9) database (the new server inside it performs migration 010).
+Run it before ``migrate``; afterwards ``migrate`` is a no-op re-run of the
+startup path and ``verify`` checks the migrated state.
 
 Credentials: the Turso platform token is read from the credential store
 entry ``turso`` inside this process (bridge :9877, else :9876) and never
@@ -197,6 +202,7 @@ def cmd_migrate() -> None:
 
 
 def cmd_run() -> None:
+    """compat_old_new.py needs a v9 starting state: run before ``migrate``."""
     env = _clone_env()
     sys.exit(subprocess.call([sys.executable, str(HERE / "compat_old_new.py")], env=env))
 
