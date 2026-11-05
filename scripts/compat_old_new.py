@@ -208,7 +208,7 @@ def main() -> int:
         code, nsr = old.call(
             "POST",
             "/admin/namespaces",
-            {"metadata": {"display_name": "compat"}},
+            {"metadata": {"display_name": "compat", "rehearsal": "compat_old_new"}},
             {"X-Admin-Token": ADMIN},
         )
         assert code == 200, (code, nsr)
