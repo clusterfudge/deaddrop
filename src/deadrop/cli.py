@@ -2110,6 +2110,7 @@ def _rekey_one(
     credential_store: str,
     pin: str | None = None,
     rotated: list[str] | None = None,
+    credential_map_path: str | None = None,
 ) -> dict:
     data = _rekey_http(
         "POST",
@@ -2150,6 +2151,16 @@ def _rekey_one(
         print(
             f"  credential {entry['credential']}.{entry['field']}: {'updated' if ok else 'FAILED'}"
         )
+        if not ok:
+            print(
+                f"Error: {identity_id} is rotated (new secret in {ns_cfg.get_path()}) but"
+                f" credential {entry['credential']} still holds the old one. Fix the store, then"
+                f" run: deadrop rekey identity {ns_cfg.ns} {identity_id}"
+                f" --credential-map {credential_map_path} --credential-store {credential_store}"
+                f"  (or with a PIN on file: deadrop rekey invite {ns_cfg.ns} {identity_id})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     elif invite:
         path = _mint_recovery_invite(
             ns_cfg,
@@ -2189,6 +2200,7 @@ def rekey_identity_cmd(
     Fix-forward: identities in --credential-map get the new secret PATCHed
     into the credential store; the rest get a single-use recovery invite
     written to a 0600 file (and piped to --deliver-cmd's stdin, if given).
+    A failed credential-store update exits 1 with the recovery command.
     """
     ns_cfg = _rekey_ns_config(ns)
     _rekey_one(
@@ -2204,6 +2216,7 @@ def rekey_identity_cmd(
         credential_map=_load_credential_map(credential_map),
         credential_store=credential_store,
         pin=_prompt_pin() if set_pin and not dry_run else None,
+        credential_map_path=credential_map,
     )
 
 
@@ -2229,7 +2242,8 @@ def rekey_all_cmd(
 
     Unless --no-invite, every target outside --credential-map needs a recovery
     PIN; if any lacks one, nothing is rotated (dry run included). A failure
-    mid-run lists which identities were rotated and which were not.
+    mid-run, including a failed credential-store update, stops the run and
+    lists which identities were rotated and which were not.
     """
     ns_cfg = _rekey_ns_config(ns)
     identities = _rekey_http("GET", f"/{ns_cfg.ns}/identities", ns_cfg).json()
@@ -2273,6 +2287,7 @@ def rekey_all_cmd(
                 credential_map=cmap,
                 credential_store=credential_store,
                 rotated=rotated,
+                credential_map_path=credential_map,
             )
     except BaseException:
         if not dry_run:

@@ -1,5 +1,7 @@
 """`deadrop rekey` CLI against the in-process API: `rekey all` preflight and namespace lookup."""
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -140,3 +142,65 @@ def test_rekey_namespace_ambiguous_or_unknown_lists_candidates(server, capsys):
         cli.rekey_status_cmd("nope")
     err = capsys.readouterr().err
     assert "no local namespace matches 'nope'" in err and a.ns in err and b.ns in err
+
+
+def _failing_store(monkeypatch, *, raise_error):
+    import httpx
+
+    def patch(url, *, json=None, timeout=None):
+        if raise_error:
+            raise httpx.ConnectError("refused")
+        return httpx.Response(503)
+
+    monkeypatch.setattr(cli.httpx, "patch", patch)
+
+
+def _map(tmp_path, ids):
+    path = tmp_path / "map.json"
+    path.write_text(
+        json.dumps({i: {"credential": f"cred-{n}", "field": "secret"} for n, i in ids.items()})
+    )
+    return str(path)
+
+
+def test_rekey_identity_exits_nonzero_when_the_store_update_fails(
+    server, capsys, monkeypatch, tmp_path
+):
+    cfg, ids = _namespace(server, "Twin", ["alice"])
+    old = _local_secrets(cfg)[ids["alice"]]
+    _failing_store(monkeypatch, raise_error=False)
+    cmap = _map(tmp_path, ids)
+    with pytest.raises(SystemExit) as e:
+        cli.rekey_identity_cmd("twin", ids["alice"], credential_map=cmap)
+    assert e.value.code == 1
+    out, err = capsys.readouterr()
+    new = _local_secrets(cfg)[ids["alice"]]
+    assert new != old and _versions(server, cfg)[ids["alice"]] == 2
+    assert "credential cred-alice.secret: FAILED" in out
+    assert "returned 503 for cred-alice" in err
+    assert f"deadrop rekey identity {cfg.ns} {ids['alice']} --credential-map {cmap}" in err
+    assert f"deadrop rekey invite {cfg.ns} {ids['alice']}" in err
+    assert new not in out + err and old not in out + err
+
+
+def test_rekey_all_stops_at_the_first_store_failure(server, capsys, monkeypatch, tmp_path):
+    cfg, ids = _namespace(server, "Twin", ["alice", "bob", "carol"])
+    before = _local_secrets(cfg)
+    order = [
+        i["id"]
+        for i in server.get(
+            f"/{cfg.ns}/identities", headers={"X-Namespace-Secret": cfg.secret}
+        ).json()
+    ]
+    _failing_store(monkeypatch, raise_error=True)
+    with pytest.raises(SystemExit) as e:
+        cli.rekey_all_cmd(cfg.ns, credential_map=_map(tmp_path, ids))
+    assert e.value.code == 1
+    out, err = capsys.readouterr()
+    assert "credential store unreachable (ConnectError)" in err
+    assert f"ABORTED at {order[0]}: 1/3 rotated" in err
+    assert f"rotated      {order[0]}" in err and "(fix-forward did not finish)" in err
+    assert f"NOT rotated  {order[1]}" in err and f"NOT rotated  {order[2]}" in err
+    assert [_versions(server, cfg)[i] for i in order] == [2, 1, 1]
+    for secret in [*before.values(), *_local_secrets(cfg).values()]:
+        assert secret not in out + err
