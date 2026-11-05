@@ -386,6 +386,27 @@ class TestPathRedaction:
         assert f"/mcp/{room['ns']}/<redacted>" in logged
         assert room["secret"] not in logged
 
+    def test_turso_unavailable_log_never_carries_the_secret(self, caplog):
+        """The 503 handler logs the path it failed on, so it must redact too."""
+        import asyncio
+
+        from starlette.requests import Request
+
+        from deadrop import api
+        from deadrop.turso_http import TursoUnavailableError
+
+        secret = "s3cret" * 10
+        request = Request(
+            {"type": "http", "method": "POST", "path": f"/mcp/abc123/{secret}", "headers": []}
+        )
+        with caplog.at_level("ERROR", logger=api.__name__):
+            response = asyncio.run(
+                api._turso_unavailable(request, TursoUnavailableError("read timed out"))
+            )
+        assert response.status_code == 503
+        assert "/mcp/abc123/<redacted>" in caplog.text
+        assert secret not in caplog.text
+
 
 class TestToolListing:
     def test_lists_three_tools(self, mcp_client, mcp_path):

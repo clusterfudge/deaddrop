@@ -213,7 +213,11 @@ app = FastAPI(
 @app.exception_handler(TursoUnavailableError)
 async def _turso_unavailable(request: Request, exc: TursoUnavailableError):
     """Turso didn't answer in time: tell the client to retry, not that we broke."""
-    logging.getLogger(__name__).error(f"Turso unavailable on {request.url.path}: {exc}")
+    from .mcp_server import redact_path
+
+    logging.getLogger(__name__).error(
+        f"Turso unavailable on {redact_path(request.url.path)}: {exc}"
+    )
     return JSONResponse({"detail": "Database unavailable — please retry"}, status_code=503)
 
 
