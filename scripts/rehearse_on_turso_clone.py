@@ -170,11 +170,18 @@ if EXPECT >= 10:
     check("no orphan secret rows", q(
         "SELECT COUNT(*) FROM identity_secrets s WHERE NOT EXISTS (SELECT 1 FROM identities i"
         " WHERE i.ns = s.ns AND i.id = s.identity_id)")[0][0] == 0)
+    # Namespaces a rehearsal harness made (compat_old_new.py, e2e_rotation) carry
+    # metadata.rehearsal; their identities were minted by new code, with random ids.
+    harness = "json_extract(n.metadata, '$.rehearsal') IS NOT NULL"
+    n_harness = q("SELECT COUNT(*) FROM identities i JOIN namespaces n ON n.ns = i.ns WHERE "
+                  + harness)[0][0]
     bad = q("SELECT COUNT(*) FROM identity_secrets s JOIN identities i"
-            " ON i.ns = s.ns AND i.id = s.identity_id WHERE s.version = 1 AND"
+            " ON i.ns = s.ns AND i.id = s.identity_id JOIN namespaces n ON n.ns = i.ns"
+            " WHERE s.version = 1 AND NOT (" + harness + ") AND"
             " (s.secret_hash != i.secret_hash OR substr(s.secret_hash, 1, 16) != i.id)"
             " AND s.status != 'burned'")[0][0]
-    check("v1 hash == identities.secret_hash and id == hash[:16] (legacy ids)", bad == 0, bad)
+    check("v1 hash == identities.secret_hash and id == hash[:16] (legacy ids)", bad == 0,
+          f"{bad} (skipped {n_harness} rehearsal-harness identities)")
     check("auth_generation seeded", q("SELECT COUNT(*) FROM auth_generation")[0][0] == 1)
     check("no recovery invites yet", q(
         "SELECT COUNT(*) FROM invites WHERE recovery != 0")[0][0] == 0)
