@@ -5,15 +5,18 @@ Boots real uvicorn processes from two checkouts against the same database and
 drives them over HTTP. With no TURSO_URL set it uses a throwaway sqlite file;
 with TURSO_URL/TURSO_AUTH_TOKEN in the environment it runs against that
 database instead (a rehearsal clone, never production). The database must
-be pre-migration (v9) when the script starts: scenario A has the new server
-perform migration 010. On a rehearsal clone, run it before `migrate`.
+be pre-migration (v9) when the script starts: scenario A runs the new tree's
+Procfile `release` task (the dokku predeploy step) to perform migration 010.
+On a rehearsal clone, run it before `migrate`.
 
     OLD_TREE=~/src/deaddrop-compat-old NEW_TREE=~/src/deaddrop-compat-audit \
         python scripts/compat_old_new.py
 
 Scenarios:
-  A  old server writes the DB (v9), new server starts (runs migration 010):
-     old identities authenticate, ids unchanged, rooms/history readable.
+  A  old server writes the DB (v9); the new server refuses to start on it;
+     the release task migrates to v10 while the old server keeps serving;
+     the new server starts: old identities authenticate, ids unchanged,
+     rooms/history readable.
   B  overlap: both servers up; an identity created on the OLD server after the
      migration reads on the old server and is REJECTED (403) on the new one,
      also after a restart. Accepted: it stays locked out until seeded by hand.
@@ -52,7 +55,7 @@ class Server:
         self.tree, self.port, self.env, self.log = tree, port, env, log
         self.proc: subprocess.Popen | None = None
 
-    def start(self) -> "Server":
+    def _spawn(self) -> None:
         fh = open(self.log, "ab")
         self.proc = subprocess.Popen(
             [
@@ -71,6 +74,10 @@ class Server:
             stdout=fh,
             stderr=subprocess.STDOUT,
         )
+
+    def start(self) -> "Server":
+        self._spawn()
+        assert self.proc
         for _ in range(150):
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=1)
@@ -80,6 +87,21 @@ class Server:
                     raise RuntimeError(f"server exited, see {self.log}")
                 time.sleep(0.2)
         raise RuntimeError(f"server did not come up, see {self.log}")
+
+    def start_refused(self) -> int | None:
+        """Start, expecting an exit before /health answers; return the exit code."""
+        self._spawn()
+        assert self.proc
+        for _ in range(150):
+            if self.proc.poll() is not None:
+                return self.proc.returncode
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.2)
+        self.stop()
+        return None
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -145,6 +167,17 @@ def room_roundtrip(
     return code, room
 
 
+def run_release(tree: Path, env: dict[str, str]) -> tuple[int, str]:
+    """Run the tree's Procfile `release:` command, as dokku does before a deploy."""
+    lines = (tree / "Procfile").read_text().splitlines()
+    cmd = next(line for line in lines if line.startswith("release:")).split(":", 1)[1].strip()
+    env = {**env, "PATH": f"{tree / '.venv/bin'}:{env.get('PATH', '')}"}
+    p = subprocess.run(
+        ["nice", "-n", "19", "sh", "-c", cmd], cwd=tree, env=env, capture_output=True, text=True
+    )
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
 def cli(env: dict[str, str], *args: str) -> tuple[int, str]:
     """Run the NEW tree's `deadrop rekey ...` against the shared database."""
     p = subprocess.run(
@@ -170,7 +203,7 @@ def main() -> int:
     new = Server(NEW_TREE, 18602, new_env, work / "new.log")
     print(f"work dir {work}; db {'turso' if env.get('TURSO_URL') else env['DEADROP_DB']}")
     try:
-        # --- A: old writes, new migrates ---
+        # --- A: old writes, release task migrates, new starts ---
         old.start()
         code, nsr = old.call(
             "POST",
@@ -184,7 +217,17 @@ def main() -> int:
         code, room = room_roundtrip(old, ns, o1, o2)
         check("A0 old server baseline room roundtrip", code == 200, f"{code}")
 
-        new.start()  # runs migration 010 while old is still serving
+        rc = new.start_refused()
+        tail = new.log.read_text(errors="replace")[-2000:]
+        check(
+            "A0b new on the v9 DB refuses to start",
+            rc is not None and rc != 0 and "this build needs v10" in tail,
+            f"exit {rc}",
+        )
+        rc, out = run_release(NEW_TREE, new_env)  # while old is still serving
+        print(out, flush=True)
+        check("A0c release task migrates v9 -> v10", rc == 0 and "v9 -> v10" in out, f"exit {rc}")
+        new.start()
         check("A1 new: pre-migration identity reads inbox", can_read(new, ns, o1) == 200)
         code, _ = room_roundtrip(new, ns, o1, o2, room)
         check("A2 new: pre-migration room post+read", code == 200, f"{code}")

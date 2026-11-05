@@ -1763,6 +1763,7 @@ def serve(
         print("  DEADROP_ADMIN_TOKEN=.. Legacy static token", file=sys.stderr)
         sys.exit(1)
 
+    os.environ.setdefault("DEADROP_MIGRATE_ON_START", "1")
     uvicorn.run(
         "deadrop.api:app",
         host=host,

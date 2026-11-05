@@ -8,15 +8,20 @@ never opened, written or given a token.
     python scripts/rehearse_on_turso_clone.py plan       # offline: print the steps
     python scripts/rehearse_on_turso_clone.py create     # copy deaddrop-east -> clone (v9)
     python scripts/rehearse_on_turso_clone.py verify-v9  # read-only checks, pre-migration
+    python scripts/rehearse_on_turso_clone.py fail       # failure paths on the v9 clone
     python scripts/rehearse_on_turso_clone.py run        # old+new servers vs the v9 clone
-    python scripts/rehearse_on_turso_clone.py migrate    # new code's startup path on the clone
+    python scripts/rehearse_on_turso_clone.py migrate    # the Procfile release task, twice
     python scripts/rehearse_on_turso_clone.py verify     # read-only checks, post-migration
     python scripts/rehearse_on_turso_clone.py teardown   # destroy the clone
 
-Order matters: ``run`` executes scripts/compat_old_new.py, which starts from a
-pre-migration (v9) database (the new server inside it performs migration 010).
-Run it before ``migrate``; afterwards ``migrate`` is a no-op re-run of the
-startup path and ``verify`` checks the migrated state.
+Order matters: ``fail`` and ``run`` need the pre-migration (v9) clone.
+``fail`` runs the release task with a read-only token (it must exit nonzero
+and leave v9) and starts the new server on v9 (it must refuse).
+``run`` executes scripts/compat_old_new.py, which runs the release task
+(migration 010) while the old server serves. ``migrate`` then re-runs the
+release task twice (both must apply nothing) and ``verify`` checks the
+migrated state. The release task is read from the Procfile, so this is the
+command dokku runs before a deploy.
 
 Credentials: the Turso platform token is read from the credential store
 entry ``turso`` inside this process (bridge :9877, else :9876) and never
@@ -33,8 +38,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import date
@@ -47,6 +54,9 @@ CLONE = os.environ.get("REHEARSAL_DB", f"deaddrop-rehearsal-{date.today():%Y%m%d
 API = "https://api.turso.tech/v1"
 HERE = Path(__file__).resolve().parent
 NEW_TREE = Path(os.environ.get("NEW_TREE", HERE.parent))
+os.environ.setdefault("NEW_TREE", str(NEW_TREE))
+sys.path.insert(0, str(HERE))
+from compat_old_new import Server, run_release  # noqa: E402
 
 
 def _guard(name: str) -> None:
@@ -89,7 +99,7 @@ def _api(method: str, path: str, body: dict | None = None) -> dict:
         sys.exit(f"{method} {path}: HTTP {e.code} {e.read()[:300]!r}")
 
 
-def _clone_env() -> dict[str, str]:
+def _clone_env(authorization: str = "full-access") -> dict[str, str]:
     """TURSO_URL/TURSO_AUTH_TOKEN for the clone only (token minted, never printed)."""
     _guard(CLONE)
     info = _api("GET", f"/organizations/{ORG}/databases/{CLONE}")["database"]
@@ -98,7 +108,7 @@ def _clone_env() -> dict[str, str]:
         sys.exit(f"clone hostname {host!r} does not belong to {CLONE}")
     tok = _api(
         "POST",
-        f"/organizations/{ORG}/databases/{CLONE}/auth/tokens?expiration=1d&authorization=full-access",
+        f"/organizations/{ORG}/databases/{CLONE}/auth/tokens?expiration=1d&authorization={authorization}",
     )["jwt"]
     env = {
         k: v
@@ -187,18 +197,37 @@ def cmd_verify() -> None:
 
 
 def cmd_migrate() -> None:
-    """What the lifespan hook runs before serving (init_db), then the v1 check."""
+    """The Procfile release task (dokku predeploy) twice, then the v1 check."""
+    env = _clone_env()
+    ok = True
+    for attempt in (1, 2):
+        rc, out = run_release(NEW_TREE, env)
+        print(f"release run {attempt}: exit {rc}: {out}")
+        ok = ok and rc == 0 and "applied nothing" in out
     code = (
-        "import time; from deadrop import db; t = time.monotonic(); db.init_db();"
-        " n = len(db.identities_without_v1());"
-        " print(f'migrated to v{db.get_schema_version()} in {time.monotonic() - t:.1f}s;'"
-        " f' identities without a v1 row: {n}')"
+        "from deadrop import db; print(f'identities without a v1 row:"
+        " {len(db.identities_without_v1())}')"
     )
-    sys.exit(
-        subprocess.call(
-            [str(NEW_TREE / ".venv/bin/python"), "-c", code], env=_clone_env(), cwd=NEW_TREE / "src"
-        )
-    )
+    subprocess.call([str(NEW_TREE / ".venv/bin/python"), "-c", code], env=env, cwd=NEW_TREE / "src")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_fail() -> None:
+    """On the v9 clone: a release task that cannot write fails; the server refuses v9."""
+    if _checks(_clone_env(), 9) != 0:
+        sys.exit("fail needs the v9 clone: run it before `run`")
+    rc, out = run_release(NEW_TREE, _clone_env("read-only"))
+    print(f"release with a read-only token: exit {rc}: {out[-300:]}")
+    still_v9 = _checks(_clone_env(), 9) == 0
+    env = {**_clone_env(), "DEADROP_ADMIN_TOKEN": "rehearsal", "DEADROP_PUSH_ENABLED": ""}
+    log = Path(tempfile.mkdtemp(prefix="dd-fail-")) / "new.log"
+    code = Server(NEW_TREE, 18603, env, log).start_refused()
+    refusal = [ln for ln in log.read_text(errors="replace").splitlines() if "needs v" in ln]
+    print(f"new server on v9: exit {code}: {refusal[-1] if refusal else '(no refusal line)'}")
+    shutil.rmtree(log.parent)
+    ok = rc != 0 and still_v9 and code not in (None, 0) and bool(refusal)
+    print("PASS failure paths" if ok else "FAIL failure paths")
+    sys.exit(0 if ok else 1)
 
 
 def cmd_run() -> None:
@@ -218,6 +247,7 @@ if __name__ == "__main__":
         "plan": cmd_plan,
         "create": cmd_create,
         "verify-v9": cmd_verify_v9,
+        "fail": cmd_fail,
         "migrate": cmd_migrate,
         "verify": cmd_verify,
         "run": cmd_run,

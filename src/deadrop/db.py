@@ -1114,21 +1114,51 @@ SCHEMA_SQL = """
 """
 
 
-def init_db_with_conn(conn: sqlite3.Connection) -> None:
+def init_db_with_conn(conn: sqlite3.Connection) -> list[int]:
     """Initialize database schema with an explicit connection.
 
     Args:
         conn: Database connection to initialize.
+
+    Returns:
+        The migration versions applied (empty when already current).
     """
     conn.executescript(SCHEMA_SQL)
     conn.commit()
-    run_migrations(conn)
+    return run_migrations(conn)
 
 
-def init_db():
+def init_db() -> list[int]:
     """Initialize database schema using the global connection."""
     conn = get_connection()
-    init_db_with_conn(conn)
+    return init_db_with_conn(conn)
+
+
+def require_schema(conn: sqlite3.Connection | None = None) -> int:
+    """Return the schema version, raising if it is older than this code needs.
+
+    Read-only: unlike ``get_schema_version`` it does not create
+    ``schema_version``, so a server pointed at an unmigrated database refuses
+    to start without writing to it.
+    """
+    conn = _get_conn(conn)
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+        name="schema.version_table_exists",
+    ).fetchone()
+    version = 0
+    if exists:
+        row = conn.execute(
+            "SELECT MAX(version) FROM schema_version", name="schema.get_version"
+        ).fetchone()
+        version = row[0] if row and row[0] is not None else 0
+    if version < SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema is v{version}, this build needs v{SCHEMA_VERSION}: run"
+            " `python -m deadrop.migrate` (the Procfile release task), or set"
+            " DEADROP_MIGRATE_ON_START=1 to migrate at startup"
+        )
+    return version
 
 
 def reset_db(conn: sqlite3.Connection | None = None):

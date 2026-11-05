@@ -104,7 +104,14 @@ async def lifespan(app: FastAPI):
 
     configure_logging()
 
-    db.init_db()
+    # Production migrates in the Procfile release task (deadrop.migrate) before
+    # this process exists; here the server only refuses an older schema.
+    # DEADROP_MIGRATE_ON_START=1 keeps the migrate-at-startup path for local
+    # servers (`deadrop serve` sets it) that have no release phase.
+    if os.environ.get("DEADROP_MIGRATE_ON_START", "").lower() in ("1", "true", "yes"):
+        db.init_db()
+    else:
+        db.require_schema()
 
     # Background monitor: resolves Turso hostname and TCP-probes each IP
     # every 15s. Surfaces the "DNS returns a dead IP" scenario (2026-05-08
