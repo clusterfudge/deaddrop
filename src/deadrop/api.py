@@ -3103,14 +3103,21 @@ async def subscribe(
 
     await _validate_subscription_topics(ns, request.topics, caller_id)
 
-    # Subscribe is a READ path — non-v7 cursors degrade to "no cursor"
-    # so legacy v4 values in client state don't wedge the subscription.
-    request.topics = {
-        topic_key: _coerce_read_cursor(cursor, f"cursor for {topic_key}")
-        for topic_key, cursor in request.topics.items()
-    }
-
     event_bus = get_event_bus()
+
+    # Subscribe is a READ path — non-v7 cursors degrade rather than 400.
+    # An absent cursor (None/"") means "never seen" and reports every
+    # non-empty topic as changed. An unusable cursor means "unknown", so it
+    # is pinned to the topic's current latest mid: the call waits for its
+    # timeout like any caught-up subscriber, and a publish inside the window
+    # still wakes it with a v7 mid the client can adopt.
+    coerced: dict[str, str | None] = {}
+    for topic_key, cursor in request.topics.items():
+        resolved = _coerce_read_cursor(cursor, f"cursor for {topic_key}")
+        if resolved is None and cursor:
+            resolved = event_bus.get_latest(ns, topic_key)
+        coerced[topic_key] = resolved
+    request.topics = coerced
 
     if request.mode == "stream":
         # SSE streaming mode
