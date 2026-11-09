@@ -2,6 +2,19 @@
  * API client for Deadrop.
  */
 
+/**
+ * True when `value` is a UUID v7 string.
+ *
+ * Cursors are ordered by string comparison, which is only meaningful between
+ * UUIDv7s: a v4 such as '1e141d46-...' sorts above every v7 ('06af...'), so
+ * no real message ID can ever advance past it. Callers treat a non-v7 cursor
+ * as unset. Same pattern as the server's _UUID7_RE (api.py).
+ */
+function isUuidV7(value) {
+    return typeof value === 'string'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 const DeadropAPI = {
     /**
      * Make an authenticated API request.
@@ -346,7 +359,20 @@ class SubscriptionManager {
     _loadCursors() {
         try {
             const stored = localStorage.getItem(this._cursorKey());
-            return stored ? JSON.parse(stored) : {};
+            const parsed = stored ? JSON.parse(stored) : {};
+            if (!parsed || typeof parsed !== 'object') return {};
+            // Drop non-v7 entries so a poisoned profile heals on load.
+            const cursors = {};
+            const dropped = [];
+            for (const [topic, mid] of Object.entries(parsed)) {
+                if (isUuidV7(mid)) cursors[topic] = mid;
+                else dropped.push(topic);
+            }
+            if (dropped.length) {
+                console.warn('Dropped non-v7 stored cursors:', dropped.join(', '));
+                localStorage.setItem(this._cursorKey(), JSON.stringify(cursors));
+            }
+            return cursors;
         } catch (e) {
             return {};
         }
@@ -367,7 +393,9 @@ class SubscriptionManager {
      * Update cursor for a topic.
      */
     updateCursor(topic, mid) {
-        if (!this.cursors[topic] || mid > this.cursors[topic]) {
+        if (!isUuidV7(mid)) return;
+        const current = this.cursors[topic];
+        if (!isUuidV7(current) || mid > current) {
             this.cursors[topic] = mid;
             this._saveCursors();
         }
@@ -571,3 +599,4 @@ class SubscriptionManager {
 }
 
 window.SubscriptionManager = SubscriptionManager;
+window.isUuidV7 = isUuidV7;
