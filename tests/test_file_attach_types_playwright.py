@@ -153,7 +153,11 @@ class TestFileAttachTypes:
 
             browser.close()
 
-    def test_untyped_text_file_becomes_text_plain(self, server):
+    @pytest.mark.parametrize(
+        ("filename", "expected"),
+        [("debug.log", "text/plain"), ("trace.har", "application/har+json")],
+    )
+    def test_untyped_file_resolves_by_extension(self, server, filename, expected):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
@@ -163,7 +167,7 @@ class TestFileAttachTypes:
             page.set_input_files(
                 "#room-file-input",
                 {
-                    "name": "debug.log",
+                    "name": filename,
                     "mimeType": "application/octet-stream",
                     "buffer": b"2026-08-28 boom\n",
                 },
@@ -171,8 +175,8 @@ class TestFileAttachTypes:
             page.wait_for_function("pendingAttachments.length === 1", timeout=5000)
 
             att = page.evaluate("pendingAttachments[0]")
-            assert att["filename"] == "debug.log"
-            assert att["content_type"] == "text/plain"
+            assert att["filename"] == filename
+            assert att["content_type"] == expected
 
             browser.close()
 

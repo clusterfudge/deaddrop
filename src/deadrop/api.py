@@ -1826,6 +1826,7 @@ ALLOWED_ATTACHMENT_TYPE_PREFIXES = ("text/", "image/", "audio/", "video/")
 ALLOWED_ATTACHMENT_TYPES = frozenset(
     {
         "application/json",
+        "application/har+json",
         "application/yaml",
         "application/x-yaml",
         "application/xml",
