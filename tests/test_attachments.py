@@ -886,6 +886,7 @@ class TestAttachmentTypePolicy:
             ("voice.m4a", "audio/mp4"),
             ("voice.mp3", "audio/mpeg"),
             ("conf.yml", "application/x-yaml"),
+            ("trace.har", "application/har+json"),
         ],
     )
     def test_newly_accepted_types(self, client, room_setup, filename, content_type):
