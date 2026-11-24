@@ -1,64 +1,120 @@
 /* Deadrop Web App Styles */
 
+/* Graphite tokens: the web copy of heare-ios-voice Theme/ (derive.py output for the
+   default pair, Graphite #121214/#7B8CFF and Graphite Light #F4F4F6/#3D55E0).
+   Served at /assets/graphite.css. Dark is the default; light follows the system
+   unless <html data-theme="dark|light"> pins one. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://cdn.jsdelivr.net/npm/hack-font@3.3.0/build/web/hack.css');
+
 :root {
-    /* Core palette — light mode */
-    --bg-color: #f9fafb;
-    --card-bg: #ffffff;
-    --text-color: #1f2937;
-    --text-muted: #6b7280;
-    --border-color: #e5e7eb;
-    --hover-bg: #f3f4f6;
-    --surface: #f5f5f5;
-    --border: #e0e0e0;
-    --input-bg: #ffffff;
-    --code-bg: rgba(0, 0, 0, 0.06);
-    --code-block-bg: #f6f8fa;        /* Light slate, matches github.min.css hljs theme */
-    --code-block-text: #24292f;      /* Dark slate for readable contrast */
-    --table-header-bg: rgba(0, 0, 0, 0.04);
-    --unread-bg: rgba(37, 99, 235, 0.05);
-    --jump-highlight: rgba(37, 99, 235, 0.16);
-    --mark-bg: rgba(245, 158, 11, 0.35);
-
-    /* Accent / interactive */
-    --primary-color: #2563eb;
-    --primary-hover: #1d4ed8;
-    --danger-color: #dc2626;
-    --warning-color: #f59e0b;
-    --success-color: #10b981;
-
-    /* Misc */
-    --shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-    --radius: 8px;
-    --focus-ring: rgba(37, 99, 235, 0.15);
+  color-scheme: dark light;
+  --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  --mono: 'Hack', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --radius-card: 12px;
+  --radius-btn: 10px;
+  --radius-bubble: 18px;
+  --radius-chip: 6px;
+  --hairline: 1px;
+  --pad-page: 16px;
+  --pad-card: 12px;
+  --gap: 8px;
+  --bg: #121214;
+  --sheet: #1B1C1E;
+  --surface: #232426;
+  --divider: #313234;
+  --outline: #606163;
+  --fg: #E2E2EB;
+  --muted: #B0B0B6;
+  --accent: #7B8CFF;
+  --accent-text: #7B8CFF;
+  --on-accent: #121214;
+  --accent-container: #2B2F42;
+  --on-accent-container: #E2E2EB;
+  --error: #E66F64;
+  --error-container: #402A27;
+  --on-error: #121214;
+  --ok: #63AB74;
+  --ok-container: #233527;
+  --warn: #C78A3B;
+  --warn-container: #3C2D1C;
+  --shadow: none;
 }
 
-/* ---- Dark mode palette ---- */
-[data-theme="dark"] {
-    --bg-color: #0f1621;
-    --card-bg: #161e2d;
-    --text-color: #d4dae4;
-    --text-muted: #9aa3b4;      /* was #8892a4 — bumped for readability */
-    --border-color: #506c90;    /* was #2a3448 — 3.09:1 on card, 3.36:1 on bg (WCAG UI) */
-    --hover-bg: #1c2d42;        /* was #1e2a3a — slightly warmer blue for hover */
-    --surface: #1a2332;
-    --border: #506c90;          /* was #2a3448 — matches border-color */
-    --input-bg: #1a2332;
-    --code-bg: rgba(255, 255, 255, 0.07);
-    --code-block-bg: #1e1e2e;        /* Catppuccin mocha — dark bg with readable syntax colors */
-    --code-block-text: #cdd6f4;
-    --table-header-bg: rgba(255, 255, 255, 0.05);
-    --unread-bg: rgba(77, 142, 240, 0.10); /* was 0.08 — slightly more visible */
-    --jump-highlight: rgba(77, 142, 240, 0.22);
-    --mark-bg: rgba(251, 191, 36, 0.30);
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #F4F4F6;
+    --sheet: #F9FAFC;
+    --surface: #FFFFFF;
+    --divider: #D4D3D5;
+    --outline: #8E8D8F;
+    --fg: #1C1C21;
+    --muted: #5D5D60;
+    --accent: #3D55E0;
+    --accent-text: #3D55E0;
+    --on-accent: #F4F4F6;
+    --accent-container: #E8EEFF;
+    --on-accent-container: #1C1C21;
+    --error: #A1302B;
+    --error-container: #FFE9E6;
+    --on-error: #F4F4F6;
+    --ok: #246E3A;
+    --ok-container: #DFF6E2;
+    --warn: #825100;
+    --warn-container: #FEEBD6;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .06);
+  }
+}
 
-    --primary-color: #4d8ef0;
-    --primary-hover: #3b7ee0;
-    --danger-color: #f87171;
-    --warning-color: #fbbf24;
-    --success-color: #34d399;
+:root[data-theme="light"] {
+  --bg: #F4F4F6;
+  --sheet: #F9FAFC;
+  --surface: #FFFFFF;
+  --divider: #D4D3D5;
+  --outline: #8E8D8F;
+  --fg: #1C1C21;
+  --muted: #5D5D60;
+  --accent: #3D55E0;
+  --accent-text: #3D55E0;
+  --on-accent: #F4F4F6;
+  --accent-container: #E8EEFF;
+  --on-accent-container: #1C1C21;
+  --error: #A1302B;
+  --error-container: #FFE9E6;
+  --on-error: #F4F4F6;
+  --ok: #246E3A;
+  --ok-container: #DFF6E2;
+  --warn: #825100;
+  --warn-container: #FEEBD6;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .06);
+}
 
-    --shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
-    --focus-ring: rgba(77, 142, 240, 0.2);
+/* Deadrop variable names, resolved from the Graphite tokens above. */
+:root {
+    --bg-color: var(--bg);
+    --card-bg: var(--surface);
+    --text-color: var(--fg);
+    --text-muted: var(--muted);
+    --border-color: var(--divider);
+    --hover-bg: var(--accent-container);
+    --border: var(--divider);
+    --input-bg: var(--sheet);
+    --code-bg: color-mix(in srgb, var(--fg) 8%, transparent);
+    --code-block-bg: var(--sheet);
+    --code-block-text: var(--fg);
+    --table-header-bg: color-mix(in srgb, var(--fg) 5%, transparent);
+    --unread-bg: color-mix(in srgb, var(--accent) 10%, transparent);
+    --jump-highlight: color-mix(in srgb, var(--accent) 22%, transparent);
+    --mark-bg: color-mix(in srgb, var(--warn) 35%, transparent);
+
+    --primary-color: var(--accent);
+    --primary-hover: color-mix(in srgb, var(--accent) 85%, var(--fg));
+    --danger-color: var(--error);
+    --warning-color: var(--warn);
+    --success-color: var(--ok);
+
+    --radius: var(--radius-card);
+    --focus-ring: color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
 * {
@@ -68,7 +124,7 @@
 }
 
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    font-family: var(--sans);
     background: var(--bg-color);
     color: var(--text-color);
     line-height: 1.5;
@@ -151,7 +207,7 @@ body {
     gap: 8px;
     padding: 10px 20px;
     border: none;
-    border-radius: var(--radius);
+    border-radius: var(--radius-btn);
     font-size: 1rem;
     font-weight: 500;
     cursor: pointer;
@@ -160,7 +216,7 @@ body {
 
 .btn-primary {
     background: var(--primary-color);
-    color: white;
+    color: var(--on-accent);
 }
 
 .btn-primary:hover {
@@ -178,11 +234,11 @@ body {
 
 .btn-danger {
     background: var(--danger-color);
-    color: white;
+    color: var(--on-error);
 }
 
 .btn-danger:hover {
-    background: #b91c1c;  /* intentional — keeps contrast on dark bg */
+    background: color-mix(in srgb, var(--danger-color) 85%, var(--fg));
 }
 
 .btn-small {
@@ -197,7 +253,7 @@ body {
     padding: 6px 8px;
     background: transparent;
     border: 1px solid var(--border-color);
-    border-radius: var(--radius);
+    border-radius: var(--radius-btn);
     cursor: pointer;
     font-size: 1rem;
     color: var(--text-muted);
@@ -264,7 +320,7 @@ textarea.form-input {
 .message {
     max-width: 70%;
     padding: 12px 16px;
-    border-radius: 16px;
+    border-radius: var(--radius-bubble);
     position: relative;
 }
 
@@ -277,7 +333,7 @@ textarea.form-input {
 .message-received {
     align-self: flex-end;
     background: var(--primary-color);
-    color: white;
+    color: var(--on-accent);
     border-bottom-right-radius: 4px;
 }
 
@@ -358,13 +414,13 @@ textarea.form-input {
 
 .thread-avatar-peer {
     background: var(--primary-color);
-    color: white;
+    color: var(--on-accent);
     font-size: 1.2rem;
 }
 
 .thread-avatar-room {
-    background: linear-gradient(135deg, var(--primary-color), #7c3aed);
-    color: white;
+    background: var(--accent-container);
+    color: var(--on-accent-container);
     font-size: 1.1rem;
 }
 
@@ -413,18 +469,18 @@ textarea.form-input {
     align-items: center;
     gap: 4px;
     padding: 2px 8px;
-    border-radius: 12px;
+    border-radius: var(--radius-chip);
     font-size: 0.75rem;
     font-weight: 500;
 }
 
 .mode-badge.ephemeral {
-    background: rgba(245, 158, 11, 0.1);
+    background: var(--warn-container);
     color: var(--warning-color);
 }
 
 .mode-badge.persistent {
-    background: rgba(16, 185, 129, 0.1);
+    background: var(--ok-container);
     color: var(--success-color);
 }
 
@@ -444,7 +500,8 @@ textarea.form-input {
     flex: 1;
     padding: 12px 16px;
     border: 1px solid var(--border-color);
-    border-radius: 24px;
+    border-radius: var(--radius-bubble);
+    font-family: inherit;
     font-size: 1rem;
     line-height: 1.4;
     resize: none;
@@ -538,7 +595,7 @@ textarea.form-input {
 
 /* Error/Loading states */
 .error-message {
-    background: rgba(220, 38, 38, 0.1);
+    background: var(--error-container);
     color: var(--danger-color);
     padding: 12px 16px;
     border-radius: var(--radius);
@@ -703,7 +760,7 @@ textarea.form-input {
     background: var(--code-bg);
     padding: 2px 6px;
     border-radius: 4px;
-    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
+    font-family: var(--mono);
     font-size: 0.88em;
 }
 
@@ -797,14 +854,14 @@ textarea.form-input {
 /* High-contrast links on from-me bubble (blue background) */
 .room-message.from-me .message-body.markdown-body a,
 .room-message.from-me .message-body.markdown-body a:visited {
-    color: #e0f0ff;
+    color: var(--on-accent);
     text-decoration: underline;
-    text-decoration-color: rgba(255,255,255,0.5);
+    text-decoration-color: color-mix(in srgb, var(--on-accent) 50%, transparent);
 }
 
 .room-message.from-me .message-body.markdown-body a:hover {
-    color: white;
-    text-decoration-color: white;
+    color: var(--on-accent);
+    text-decoration-color: var(--on-accent);
 }
 
 /* Horizontal rules */
@@ -1134,7 +1191,7 @@ textarea.form-input {
     border: none;
     border-radius: var(--radius);
     background: var(--primary-color);
-    color: #fff;
+    color: var(--on-accent);
     font-family: inherit;
     font-size: 15px;
     font-weight: 600;
@@ -1390,7 +1447,7 @@ textarea.form-input {
     border: none;
     border-radius: var(--radius);
     background: var(--primary-color);
-    color: #fff;
+    color: var(--on-accent);
     font-family: inherit;
     font-size: 15px;
     font-weight: 600;
@@ -1566,9 +1623,9 @@ textarea.form-input {
     display: inline-block;
     max-width: 80%;
     padding: 10px 14px;
-    border-radius: var(--radius);
+    border-radius: var(--radius-bubble);
     background: var(--primary-color);
-    color: white;
+    color: var(--on-accent);
     white-space: pre-wrap;
 }
 
@@ -1606,7 +1663,7 @@ textarea.form-input {
 }
 
 .room-message.pending.from-me .message-body {
-    background: rgba(37, 99, 235, 0.5);
+    background: color-mix(in srgb, var(--accent) 50%, transparent);
     border: 1px dashed var(--primary-color);
 }
 
@@ -2003,7 +2060,7 @@ button:disabled {
     padding: 6px 8px;
     background: transparent;
     border: 1px solid var(--border-color);
-    border-radius: var(--radius);
+    border-radius: var(--radius-btn);
     cursor: pointer;
     font-size: 1rem;
     color: var(--text-muted);
@@ -2168,7 +2225,7 @@ kbd {
     display: inline-block;
     min-width: 18px;
     padding: 1px 5px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--mono);
     font-size: 11px;
     line-height: 1.6;
     text-align: center;
@@ -2197,7 +2254,7 @@ kbd {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--mono);
     font-size: 11px;
     color: var(--text-muted);
 }
