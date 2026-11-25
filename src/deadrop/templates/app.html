@@ -475,11 +475,12 @@
      * browser view rather than the browser, and an in-app browser view does
      * not resolve universal links. The `x-safari-https:` scheme re-dispatches
      * the URL through Safari, where a universal link reaches its native app.
-     * An unhandled scheme leaves the document visible, so the deferred
+     * iOS has no `x-safari-http:` counterpart, so only https URLs are handed
+     * off. An unhandled scheme leaves the document visible, so the deferred
      * window.open opens the in-app view instead of dropping the link.
      */
     function openInSafari(href) {
-        window.location.href = href.replace(/^http(s?):/, 'x-safari-http$1:');
+        window.location.href = href.replace(/^https:/, 'x-safari-https:');
         setTimeout(() => {
             if (document.visibilityState === 'visible') {
                 window.open(href, '_blank', 'noopener,noreferrer');
@@ -3951,7 +3952,7 @@
         const anchor = e.target.closest && e.target.closest('.markdown-body a[target="_blank"]');
         if (!anchor) return;
         const href = anchor.getAttribute('href');
-        if (!href || !isExternalUrl(href)) return;
+        if (!href || !isExternalUrl(href) || anchor.protocol !== 'https:') return;
         e.preventDefault();
         openInSafari(anchor.href);
     });

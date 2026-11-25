@@ -131,3 +131,12 @@ def test_ios_standalone_in_app_click_not_intercepted(page):
     _mount(page, "[room](/app/fritz/rooms/abc)", standalone=True, ios=True)
     page.click("#test-body a")
     assert page.evaluate("() => window.__opened") == []
+
+
+def test_ios_standalone_http_click_not_intercepted(page):
+    # iOS has no x-safari-http: scheme; an http link keeps its own target.
+    _mount(page, "[note](http://example.com:8080/#2026-note)", standalone=True, ios=True)
+    page.click("#test-body a")
+    page.wait_for_timeout(1500)
+    assert page.evaluate("() => window.__opened") == []
+    assert page.url == f"{BASE_URL}/app"
